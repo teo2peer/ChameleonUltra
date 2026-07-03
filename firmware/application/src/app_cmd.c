@@ -2665,6 +2665,73 @@ static bool tcl_apdu_(
     return chain_len > 0u;
 }
 
+/* Fill an EMV DOL (Data Object List: repeated tag+length) with simulated
+ * offline-terminal data. amount is a 6-byte n12 BCD value. Unknown fields are
+ * zero-filled. Returns the number of bytes written to out. Used to build the
+ * GPO PDOL and the GENERATE AC CDOL1 for an offline purchase simulation. */
+static uint8_t emv_fill_dol(const uint8_t *dol, uint8_t dol_len, uint8_t *out,
+                            const uint8_t amount[6]) {
+    uint8_t o = 0, i = 0;
+    while (i < dol_len) {
+        uint16_t tag = dol[i];
+        uint8_t tl = 1;
+        if ((dol[i] & 0x1F) == 0x1F && i + 1 < dol_len) {
+            tag = (tag << 8) | dol[i + 1];
+            tl = 2;
+        }
+        i += tl;
+        if (i >= dol_len) break;
+        uint8_t len = dol[i++];
+        if (o + len > 250) break;
+        for (uint8_t k = 0; k < len; k++) out[o + k] = 0x00;
+        switch (tag) {
+            case 0x9F02: if (len == 6) memcpy(&out[o], amount, 6); break; /* Amount Authorised */
+            case 0x5F2A: if (len == 2) { out[o] = 0x09; out[o + 1] = 0x78; } break; /* Currency EUR */
+            case 0x9F1A: if (len == 2) { out[o] = 0x07; out[o + 1] = 0x24; } break; /* Country ES */
+            case 0x9A:   if (len == 3) { out[o] = 0x25; out[o + 1] = 0x01; out[o + 2] = 0x01; } break; /* Date */
+            case 0x9F37: for (uint8_t k = 0; k < len; k++) out[o + k] = (uint8_t)(0x11 * (k + 1)); break; /* Unpredictable Number */
+            case 0x9F35: if (len >= 1) out[o] = 0x22; break; /* Terminal Type */
+            case 0x9F66: if (len == 4) out[o] = 0x36; break; /* TTQ (qVSDC, online) */
+            default: break; /* 9C type=00, 95 TVR=0, 9F03 other amount=0, ... */
+        }
+        o += len;
+    }
+    return o;
+}
+
+/* Find CDOL1 (tag 8C) inside an EMV record body, recursing into constructed
+ * templates (70/77/...). Returns true and fills out/out_len on success. */
+static bool emv_find_cdol1(const uint8_t *d, uint16_t dl, uint8_t *out,
+                           uint8_t *out_len) {
+    uint16_t i = 0;
+    while (i < dl) {
+        if (d[i] == 0x00 || d[i] == 0xFF) { i++; continue; }
+        uint8_t first = d[i++];
+        bool constructed = (first & 0x20) != 0;
+        if ((first & 0x1F) == 0x1F) {
+            while (i < dl && (d[i] & 0x80)) i++;
+            if (i < dl) i++;
+        }
+        if (i >= dl) break;
+        uint16_t len = d[i++];
+        if (len & 0x80) {
+            uint8_t nb = len & 0x7F;
+            len = 0;
+            for (uint8_t k = 0; k < nb && i < dl; k++) len = (len << 8) | d[i++];
+        }
+        if (i + len > dl) break;
+        if (!constructed && first == 0x8C) {
+            uint8_t cl = (uint8_t)(len > 64 ? 64 : len);
+            memcpy(out, &d[i], cl);
+            *out_len = cl;
+            return true;
+        }
+        if (constructed && emv_find_cdol1(&d[i], len, out, out_len)) return true;
+        i += len;
+    }
+    return false;
+}
+
 /**
  * HF14A-4 EMV scan — complete EMV card read in a single firmware call.
  *
@@ -2699,6 +2766,15 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
 
     /* Append a cmd+resp pair to out buffer */
 #define APPEND_PAIR(cmd_ptr, cmd_sz, resp_ptr, resp_sz) do {         if (out_len + 1 + (cmd_sz) + 2 + (resp_sz) < NETDATA_MAX_DATA_LENGTH) {             out[out_len++] = (uint8_t)(cmd_sz);             memcpy(&out[out_len], (cmd_ptr), (cmd_sz)); out_len += (cmd_sz);             out[out_len++] = (uint8_t)((resp_sz) & 0xFF);             out[out_len++] = (uint8_t)((resp_sz) >> 8);             memcpy(&out[out_len], (resp_ptr), (resp_sz)); out_len += (resp_sz);         }     } while(0)
+
+    /* Offline transaction simulation: if a 6-byte amount (n12 BCD) is supplied,
+     * inject it into the GPO PDOL and issue GENERATE AC after the records.
+     * With no payload this behaves exactly like the read-only EMV scan. */
+    uint8_t txn_amount[6] = {0, 0, 0, 0, 0, 0};
+    bool do_txn = (length >= 6);
+    if (do_txn) memcpy(txn_amount, data, 6);
+    static uint8_t cdol1[64];
+    uint8_t cdol1_len = 0;
 
     /* ---- Step 1: scan_auto ----------------------------------------- */
     bsp_delay_ms(10);
@@ -2859,7 +2935,7 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     static uint8_t gpo_buf[8 + 44]; /* static: keep off stack */
     /* PDOL template: TTQ first 4 bytes, zeros after.
      * TTQ A0000000: MSD+EMV contactless capable, offline, no CDA/DDA. */
-    static const uint8_t gpo_pdol_template[44] = {
+    static uint8_t gpo_pdol_template[44] = {
         0xA0, 0x00, 0x00, 0x00,  /* TTQ (9F66): MSD+cEMV, offline, no DDA */
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* Amount Authorised (9F02) */
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* Amount Other (9F03) */
@@ -2872,6 +2948,11 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* extra zeros */
         0x00, 0x00, 0x00
     };
+    /* Inject the simulated amount (or reset to zero for a read-only scan) into
+     * the PDOL Amount Authorised field so the card's cryptogram covers it. */
+    for (uint8_t _a = 0; _a < 6; _a++) {
+        gpo_pdol_template[4 + _a] = do_txn ? txn_amount[_a] : 0x00;
+    }
     uint8_t gpo_len = 0;
     uint8_t *gpo_resp = NULL;
     uint16_t gpo_rlen = 0;
@@ -2975,6 +3056,10 @@ gpo_done:
                 APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
                 num_apdus++;
                 records_read++;
+                if (do_txn && cdol1_len == 0) {
+                    emv_find_cdol1(rr_resp, rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen,
+                                   cdol1, &cdol1_len);
+                }
             }
         }
     }
@@ -2998,9 +3083,43 @@ gpo_done:
                     APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
                     num_apdus++;
                     records_read++;
+                    if (do_txn && cdol1_len == 0) {
+                        emv_find_cdol1(rr_resp,
+                                       rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen,
+                                       cdol1, &cdol1_len);
+                    }
                 } else {
                     break;
                 }
+            }
+        }
+    }
+
+    /* ---- Optional: GENERATE AC — offline purchase simulation -------------
+     * Requests an ARQC cryptogram for the simulated amount. This is what a POS
+     * asks the card during a purchase; the cryptogram is NOT sent to any bank,
+     * so nothing is authorised and no funds move. Best-effort: cards may return
+     * an error SW without a full terminal profile — that's fine (still no
+     * charge). Visa qVSDC cards already produce the cryptogram in the GPO. */
+    if (do_txn && cdol1_len > 0) {
+        static uint8_t gac_data[64];
+        uint8_t gac_dlen = emv_fill_dol(cdol1, cdol1_len, gac_data, txn_amount);
+        if (gac_dlen <= 55) {
+            static uint8_t gac_cmd[80];
+            uint8_t gc = 0;
+            gac_cmd[gc++] = 0x80;      /* CLA */
+            gac_cmd[gc++] = 0xAE;      /* INS GENERATE AC */
+            gac_cmd[gc++] = 0x80;      /* P1 = ARQC (online cryptogram) */
+            gac_cmd[gc++] = 0x00;
+            gac_cmd[gc++] = gac_dlen;
+            memcpy(&gac_cmd[gc], gac_data, gac_dlen);
+            gc += gac_dlen;
+            gac_cmd[gc++] = 0x00;
+            uint8_t *gac_resp;
+            uint16_t gac_rlen;
+            if (SEND_APDU(gac_cmd, gc, &gac_resp, &gac_rlen)) {
+                APPEND_PAIR(gac_cmd, gc, gac_resp, gac_rlen);
+                num_apdus++;
             }
         }
     }
