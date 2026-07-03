@@ -2947,35 +2947,61 @@ gpo_done:
         afl = &gpo_resp[3];
         afl_len = gpo_rlen - 3 - 2;
     }
-    if (afl == NULL || afl_len == 0) goto done;
+    uint8_t records_read = 0;
 
-    /* Copy AFL to local buffer before READ RECORDs.
-     * afl points into chain_buf which is overwritten by each SEND_APDU call.
-     * Without this copy, the 2nd+ AFL entries become garbage after the first
-     * READ RECORD, causing last=0xFF and up to 255 timeout loops per entry. */
-    static uint8_t afl_buf[32];  /* max 8 AFL entries × 4 bytes */
-    if (afl_len > sizeof(afl_buf)) afl_len = (uint8_t)sizeof(afl_buf);
-    memcpy(afl_buf, afl, afl_len);
-    afl = afl_buf;
+    /* READ each record listed in the AFL (when the GPO provided one) */
+    if (afl != NULL && afl_len > 0) {
+        /* Copy AFL to local buffer before READ RECORDs.
+         * afl points into chain_buf which is overwritten by each SEND_APDU call. */
+        static uint8_t afl_buf[32];  /* max 8 AFL entries × 4 bytes */
+        if (afl_len > sizeof(afl_buf)) afl_len = (uint8_t)sizeof(afl_buf);
+        memcpy(afl_buf, afl, afl_len);
+        afl = afl_buf;
 
-    /* READ each record */
-    for (uint8_t a = 0; a + 3 < afl_len; a += 4) {
-        uint8_t sfi    = (afl[a] >> 3) & 0x1F;
-        uint8_t rec_s  = afl[a + 1];
-        uint8_t rec_e  = afl[a + 2];
-        if (sfi == 0 || rec_s > rec_e) continue;
-        for (uint8_t r = rec_s; r <= rec_e; r++) {
-            uint8_t rr_cmd[5] = {0x00, 0xB2, r, (uint8_t)((sfi << 3) | 4), 0x00};
-            uint8_t *rr_resp;
-            uint16_t rr_rlen;
-            if (!SEND_APDU(rr_cmd, 5, &rr_resp, &rr_rlen)) {
-                /* RC522 FIFO is 64 bytes — records > 61 bytes fail.
-                 * Skip silently rather than aborting the whole scan. */
-                NRF_LOG_INFO("14A4_EMV_SCAN: READ RECORD SFI=%d rec=%d failed (response too large?)", sfi, r);
-                continue;
+        for (uint8_t a = 0; a + 3 < afl_len; a += 4) {
+            uint8_t sfi    = (afl[a] >> 3) & 0x1F;
+            uint8_t rec_s  = afl[a + 1];
+            uint8_t rec_e  = afl[a + 2];
+            if (sfi == 0 || rec_s > rec_e) continue;
+            for (uint8_t r = rec_s; r <= rec_e; r++) {
+                uint8_t rr_cmd[5] = {0x00, 0xB2, r, (uint8_t)((sfi << 3) | 4), 0x00};
+                uint8_t *rr_resp;
+                uint16_t rr_rlen;
+                if (!SEND_APDU(rr_cmd, 5, &rr_resp, &rr_rlen)) {
+                    /* RC522 FIFO is 64 bytes — records > 61 bytes fail. */
+                    NRF_LOG_INFO("14A4_EMV_SCAN: READ RECORD SFI=%d rec=%d failed (response too large?)", sfi, r);
+                    continue;
+                }
+                APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
+                num_apdus++;
+                records_read++;
             }
-            APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
-            num_apdus++;
+        }
+    }
+
+    /* Fallback (nfc-frog style): if the AFL yielded no records — some cards
+     * omit or mis-report it in the GPO — brute-force READ RECORD across the low
+     * SFIs to capture the PAN record. Stop each SFI on the first error SW
+     * (6A83 record-not-found), and bound the total to keep the response sane. */
+    if (records_read == 0) {
+        for (uint8_t sfi = 1; sfi <= 8; sfi++) {
+            if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
+            for (uint8_t r = 1; r <= 16; r++) {
+                if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
+                uint8_t rr_cmd[5] = {0x00, 0xB2, r, (uint8_t)((sfi << 3) | 4), 0x00};
+                uint8_t *rr_resp;
+                uint16_t rr_rlen;
+                if (!SEND_APDU(rr_cmd, 5, &rr_resp, &rr_rlen)) break;
+                /* Success only on SW 90 00; any error (6A83/6A82/...) => next SFI */
+                if (rr_rlen >= 2 && rr_resp[rr_rlen - 2] == 0x90 &&
+                        rr_resp[rr_rlen - 1] == 0x00) {
+                    APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
+                    num_apdus++;
+                    records_read++;
+                } else {
+                    break;
+                }
+            }
         }
     }
 
