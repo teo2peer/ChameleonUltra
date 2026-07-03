@@ -2986,6 +2986,116 @@ done:
     return data_frame_make(cmd, STATUS_HF_TAG_OK, out_len, out);
 }
 
+/**
+ * HF14A-4 DESFire scan — enumerate a MIFARE DESFire card in a single call.
+ *
+ * Performs: field cycle -> scan_auto (select+RATS) -> GetVersion (+ 0xAF
+ * additional frames) -> GetApplicationIDs -> per-AID SelectApplication +
+ * GetFileIDs, all in one T=CL session. Same packed response format as the EMV
+ * scan (tag info + cmd/resp APDU pairs); the host parses the DESFire structures.
+ * Reuses the static tcl_apdu_ helper and the SEND_APDU/APPEND_PAIR macros.
+ */
+static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = 0;
+    static uint8_t  abuf[64];
+    static uint8_t  rbuf[270];
+    static uint8_t  chain_buf[512];
+    uint16_t rbits;
+    uint8_t  blk = 0;
+
+    bsp_delay_ms(10);
+    static picc_14a_tag_t tag;
+    memset(&tag, 0, sizeof(tag));
+    status = pcd_14a_reader_scan_auto(&tag);
+    if (status != STATUS_HF_TAG_OK) {
+        bsp_delay_ms(20);
+        memset(&tag, 0, sizeof(tag));
+        status = pcd_14a_reader_scan_auto(&tag);
+        if (status != STATUS_HF_TAG_OK) {
+            return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
+        }
+    }
+    bsp_delay_ms(5);
+
+    /* Clear RC522 stale state after RATS (see emv_scan for rationale) */
+    write_register_single(CommandReg, PCD_IDLE);
+    {
+        uint16_t _w = 0;
+        while ((read_register_single(CommandReg) & 0x0F) != PCD_IDLE && _w++ < 1000);
+    }
+    write_register_single(ComIrqReg,  0x7F);
+    set_register_mask(FIFOLevelReg,   0x80);
+    clear_register_mask(BitFramingReg, 0x80);
+
+    /* Pack tag info (same layout as emv_scan) */
+    out[out_len++] = tag.uid_len;
+    memcpy(&out[out_len], tag.uid, tag.uid_len);
+    out_len += tag.uid_len;
+    memcpy(&out[out_len], tag.atqa, 2);
+    out_len += 2;
+    out[out_len++] = tag.sak;
+    out[out_len++] = tag.ats_len;
+    memcpy(&out[out_len], tag.ats, tag.ats_len);
+    out_len += tag.ats_len;
+
+    uint16_t num_apdus_offset = out_len;
+    out[out_len++] = 0;
+    uint8_t num_apdus = 0;
+    pcd_14a_reader_timeout_set(600);
+
+    uint8_t *r = NULL;
+    uint16_t rl = 0;
+
+    /* GetVersion (0x60) + additional frames (0xAF) while SW == 91 AF */
+    static const uint8_t getver[] = {0x90, 0x60, 0x00, 0x00, 0x00};
+    if (SEND_APDU(getver, sizeof(getver), &r, &rl)) {
+        APPEND_PAIR(getver, sizeof(getver), r, rl);
+        num_apdus++;
+        static const uint8_t getmore[] = {0x90, 0xAF, 0x00, 0x00, 0x00};
+        uint8_t guard = 0;
+        while (rl >= 2 && r[rl - 2] == 0x91 && r[rl - 1] == 0xAF && guard++ < 4) {
+            if (!SEND_APDU(getmore, sizeof(getmore), &r, &rl)) break;
+            APPEND_PAIR(getmore, sizeof(getmore), r, rl);
+            num_apdus++;
+        }
+    }
+
+    /* GetApplicationIDs (0x6A) — response is N*3 bytes of AIDs + SW */
+    static const uint8_t getaids[] = {0x90, 0x6A, 0x00, 0x00, 0x00};
+    uint8_t aids[24];
+    uint8_t aids_count = 0;
+    if (SEND_APDU(getaids, sizeof(getaids), &r, &rl)) {
+        APPEND_PAIR(getaids, sizeof(getaids), r, rl);
+        num_apdus++;
+        if (rl >= 2) {
+            uint16_t adata = rl - 2;
+            for (uint16_t i = 0; i + 3 <= adata && aids_count < 8; i += 3) {
+                memcpy(&aids[aids_count * 3], &r[i], 3);
+                aids_count++;
+            }
+        }
+    }
+
+    /* Per application: SelectApplication (0x5A) + GetFileIDs (0x6F) */
+    static const uint8_t getfiles[] = {0x90, 0x6F, 0x00, 0x00, 0x00};
+    for (uint8_t a = 0; a < aids_count; a++) {
+        uint8_t selapp[9] = {0x90, 0x5A, 0x00, 0x00, 0x03,
+                             aids[a * 3], aids[a * 3 + 1], aids[a * 3 + 2], 0x00};
+        if (!SEND_APDU(selapp, sizeof(selapp), &r, &rl)) continue;
+        APPEND_PAIR(selapp, sizeof(selapp), r, rl);
+        num_apdus++;
+        if (SEND_APDU(getfiles, sizeof(getfiles), &r, &rl)) {
+            APPEND_PAIR(getfiles, sizeof(getfiles), r, rl);
+            num_apdus++;
+        }
+    }
+
+    pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+    out[num_apdus_offset] = num_apdus;
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, out_len, out);
+}
+
 static data_frame_tx_t *cmd_processor_hf14a_4_debug_counters(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t buf[4];
     nfc_tag_14a_4_get_debug_counters(&buf[0], &buf[1], &buf[2], &buf[3]);
@@ -3155,6 +3265,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14A_4_STATIC_RESP,            NULL,                        cmd_processor_hf14a_4_static_resp,           NULL                   },
     {    DATA_CMD_HF14A_4_READER_APDU,            before_hf_reader_run,        cmd_processor_hf14a_4_reader_apdu,           NULL                   },
     {    DATA_CMD_HF14A_4_EMV_SCAN,               before_hf_reader_run,        cmd_processor_hf14a_4_emv_scan,              NULL                   },
+    {    DATA_CMD_HF14A_4_DESFIRE_SCAN,           before_hf_reader_run,        cmd_processor_hf14a_4_desfire_scan,          NULL                   },
     {    6010,                                     NULL,                        cmd_processor_hf14a_4_debug_counters,        NULL                   },
     /* HF14A scan keeping field alive */
     {    DATA_CMD_HF14A_SCAN_KEEP,                before_hf_reader_run,        cmd_processor_hf14a_scan_keep,               NULL                   },
