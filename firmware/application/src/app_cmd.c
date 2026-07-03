@@ -2670,7 +2670,7 @@ static bool tcl_apdu_(
  * zero-filled. Returns the number of bytes written to out. Used to build the
  * GPO PDOL and the GENERATE AC CDOL1 for an offline purchase simulation. */
 static uint8_t emv_fill_dol(const uint8_t *dol, uint8_t dol_len, uint8_t *out,
-                            const uint8_t amount[6]) {
+                            uint8_t out_cap, const uint8_t amount[6]) {
     uint8_t o = 0, i = 0;
     while (i < dol_len) {
         uint16_t tag = dol[i];
@@ -2682,7 +2682,9 @@ static uint8_t emv_fill_dol(const uint8_t *dol, uint8_t dol_len, uint8_t *out,
         i += tl;
         if (i >= dol_len) break;
         uint8_t len = dol[i++];
-        if (o + len > 250) break;
+        /* Bound against the REAL destination capacity: a DOL's declared field
+         * lengths can sum far past the buffer (stack overflow) otherwise. */
+        if (o + len > out_cap) break;
         for (uint8_t k = 0; k < len; k++) out[o + k] = 0x00;
         switch (tag) {
             case 0x9F02: if (len == 6) memcpy(&out[o], amount, 6); break; /* Amount Authorised */
@@ -2702,7 +2704,8 @@ static uint8_t emv_fill_dol(const uint8_t *dol, uint8_t dol_len, uint8_t *out,
 /* Find CDOL1 (tag 8C) inside an EMV record body, recursing into constructed
  * templates (70/77/...). Returns true and fills out/out_len on success. */
 static bool emv_find_cdol1(const uint8_t *d, uint16_t dl, uint8_t *out,
-                           uint8_t *out_len) {
+                           uint8_t *out_len, uint8_t depth) {
+    if (depth > 6) return false; /* bound recursion (crafted-TLV stack overflow) */
     uint16_t i = 0;
     while (i < dl) {
         if (d[i] == 0x00 || d[i] == 0xFF) { i++; continue; }
@@ -2726,7 +2729,9 @@ static bool emv_find_cdol1(const uint8_t *d, uint16_t dl, uint8_t *out,
             *out_len = cl;
             return true;
         }
-        if (constructed && emv_find_cdol1(&d[i], len, out, out_len)) return true;
+        if (constructed && emv_find_cdol1(&d[i], len, out, out_len, depth + 1)) {
+            return true;
+        }
         i += len;
     }
     return false;
@@ -2872,8 +2877,9 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     /* ---- Extract first AID from PPSE ----------------------------- */
     uint8_t aid[16];
     uint8_t aid_len = 0;
-    for (uint8_t i = 0; i + 1 < ppse_rlen; i++) {
-        if (ppse_resp[i] == 0x4F && ppse_resp[i + 1] > 0 && ppse_resp[i + 1] <= 16) {
+    for (uint16_t i = 0; i + 1 < ppse_rlen; i++) {
+        if (ppse_resp[i] == 0x4F && ppse_resp[i + 1] > 0 && ppse_resp[i + 1] <= 16 &&
+                (uint16_t)(i + 2 + ppse_resp[i + 1]) <= ppse_rlen) {
             aid_len = ppse_resp[i + 1];
             memcpy(aid, &ppse_resp[i + 2], aid_len);
             break;
@@ -2902,8 +2908,8 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     /* ---- Step 4: GPO — parse PDOL from SELECT AID FCI, fill zeros ------- */
     /* PDOL is tag 9F38 in the FCI (sel_resp). Parse it to know how many
      * bytes the card expects. Fill all fields with zeros (offline scan). */
-    uint8_t pdol_len = 0;
-    for (uint8_t pi = 0; pi + 2 < sel_rlen; pi++) {
+    uint16_t pdol_len = 0;
+    for (uint16_t pi = 0; pi + 2 < sel_rlen; pi++) {
         /* 2-byte tag detection: first byte has bits[4:0] == 0x1F */
         uint8_t ptag1 = sel_resp[pi];
         uint8_t ptag2 = (((ptag1 & 0x1F) == 0x1F) && pi + 1 < sel_rlen) ? sel_resp[pi + 1] : 0;
@@ -2913,8 +2919,8 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
         uint8_t flen = sel_resp[pi + flen_off];
         if (ftag == 0x9F38) {
             /* Sum DOL field lengths to get total PDOL data size */
-            uint8_t di = pi + flen_off + 1;
-            uint8_t dend = di + flen;
+            uint16_t di = pi + flen_off + 1;
+            uint16_t dend = di + flen;
             while (di < dend && di + 1 < sel_rlen) {
                 uint8_t dol_tl = ((sel_resp[di] & 0x1F) == 0x1F) ? 2 : 1;
                 if (di + dol_tl >= sel_rlen) break;
@@ -3017,16 +3023,17 @@ gpo_done:
     uint8_t *afl = NULL;
     uint8_t afl_len = 0;
     if (gpo_rlen > 0 && gpo_resp[0] == 0x77) {
-        /* Format 2: find tag 94 */
-        for (uint8_t i = 2; i + 1 < gpo_rlen;) {
+        /* Format 2: find tag 94 (uint16_t i: a uint8_t wraps on >256B responses) */
+        for (uint16_t i = 2; i + 1 < gpo_rlen;) {
             uint8_t t = gpo_resp[i];
             uint8_t l = gpo_resp[i + 1];
             if (t == 0x94) { afl = &gpo_resp[i + 2]; afl_len = l; break; }
             i += 2 + l;
         }
-    } else if (gpo_rlen > 3 && gpo_resp[0] == 0x80) {
-        afl = &gpo_resp[3];
-        afl_len = gpo_rlen - 3 - 2;
+    } else if (gpo_rlen > 6 && gpo_resp[0] == 0x80) {
+        /* Format 1: tag 80, len, AIP(2), AFL(...), SW(2) => AFL starts at [4]. */
+        afl = &gpo_resp[4];
+        afl_len = gpo_rlen - 6;
     }
     uint8_t records_read = 0;
 
@@ -3044,8 +3051,10 @@ gpo_done:
             uint8_t rec_s  = afl[a + 1];
             uint8_t rec_e  = afl[a + 2];
             if (sfi == 0 || rec_s > rec_e) continue;
-            for (uint8_t r = rec_s; r <= rec_e; r++) {
-                uint8_t rr_cmd[5] = {0x00, 0xB2, r, (uint8_t)((sfi << 3) | 4), 0x00};
+            /* `unsigned` r: a uint8_t would wrap forever when rec_e == 0xFF. */
+            for (unsigned r = rec_s; r <= rec_e; r++) {
+                if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
+                uint8_t rr_cmd[5] = {0x00, 0xB2, (uint8_t)r, (uint8_t)((sfi << 3) | 4), 0x00};
                 uint8_t *rr_resp;
                 uint16_t rr_rlen;
                 if (!SEND_APDU(rr_cmd, 5, &rr_resp, &rr_rlen)) {
@@ -3058,7 +3067,7 @@ gpo_done:
                 records_read++;
                 if (do_txn && cdol1_len == 0) {
                     emv_find_cdol1(rr_resp, rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen,
-                                   cdol1, &cdol1_len);
+                                   cdol1, &cdol1_len, 0);
                 }
             }
         }
@@ -3086,7 +3095,7 @@ gpo_done:
                     if (do_txn && cdol1_len == 0) {
                         emv_find_cdol1(rr_resp,
                                        rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen,
-                                       cdol1, &cdol1_len);
+                                       cdol1, &cdol1_len, 0);
                     }
                 } else {
                     break;
@@ -3103,7 +3112,8 @@ gpo_done:
      * charge). Visa qVSDC cards already produce the cryptogram in the GPO. */
     if (do_txn && cdol1_len > 0) {
         static uint8_t gac_data[64];
-        uint8_t gac_dlen = emv_fill_dol(cdol1, cdol1_len, gac_data, txn_amount);
+        uint8_t gac_dlen =
+            emv_fill_dol(cdol1, cdol1_len, gac_data, sizeof(gac_data), txn_amount);
         if (gac_dlen <= 55) {
             static uint8_t gac_cmd[80];
             uint8_t gc = 0;
@@ -3206,6 +3216,13 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
         }
     }
 
+    /* GetFreeMemory (0x6E) — 3-byte free EEPROM (EV1+; harmless if unsupported) */
+    static const uint8_t getfree[] = {0x90, 0x6E, 0x00, 0x00, 0x00};
+    if (SEND_APDU(getfree, sizeof(getfree), &r, &rl)) {
+        APPEND_PAIR(getfree, sizeof(getfree), r, rl);
+        num_apdus++;
+    }
+
     /* GetApplicationIDs (0x6A) — response is N*3 bytes of AIDs + SW */
     static const uint8_t getaids[] = {0x90, 0x6A, 0x00, 0x00, 0x00};
     uint8_t aids[24];
@@ -3247,6 +3264,34 @@ static data_frame_tx_t *cmd_processor_hf14a_4_debug_counters(uint16_t cmd, uint1
     return data_frame_make(cmd, STATUS_SUCCESS, 4, buf);
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Passive BLE scanner commands (listen-only observer role; see ble_main.c).
+// The device transmits nothing while scanning: it only collects advertisements
+// already broadcast by nearby devices. Available on both Ultra and Lite.
+// ---------------------------------------------------------------------------
+static data_frame_tx_t *cmd_processor_ble_scan_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t err_code = ble_scan_start();
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_scan_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t err_code = ble_scan_stop();
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_scan_get_count(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t count = ble_scan_get_count();
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &count);
+}
+
+static data_frame_tx_t *cmd_processor_ble_scan_get_results(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t start_index = (length >= 1) ? data[0] : 0;
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = ble_scan_copy_records(start_index, out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
@@ -3288,6 +3333,11 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_get_sleep_timeout,             NULL                   },
     {    DATA_CMD_SET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_set_sleep_timeout,             NULL                   },
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },
+
+    {    DATA_CMD_BLE_SCAN_START,               NULL,                        cmd_processor_ble_scan_start,                NULL                   },
+    {    DATA_CMD_BLE_SCAN_STOP,                NULL,                        cmd_processor_ble_scan_stop,                 NULL                   },
+    {    DATA_CMD_BLE_SCAN_GET_COUNT,           NULL,                        cmd_processor_ble_scan_get_count,            NULL                   },
+    {    DATA_CMD_BLE_SCAN_GET_RESULTS,         NULL,                        cmd_processor_ble_scan_get_results,          NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 

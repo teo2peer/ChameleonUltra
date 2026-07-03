@@ -3,6 +3,7 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
+ - Added `ble scan` passive BLE scanner: uses the SoftDevice observer role in passive mode (active=0) to listen for nearby BLE advertisements and list device address, type, RSSI and advertised name. Listen-only — the device transmits nothing while scanning. New commands `BLE_SCAN_START`/`BLE_SCAN_STOP`/`BLE_SCAN_GET_COUNT`/`BLE_SCAN_GET_RESULTS` (7000-7003) (@teo2peer)
  - Added `hf mf readerkeys` reader-key capture mode (MFKey32): emulate a MIFARE Classic card (optionally from a dump), log the reader's authentication attempts, recover and export the reader's keys. Supports a fixed or random-per-activation UID, a center-out rainbow LED animation, and works over USB and BLE (@teo2peer)
  - Added `MF1_SET_RANDOM_UID_MODE`/`MF1_GET_RANDOM_UID_MODE` commands: emulate a new random UID on each reader activation (per-slot). Note: this fragments MFKey32 recovery and is meant for fingerprinting/testing (@teo2peer)
  - Added `MF1_SET_READER_KEYS_ANIM` command driving a non-blocking rainbow LED animation that radiates from the center of the LED bar outward (@teo2peer)

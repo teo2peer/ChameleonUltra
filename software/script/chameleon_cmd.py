@@ -120,6 +120,54 @@ class ChameleonCMD:
             resp.parsed = data
         return resp
 
+    def ble_scan_start(self):
+        """
+        Start a passive (listen-only) BLE scan. The device never transmits:
+        it only receives advertisements already broadcast by nearby devices.
+        """
+        return self.device.send_cmd_sync(Command.BLE_SCAN_START)
+
+    def ble_scan_stop(self):
+        """
+        Stop the passive BLE scan.
+        """
+        return self.device.send_cmd_sync(Command.BLE_SCAN_STOP)
+
+    def ble_scan_get_count(self):
+        """
+        Number of distinct BLE devices seen so far in the current/last scan.
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_SCAN_GET_COUNT)
+        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+            return resp.data[0]
+        return 0
+
+    @expect_response(Status.SUCCESS)
+    def ble_scan_get_results(self, start_index: int = 0):
+        """
+        Fetch discovered BLE device records, starting at start_index.
+
+        Wire format per record:
+            addr[6] | addr_type[1] | rssi[1, signed] | adv_len[1] | adv[adv_len]
+
+        :return: list of dicts {addr(bytes, LE), addr_type(int), rssi(int), adv(bytes)}
+        """
+        data = struct.pack('!B', start_index)
+        resp = self.device.send_cmd_sync(Command.BLE_SCAN_GET_RESULTS, data)
+        if resp.status == Status.SUCCESS:
+            offset = 0
+            devices = []
+            while offset + 9 <= len(resp.data):
+                addr = resp.data[offset:offset + 6]
+                offset += 6
+                addr_type, rssi, adv_len = struct.unpack_from('!BbB', resp.data, offset)
+                offset += 3
+                adv = resp.data[offset:offset + adv_len]
+                offset += adv_len
+                devices.append({'addr': addr, 'addr_type': addr_type, 'rssi': rssi, 'adv': adv})
+            resp.parsed = devices
+        return resp
+
     def mf1_detect_support(self):
         """
         Detect whether it is mifare classic tag.

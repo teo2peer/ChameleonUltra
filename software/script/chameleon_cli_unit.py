@@ -890,6 +890,7 @@ lf_em = lf.subgroup("em", "EM commands")
 lf_em_4x05 = lf_em.subgroup("4x05", "EM4x05/EM4x69 commands")
 data = root.subgroup('data', 'Data analysis and visualization commands')
 emv = root.subgroup('emv', 'EMV contactless payment card commands')
+ble = root.subgroup('ble', 'Bluetooth Low Energy commands')
 
 
 lf_em_410x = lf_em.subgroup("410x", "EM410x commands")
@@ -912,6 +913,60 @@ class RootClear(BaseCLIUnit):
 
     def on_exec(self, args: argparse.Namespace):
         os.system("clear" if os.name == "posix" else "cls")
+
+
+@ble.command("scan")
+class BLEScan(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Passively scan for nearby BLE devices (listen-only: the Chameleon "
+            "never transmits, it only receives advertisements already broadcast "
+            "by nearby devices). Prints address, RSSI and advertised name."
+        )
+        parser.add_argument("-t", "--timeout", type=float, default=5.0, metavar="<sec>",
+                            help="How long to listen, in seconds (default: 5)")
+        return parser
+
+    @staticmethod
+    def parse_adv_name(adv: bytes):
+        # Walk the advertising AD structures (len | type | data...) looking for
+        # the shortened (0x08) or complete (0x09) local name.
+        i = 0
+        name = None
+        while i < len(adv):
+            ln = adv[i]
+            if ln == 0:
+                break
+            ad_type = adv[i + 1] if i + 1 < len(adv) else 0
+            value = adv[i + 2:i + 1 + ln]
+            if ad_type in (0x08, 0x09):
+                name = value.decode('utf-8', errors='replace')
+            i += ln + 1
+        return name
+
+    def on_exec(self, args: argparse.Namespace):
+        self.cmd.ble_scan_start()
+        print(f"Listening for BLE advertisements for {args.timeout:.1f}s "
+              f"(passive, no transmission)...")
+        try:
+            time.sleep(args.timeout)
+        finally:
+            self.cmd.ble_scan_stop()
+
+        count = self.cmd.ble_scan_get_count()
+        if count == 0:
+            print("No BLE devices found")
+            return
+
+        devices = self.cmd.ble_scan_get_results(0)
+        print(f"Found {count} device(s):")
+        for d in devices:
+            # SoftDevice reports the address little-endian; display MSB-first.
+            addr = ':'.join(f'{b:02X}' for b in reversed(d['addr']))
+            name = self.parse_adv_name(d['adv'])
+            name_str = f"  name: {name}" if name else ""
+            print(f"- {addr}  (type {d['addr_type']})  RSSI {d['rssi']:>4} dBm{name_str}")
 
 
 @root.command("rem")

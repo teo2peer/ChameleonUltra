@@ -180,6 +180,12 @@ class Command(enum.IntEnum):
     EM4X05_READSNIFF = 3032
     LF_SNIFF = 3031
 
+    # BLE (2.4GHz radio) — passive, listen-only scanner (no transmission)
+    BLE_SCAN_START = 7000
+    BLE_SCAN_STOP = 7001
+    BLE_SCAN_GET_COUNT = 7002
+    BLE_SCAN_GET_RESULTS = 7003
+
 
 @enum.unique
 class Status(enum.IntEnum):

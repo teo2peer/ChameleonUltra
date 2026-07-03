@@ -208,4 +208,19 @@
 #define DATA_CMD_EM4X05_READSNIFF               (3032)
 #define DATA_CMD_LF_SNIFF                       (3031)
 
+
+// ******************************************************************
+//                      CMD for BLE (2.4GHz radio)
+//                  Range from 7000 -> 7999
+// ******************************************************************
+//
+// NOTE: these are LISTEN-ONLY. The passive scanner uses the SoftDevice
+// observer role with active=0, so the device never transmits (no scan
+// requests, no advertisements, no carrier). It only receives advertising
+// packets already broadcast by nearby devices.
+#define DATA_CMD_BLE_SCAN_START                 (7000)  /* start passive BLE scan (listen-only) */
+#define DATA_CMD_BLE_SCAN_STOP                  (7001)  /* stop passive BLE scan                */
+#define DATA_CMD_BLE_SCAN_GET_COUNT             (7002)  /* number of distinct devices seen      */
+#define DATA_CMD_BLE_SCAN_GET_RESULTS           (7003)  /* paged device records by start index  */
+
 #endif

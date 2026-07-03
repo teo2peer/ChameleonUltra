@@ -22,4 +22,20 @@ void set_ble_connect_key(uint8_t *key);
 void register_lf_adc_callback(lf_adc_callback_t cb);
 void unregister_lf_adc_callback(void);
 
+// ---------------------------------------------------------------------------
+// Passive BLE scanner (SoftDevice observer role).
+//
+// Listen-only: scanning is started in PASSIVE mode (active=0), so the device
+// never emits scan requests or any other packet. It purely receives the
+// advertisements that nearby devices already broadcast. There is no central
+// connection and no transmission of any kind here.
+// ---------------------------------------------------------------------------
+uint32_t ble_scan_start(void);   // clear results and start a passive scan
+uint32_t ble_scan_stop(void);    // stop the passive scan
+uint8_t  ble_scan_get_count(void);
+// Serialize discovered records starting at start_index into out (max out_cap
+// bytes). Wire format per record: addr[6] | addr_type[1] | rssi[1] | adv_len[1]
+// | adv[adv_len]. Returns the number of bytes written.
+uint16_t ble_scan_copy_records(uint8_t start_index, uint8_t *out, uint16_t out_cap);
+
 #endif

@@ -221,6 +221,114 @@ bool is_nus_working(void) {
     return g_is_ble_connected;
 }
 
+// ---------------------------------------------------------------------------
+// Passive BLE scanner (observer role) — listen-only.
+//
+// The scan is started with active=0 (PASSIVE), so the SoftDevice never sends a
+// scan request. The device transmits nothing while scanning; it only collects
+// the advertising packets that nearby devices already broadcast. This is the
+// receive-only counterpart to advertising, and is used for device inventory /
+// detection. It never connects out and never emits a carrier.
+// ---------------------------------------------------------------------------
+#define BLE_SCAN_MAX_DEVICES        40      // distinct devices retained per scan
+#define BLE_SCAN_ADV_DATA_MAX       31      // legacy advertising payload maximum
+
+typedef struct {
+    uint8_t  addr[BLE_GAP_ADDR_LEN];        // device address as reported (LE byte order)
+    uint8_t  addr_type;                     // BLE_GAP_ADDR_TYPE_*
+    int8_t   rssi;                          // last observed RSSI (dBm)
+    uint8_t  adv_data_len;                  // bytes valid in adv_data
+    uint8_t  adv_data[BLE_SCAN_ADV_DATA_MAX];
+} ble_scan_record_t;
+
+static ble_scan_record_t m_scan_records[BLE_SCAN_MAX_DEVICES];
+static volatile uint8_t  m_scan_count  = 0;
+static volatile bool     m_scan_active = false;
+
+static uint8_t    m_scan_buffer_data[BLE_GAP_SCAN_BUFFER_MIN];
+static ble_data_t m_scan_buffer = { m_scan_buffer_data, BLE_GAP_SCAN_BUFFER_MIN };
+
+static const ble_gap_scan_params_t m_scan_params = {
+    .active        = 0,                                  // PASSIVE: never transmit scan requests
+    .filter_policy = BLE_GAP_SCAN_FP_ACCEPT_ALL,
+    .scan_phys     = BLE_GAP_PHY_1MBPS,
+    .interval      = MSEC_TO_UNITS(100, UNIT_0_625_MS),
+    .window        = MSEC_TO_UNITS(50, UNIT_0_625_MS),
+    .timeout       = 0,                                  // run until explicitly stopped
+};
+
+// Merge one advertising report into the result table (dedup by address).
+static void ble_scan_record_update(const ble_gap_evt_adv_report_t *report) {
+    uint8_t adv_len = MIN(report->data.len, (uint16_t)BLE_SCAN_ADV_DATA_MAX);
+
+    for (uint8_t i = 0; i < m_scan_count; i++) {
+        if (m_scan_records[i].addr_type == report->peer_addr.addr_type &&
+                memcmp(m_scan_records[i].addr, report->peer_addr.addr, BLE_GAP_ADDR_LEN) == 0) {
+            // Known device: refresh RSSI and advertising payload.
+            m_scan_records[i].rssi = report->rssi;
+            m_scan_records[i].adv_data_len = adv_len;
+            memcpy(m_scan_records[i].adv_data, report->data.p_data, adv_len);
+            return;
+        }
+    }
+
+    if (m_scan_count >= BLE_SCAN_MAX_DEVICES) {
+        return; // table full: keep the first BLE_SCAN_MAX_DEVICES distinct devices
+    }
+
+    ble_scan_record_t *rec = &m_scan_records[m_scan_count];
+    memcpy(rec->addr, report->peer_addr.addr, BLE_GAP_ADDR_LEN);
+    rec->addr_type    = report->peer_addr.addr_type;
+    rec->rssi         = report->rssi;
+    rec->adv_data_len = adv_len;
+    memcpy(rec->adv_data, report->data.p_data, adv_len);
+    m_scan_count++;
+}
+
+uint32_t ble_scan_start(void) {
+    if (m_scan_active) {
+        return NRF_SUCCESS;
+    }
+    m_scan_count = 0;
+    m_scan_buffer.len = BLE_GAP_SCAN_BUFFER_MIN;
+    ret_code_t err_code = sd_ble_gap_scan_start(&m_scan_params, &m_scan_buffer);
+    if (err_code == NRF_SUCCESS) {
+        m_scan_active = true;
+    }
+    return err_code;
+}
+
+uint32_t ble_scan_stop(void) {
+    if (!m_scan_active) {
+        return NRF_SUCCESS;
+    }
+    m_scan_active = false;
+    return sd_ble_gap_scan_stop();
+}
+
+uint8_t ble_scan_get_count(void) {
+    return m_scan_count;
+}
+
+uint16_t ble_scan_copy_records(uint8_t start_index, uint8_t *out, uint16_t out_cap) {
+    uint16_t offset = 0;
+    for (uint8_t i = start_index; i < m_scan_count; i++) {
+        ble_scan_record_t *rec = &m_scan_records[i];
+        uint16_t rec_size = BLE_GAP_ADDR_LEN + 3 + rec->adv_data_len; // addr + type + rssi + len + adv
+        if (offset + rec_size > out_cap) {
+            break;
+        }
+        memcpy(out + offset, rec->addr, BLE_GAP_ADDR_LEN);
+        offset += BLE_GAP_ADDR_LEN;
+        out[offset++] = rec->addr_type;
+        out[offset++] = (uint8_t)rec->rssi;
+        out[offset++] = rec->adv_data_len;
+        memcpy(out + offset, rec->adv_data, rec->adv_data_len);
+        offset += rec->adv_data_len;
+    }
+    return offset;
+}
+
 /**@brief Function for handling Queued Write Module errors.
  *
  * @details A pointer to this function will be passed to each service which may need to inform the
@@ -473,6 +581,18 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             err_code = sd_ble_gap_disconnect(p_ble_evt->evt.gatts_evt.conn_handle,
                                              BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
             APP_ERROR_CHECK(err_code);
+            break;
+
+        case BLE_GAP_EVT_ADV_REPORT:
+            // Passive-scan result. Record it, then hand the scan buffer back to
+            // the SoftDevice so it keeps delivering reports (each report consumes
+            // the buffer). Not APP_ERROR_CHECK'd on purpose: if the scan was
+            // stopped meanwhile, a benign error is expected here.
+            if (m_scan_active) {
+                ble_scan_record_update(&p_ble_evt->evt.gap_evt.params.adv_report);
+                err_code = sd_ble_gap_scan_start(NULL, &m_scan_buffer);
+                UNUSED_VARIABLE(err_code);
+            }
             break;
 
         default:
