@@ -836,6 +836,27 @@ static void btn_fn_copy_ic_uid(void) {
 
 /**@brief Execute the corresponding logic based on the functional settings of the buttons.
  */
+// Toggle reader-key (MFKey32) capture on the active slot. Only acts when the
+// active slot's HF card is a MIFARE Classic type; arms auth logging + the
+// center-out rainbow animation, or disarms both if already active.
+static void btn_fn_toggle_reader_keys(void) {
+    tag_slot_specific_type_t tag_types;
+    tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
+    if (tag_types.tag_hf < TAG_TYPE_MIFARE_Mini || tag_types.tag_hf > TAG_TYPE_MIFARE_4096) {
+        NRF_LOG_INFO("Reader-keys button: active slot HF is not MIFARE Classic");
+        return;
+    }
+    if (rgb_marquee_is_reader_keys_anim()) {
+        rgb_marquee_set_reader_keys_anim(false);
+        nfc_tag_mf1_set_detection_enable(false);
+        light_up_by_slot();
+    } else {
+        nfc_tag_mf1_detection_log_clear();
+        nfc_tag_mf1_set_detection_enable(true);
+        rgb_marquee_set_reader_keys_anim(true);
+    }
+}
+
 static void run_button_function_by_settings(settings_button_function_t sbf) {
     switch (sbf) {
         case SettingsButtonCycleSlot:
@@ -843,6 +864,9 @@ static void run_button_function_by_settings(settings_button_function_t sbf) {
             break;
         case SettingsButtonCycleSlotDec:
             cycle_slot(true);
+            break;
+        case SettingsButtonReaderKeys:
+            btn_fn_toggle_reader_keys();
             break;
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -1046,8 +1070,12 @@ int main(void) {
         field_generator_rainbow_loop();
 #endif
 
-        // Led blink at usb status (only if field generator is off)
-        if (!m_is_field_on) {
+        // Reader-key capture animation takes over the LEDs while armed; otherwise
+        // fall back to the normal USB-status marquee / slot indicator.
+        if (rgb_marquee_is_reader_keys_anim()) {
+            rgb_marquee_reader_keys_loop();
+        } else if (!m_is_field_on) {
+            // Led blink at usb status (only if field generator is off)
             blink_usb_led_status();
         }
 

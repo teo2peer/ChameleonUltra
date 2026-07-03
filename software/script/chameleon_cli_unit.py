@@ -881,6 +881,7 @@ hw_settings = hw.subgroup("settings", "Chameleon settings commands")
 hf = root.subgroup("hf", "High Frequency commands")
 hf_14a = hf.subgroup("14a", "ISO14443-a commands")
 hf_mf = hf.subgroup("mf", "MIFARE Classic commands")
+hf_mf_readerkeys = hf_mf.subgroup("readerkeys", "Capture reader keys (MFKey32) by emulating a card")
 hf_mfu = hf.subgroup("mfu", "MIFARE Ultralight / NTAG commands")
 hf_des = hf.subgroup("des", "MIFARE DESFire commands")
 
@@ -3776,6 +3777,226 @@ class HFMFELog(DeviceRequiredUnit):
                         f"  > Block {block}, B key result: {result_maps_for_uid[block]['B']}"
                     )
         return
+
+
+MFC_TAG_TYPES = [
+    TagSpecificType.MIFARE_Mini,
+    TagSpecificType.MIFARE_1024,
+    TagSpecificType.MIFARE_2048,
+    TagSpecificType.MIFARE_4096,
+]
+
+
+def write_emu_dump_to_slot(cmd, device_com, buffer: bytes):
+    """
+    Write a raw MIFARE Classic dump (16-byte blocks) into the active slot's
+    emulator memory, splitting it into as many blocks as fit in one frame.
+    """
+    if len(buffer) % 16 != 0:
+        raise Exception("Data block not aligned to 16 bytes")
+    if len(buffer) // 16 > 256:
+        raise Exception("Data block memory overflow")
+    max_blocks = (device_com.data_max_length - 1) // 16
+    block = 0
+    index = 0
+    while index < len(buffer):
+        block_data = buffer[index: index + 16 * max_blocks]
+        n_blocks = len(block_data) // 16
+        cmd.mf1_write_emu_block_data(block, block_data)
+        print("." * n_blocks, end="")
+        block += n_blocks
+        index += 16 * n_blocks
+
+
+@hf_mf_readerkeys.command("start")
+class HFMFReaderKeysStart(SlotIndexArgsUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Arm reader-key (MFKey32) capture: emulate a MIFARE Classic card, log the "
+            "reader's authentication attempts, and run the center-out rainbow LED "
+            "animation. The chosen slot is left active so capture continues autonomously "
+            "(on battery, disconnected). Recover keys later with 'hf mf readerkeys extract'."
+        )
+        self.add_slot_args(parser)
+        parser.add_argument("-f", "--file", type=str, required=False,
+                            help="MIFARE Classic dump to load into the slot as the simulated card")
+        parser.add_argument("-t", "--type", type=str, required=False, choices=["bin", "hex"],
+                            help="Dump content type (default: guess from extension)")
+        uid_group = parser.add_mutually_exclusive_group()
+        uid_group.add_argument("--uid", type=str, metavar="<hex>",
+                               help="Emulate this fixed UID (recommended for key recovery)")
+        uid_group.add_argument("--random-uid", action="store_true",
+                               help="Emulate a new random UID on each reader tap "
+                                    "(WARNING: greatly reduces key recovery)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        # Select and *keep* the target slot active (capture runs on the active slot).
+        if args.slot is not None:
+            self.slot_num = args.slot
+            self.cmd.set_active_slot(self.slot_num)
+        else:
+            self.slot_num = SlotNumber.from_fw(self.cmd.get_active_slot())
+
+        # Slot must be a MIFARE Classic type.
+        slotinfo = self.cmd.get_slot_info()
+        fwslot = SlotNumber.to_fw(self.slot_num)
+        hf_tag_type = TagSpecificType(slotinfo[fwslot]["hf"])
+        if hf_tag_type not in MFC_TAG_TYPES:
+            print(color_string((CR, f"Slot {self.slot_num} is not a MIFARE Classic slot. "
+                                    "Set it with 'hw slot type' first.")))
+            return
+
+        # Optionally load a dump to emulate as the card.
+        if args.file is not None:
+            content_type = args.type
+            if content_type is None:
+                if args.file.endswith(".bin"):
+                    content_type = "bin"
+                elif args.file.endswith(".eml"):
+                    content_type = "hex"
+                else:
+                    raise Exception("Unknown file format, specify content type with -t")
+            buffer = bytearray()
+            with open(args.file, mode="rb") as fd:
+                if content_type == "bin":
+                    buffer.extend(fd.read())
+                else:
+                    buffer.extend(bytearray.fromhex(fd.read().decode()))
+            print(" - Loading dump into slot ", end="")
+            write_emu_dump_to_slot(self.cmd, self.device_com, buffer)
+            print(" done")
+
+        # UID mode.
+        if args.uid is not None:
+            uid = bytes.fromhex(args.uid)
+            if len(uid) not in (4, 7, 10):
+                raise ArgsParserError("UID must be 4, 7 or 10 bytes (8/14/20 hex chars)")
+            anti_coll = self.cmd.hf14a_get_anti_coll_data()
+            if anti_coll is None or len(anti_coll) == 0:
+                raise Exception("Slot has no HF 14A anti-collision config")
+            self.cmd.mf1_set_random_uid_mode(False)
+            self.cmd.hf14a_set_anti_coll_data(uid, anti_coll["atqa"], anti_coll["sak"], anti_coll["ats"])
+            print(f" - Fixed UID set to {uid.hex().upper()}")
+        elif args.random_uid:
+            self.cmd.mf1_set_random_uid_mode(True)
+            print(color_string((CY, " - Random UID mode enabled. NOTE: a random UID fragments "
+                                    "MFKey32 pairs and usually prevents key recovery; use a fixed "
+                                    "UID for reliable capture.")))
+        else:
+            # Keep the slot's current UID, but make sure random mode is off.
+            self.cmd.mf1_set_random_uid_mode(False)
+
+        # Arm capture (this also clears any previous log) and start the animation.
+        self.cmd.mf1_set_detection_enable(True)
+        self.cmd.mf1_set_reader_keys_anim(True)
+        print(color_string((CG, f" - Reader-key capture armed on slot {self.slot_num}. "
+                                "Present the device to the target reader.")))
+        print("   Progress: 'hf mf readerkeys status'")
+        print("   Recover : 'hf mf readerkeys extract -o keys.dic'  (do this before 'stop')")
+        print("   Stop    : 'hf mf readerkeys stop'")
+
+
+@hf_mf_readerkeys.command("status")
+class HFMFReaderKeysStatus(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Show reader-key capture status of the active slot"
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        count = self.cmd.mf1_get_detection_count()
+        detection = self.cmd.mf1_get_emulator_config()["detection"]
+        random_uid = self.cmd.mf1_get_random_uid_mode()
+        print(f" - Capture armed  : {detection}")
+        print(f" - Random UID mode: {random_uid}")
+        print(f" - Auth log count : {count}")
+        if count == 0 and detection:
+            print(color_string((CY, "   Waiting for reader authentication attempts...")))
+
+
+@hf_mf_readerkeys.command("extract")
+class HFMFReaderKeysExtract(HFMFELog):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Download captured reader auth logs and recover keys (MFKey32)"
+        parser.add_argument("-o", "--output", type=str, required=False,
+                            help="Save recovered keys to a .dic file (one key per line)")
+        parser.add_argument("--clear", action="store_true",
+                            help="Clear the on-device log after extraction (keeps capturing)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        count = self.cmd.mf1_get_detection_count()
+        if count == 0:
+            print(" - No reader auth logs captured yet")
+            return
+        print(f" - Captured {count} auth log entries, downloading", end="")
+        index = 0
+        result_list = []
+        while index < count:
+            tmp = self.cmd.mf1_get_detection_log(index)
+            recv = len(tmp)
+            if recv == 0:
+                break
+            index += recv
+            result_list.extend(tmp)
+            print("." * recv, end="")
+        print()
+
+        # Group by uid -> block -> key type, then recover each with mfkey32.
+        result_maps = {}
+        for item in result_list:
+            result_maps.setdefault(item["uid"], {}).setdefault(
+                item["block"], {}).setdefault(item["type"], []).append(item)
+
+        all_keys = set()
+        for uid in result_maps:
+            print(f" - Reader keys for UID [{uid.upper()}]")
+            uid_found_keys = set()
+            for block in result_maps[uid]:
+                for keyType in "AB":
+                    records = result_maps[uid][block].get(keyType, [])
+                    if len(records) < 1:
+                        continue
+                    keys = self.decrypt_by_list(records, uid_found_keys)
+                    uid_found_keys.update(keys)
+                    if keys:
+                        print(f"   Block {block} key {keyType}: "
+                              f"{', '.join(sorted(k.upper() for k in keys))}")
+            all_keys.update(uid_found_keys)
+
+        if not all_keys:
+            print(color_string((CY, " - No keys recovered. Capture more auth attempts "
+                                    "(ideally 2+ per sector with a fixed UID).")))
+        elif args.output:
+            with open(args.output, "w") as f:
+                for k in sorted(all_keys):
+                    f.write(k.upper() + "\n")
+            print(color_string((CG, f" - Saved {len(all_keys)} unique key(s) to {args.output}")))
+
+        if args.clear:
+            # set_detection_enable clears the log on the firmware side; re-enabling
+            # keeps capture running with a fresh buffer.
+            self.cmd.mf1_set_detection_enable(True)
+            print(" - On-device log cleared, still capturing")
+
+
+@hf_mf_readerkeys.command("stop")
+class HFMFReaderKeysStop(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = ("Stop reader-key capture: disable logging + UID randomization "
+                              "and stop the LED animation (this clears the on-device log)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        self.cmd.mf1_set_reader_keys_anim(False)
+        self.cmd.mf1_set_random_uid_mode(False)
+        # Disabling detection clears the on-device auth log — extract first!
+        self.cmd.mf1_set_detection_enable(False)
+        print(color_string((CG, " - Reader-key capture stopped (on-device log cleared)")))
 
 
 @hf_mf.command("eload")

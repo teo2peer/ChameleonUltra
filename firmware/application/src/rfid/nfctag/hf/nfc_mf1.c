@@ -698,6 +698,12 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
 #endif
                     // The verification is successful, and you need to enter the state that has been successfully verified
                     m_mf1_state = MF1_STATE_AUTHENTICATED;
+                    // Commit the captured nonce for a *successful* auth too. This lets the
+                    // reader-key (MFKey32) capture work even when the emulated dump already
+                    // holds the reader's real key (auth succeeds); otherwise the tuple would
+                    // be overwritten by the next auth and lost. Gated by detection_enable
+                    // inside step3, so it is a no-op when detection is off.
+                    append_mf1_auth_log_step3(true);
                     // Package, stitch the Qiqi school inspection, return
                     m_tag_tx_buffer.tx_frame_bit_size = nfc_tag_14a_wrap_frame(m_tag_tx_buffer.tx_raw_buffer, 32, m_tag_tx_buffer.tx_bit_parity, m_tag_tx_buffer.tx_warp_frame);
                     nfc_tag_14a_tx_bits(m_tag_tx_buffer.tx_warp_frame, m_tag_tx_buffer.tx_frame_bit_size);
@@ -1086,11 +1092,38 @@ nfc_tag_14a_coll_res_reference_t *get_saved_mifare_coll_res() {
 }
 
 /**
+ * @brief Fill the standalone anti-collision UID with fresh random bytes,
+ *        matching the currently configured UID length (4/7/10).
+ */
+static void nfc_tag_mf1_regen_random_uid(void) {
+    uint8_t len = m_tag_information->res_coll.size;
+    if (len != NFC_TAG_14A_UID_SINGLE_SIZE &&
+            len != NFC_TAG_14A_UID_DOUBLE_SIZE &&
+            len != NFC_TAG_14A_UID_TRIPLE_SIZE) {
+        len = NFC_TAG_14A_UID_SINGLE_SIZE;
+    }
+    for (uint8_t i = 0; i < len; i++) {
+        m_tag_information->res_coll.uid[i] = (uint8_t)(rand() & 0xFF);
+    }
+    // 0x88 is the cascade-tag marker; it must not appear as the first UID byte.
+    if (m_tag_information->res_coll.uid[0] == 0x88) {
+        m_tag_information->res_coll.uid[0] = 0x08;
+    }
+}
+
+/**
  * @brief Reconcile when the parameter label needs to be reset
  */
 void nfc_tag_mf1_reset_handler() {
     m_mf1_state = MF1_STATE_UNAUTHENTICATED;
     m_gen1a_state = GEN1A_STATE_DISABLE;
+
+    // Random-UID mode: generate a fresh UID for every new reader session
+    // (this handler runs on REQA/WUPA), so the reader sees a different card
+    // each activation.
+    if (m_tag_information->config.random_uid) {
+        nfc_tag_mf1_regen_random_uid();
+    }
 
 #ifndef NFC_MF1_FAST_SIM
     // Must to reset pcs handler
@@ -1200,7 +1233,7 @@ bool nfc_tag_mf1_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
 
     // PRNG type defaults to WEAK (1) — real MFC LFSR, compatible with Eltis readers
     p_mf1_information->config.prng_type = 1;
-    p_mf1_information->config.reserved1 = 0x00;
+    p_mf1_information->config.random_uid = false;
     p_mf1_information->config.reserved2 = 0x00;
     p_mf1_information->config.reserved3 = 0x00;
 
@@ -1227,6 +1260,23 @@ void nfc_tag_mf1_set_detection_enable(bool enable) {
 // Whether it can be detected at present
 bool nfc_tag_mf1_is_detection_enable(void) {
     return m_tag_information->config.detection_enable;
+}
+
+// Enable/disable random-UID-per-activation mode
+void nfc_tag_mf1_set_random_uid_mode(bool enable) {
+    m_tag_information->config.random_uid = enable;
+    if (enable) {
+        // Random UID lives in the standalone anti-collision entity, so make sure
+        // we do not fall back to the (fixed) block-0 UID.
+        m_tag_information->config.use_mf1_coll_res = false;
+        // Apply immediately so the change is visible without a field cycle.
+        nfc_tag_mf1_regen_random_uid();
+    }
+}
+
+// Whether random-UID mode is enabled
+bool nfc_tag_mf1_is_random_uid_mode(void) {
+    return m_tag_information->config.random_uid;
 }
 
 // Clear detection record

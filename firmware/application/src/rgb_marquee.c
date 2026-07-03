@@ -4,6 +4,7 @@
 #include "bsp_delay.h"
 #include "rgb_marquee.h"
 #include "bsp_time.h"
+#include "app_timer.h"
 
 
 #define NRF_LOG_MODULE_NAME rgb
@@ -35,6 +36,7 @@ static autotimer *timer;
 static uint8_t rgb_marquee_usb_idle_step = 0;
 static uint8_t rgb_marquee_usb_idle_color = RGB_RED;
 static uint8_t rgb_marquee_usb_open_step = 0;
+static bool m_reader_keys_anim_active = false;
 extern bool g_usb_led_marquee_enable;
 
 
@@ -663,4 +665,73 @@ void rgb_marquee_symmetric_in(uint8_t color, uint8_t slot) {
  */
 bool rgb_marquee_is_enabled(void) {
     return g_usb_led_marquee_enable;
+}
+
+/**
+ * @brief Enable/disable the reader-key capture animation.
+ *
+ * When enabling, release any PWM the idle/open marquee may still be driving so
+ * that rgb_marquee_reader_keys_loop() can drive the position LEDs directly as
+ * GPIO. rgb_marquee_stop() zeroes both step counters, so a non-zero step means
+ * the marquee had actually started PWM and it is safe to stop.
+ */
+void rgb_marquee_set_reader_keys_anim(bool enable) {
+    m_reader_keys_anim_active = enable;
+    if (enable) {
+        if (rgb_marquee_usb_idle_step != 0 || rgb_marquee_usb_open_step != 0) {
+            rgb_marquee_stop();
+        }
+    } else {
+        // Force the normal marquee / slot indicator to refresh on the next tick.
+        rgb_marquee_reset();
+    }
+}
+
+bool rgb_marquee_is_reader_keys_anim(void) {
+    return m_reader_keys_anim_active;
+}
+
+/**
+ * @brief Rainbow that radiates from the center of the LED bar outward.
+ *
+ * The hardware shares one RGB colour bus across all 8 position LEDs, so every
+ * lit LED shows the same colour at any instant. This renders a colour wave: a
+ * ring grows from the centre pair (indices 3 & 4) out to the edges (0 & 7),
+ * and the single shared colour steps through the rainbow over time. Fully
+ * non-blocking: it advances one frame per call, throttled with app_timer.
+ */
+void rgb_marquee_reader_keys_loop(void) {
+    static uint8_t radius = 1;         // 1..4 concentric pairs lit, from the centre
+    static uint8_t color_index = 0;
+    static uint32_t last_update = 0;
+
+    uint32_t now = app_timer_cnt_get();
+    if (app_timer_cnt_diff_compute(now, last_update) < APP_TIMER_TICKS(120)) {
+        return;
+    }
+    last_update = now;
+
+    const uint8_t colors[] = {RGB_RED, RGB_YELLOW, RGB_GREEN, RGB_CYAN, RGB_BLUE, RGB_MAGENTA};
+    uint32_t *led_pins = hw_get_led_array();
+
+    set_slot_light_color(colors[color_index]);
+    for (uint8_t i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_clear(led_pins[i]);
+    }
+    // Light concentric pairs from the centre outward: r=1 -> (3,4), r=2 -> (2,5) ...
+    for (uint8_t r = 1; r <= radius; r++) {
+        uint8_t left = 4 - r;
+        uint8_t right = 3 + r;
+        if (left < RGB_LIST_NUM) {
+            nrf_gpio_pin_set(led_pins[left]);
+        }
+        if (right < RGB_LIST_NUM) {
+            nrf_gpio_pin_set(led_pins[right]);
+        }
+    }
+
+    if (++radius > 4) {
+        radius = 1;
+        color_index = (color_index + 1) % 6;
+    }
 }

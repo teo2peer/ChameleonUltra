@@ -4,6 +4,7 @@
 #include "usb_main.h"
 #include "rfid_main.h"
 #include "ble_main.h"
+#include "rgb_marquee.h"
 #include "syssleep.h"
 #include "hex_utils.h"
 #include "data_cmd.h"
@@ -1705,6 +1706,27 @@ static data_frame_tx_t *cmd_processor_mf1_set_prng_type(uint16_t cmd, uint16_t s
     return data_frame_make(cmd, STATUS_SUCCESS, 1, &data[0]);  // echo back the set value
 }
 
+static data_frame_tx_t *cmd_processor_mf1_set_random_uid_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 1 || data[0] > 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    nfc_tag_mf1_set_random_uid_mode(data[0]);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_mf1_get_random_uid_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t is_enable = nfc_tag_mf1_is_random_uid_mode();
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, (uint8_t *)(&is_enable));
+}
+
+static data_frame_tx_t *cmd_processor_mf1_set_reader_keys_anim(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 1 || data[0] > 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    rgb_marquee_set_reader_keys_anim(data[0]);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 static data_frame_tx_t *cmd_processor_mf1_get_gen1a_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t mode = nfc_tag_mf1_is_gen1a_magic_mode();
     return data_frame_make(cmd, STATUS_SUCCESS, 1, &mode);
@@ -3076,6 +3098,9 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_MF1_GET_EMULATOR_CONFIG,      NULL,                        cmd_processor_mf1_get_emulator_config,       NULL                   },
     {    DATA_CMD_MF1_GET_PRNG_TYPE,            NULL,                        cmd_processor_mf1_get_prng_type,             NULL                   },
     {    DATA_CMD_MF1_SET_PRNG_TYPE,            NULL,                        cmd_processor_mf1_set_prng_type,             NULL                   },
+    {    DATA_CMD_MF1_SET_RANDOM_UID_MODE,      NULL,                        cmd_processor_mf1_set_random_uid_mode,       NULL                   },
+    {    DATA_CMD_MF1_GET_RANDOM_UID_MODE,      NULL,                        cmd_processor_mf1_get_random_uid_mode,       NULL                   },
+    {    DATA_CMD_MF1_SET_READER_KEYS_ANIM,     NULL,                        cmd_processor_mf1_set_reader_keys_anim,      NULL                   },
     {    DATA_CMD_MF1_GET_GEN1A_MODE,           NULL,                        cmd_processor_mf1_get_gen1a_mode,            NULL                   },
     {    DATA_CMD_MF1_SET_GEN1A_MODE,           NULL,                        cmd_processor_mf1_set_gen1a_mode,            NULL                   },
     {    DATA_CMD_MF1_GET_GEN2_MODE,            NULL,                        cmd_processor_mf1_get_gen2_mode,             NULL                   },

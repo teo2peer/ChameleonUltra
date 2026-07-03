@@ -165,6 +165,9 @@
 #define DATA_CMD_MF1_GET_FIELD_OFF_DO_RESET     (4039)
 #define DATA_CMD_MF1_GET_PRNG_TYPE              (4040)  // 0=static 1=weak(LFSR) 2=hard(rand)
 #define DATA_CMD_MF1_SET_PRNG_TYPE              (4041)
+#define DATA_CMD_MF1_SET_RANDOM_UID_MODE        (4042)  // emulate a new random UID on each reader activation
+#define DATA_CMD_MF1_GET_RANDOM_UID_MODE        (4043)
+#define DATA_CMD_MF1_SET_READER_KEYS_ANIM       (4044)  // center-out rainbow LED animation for reader-key capture
 //
 // ******************************************************************
 

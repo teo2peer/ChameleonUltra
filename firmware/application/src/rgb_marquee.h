@@ -19,4 +19,10 @@ void rgb_marquee_usb_idle(void);
 void rgb_marquee_symmetric_out(uint8_t color, uint8_t slot);
 void rgb_marquee_symmetric_in(uint8_t color, uint8_t slot);
 
+// Reader-key capture animation: a rainbow that radiates from the center of the
+// LED bar outward. Non-blocking; drive it once per main-loop iteration.
+void rgb_marquee_reader_keys_loop(void);
+void rgb_marquee_set_reader_keys_anim(bool enable);
+bool rgb_marquee_is_reader_keys_anim(void);
+
 #endif

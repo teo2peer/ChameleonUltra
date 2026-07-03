@@ -33,6 +33,9 @@ typedef enum {
     SettingsButtonShowBattery = 4U,
     // Toggle NFC field generator on/off (Ultra only, must be in reader mode)
     SettingsButtonNfcFieldGenerator = 5U,
+    // Toggle reader-key (MFKey32) capture on the active MIFARE Classic slot:
+    // arms auth logging and runs the center-out rainbow LED animation
+    SettingsButtonReaderKeys = 6U,
 } settings_button_function_t;
 
 typedef struct ALIGN_U32 {

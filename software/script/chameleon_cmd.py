@@ -1135,6 +1135,44 @@ class ChameleonCMD:
         return self.device.send_cmd_sync(Command.MF1_SET_DETECTION_ENABLE, data)
 
     @expect_response(Status.SUCCESS)
+    def mf1_set_random_uid_mode(self, enabled: bool):
+        """
+        Set whether the emulator presents a new random UID on each reader activation.
+
+        Note: random UID fragments MFKey32 recovery (which needs two auths sharing
+        the same UID); use a fixed UID when maximizing key capture.
+
+        :param enabled: Whether to enable random-UID mode
+        :return:
+        """
+        data = struct.pack('!B', enabled)
+        return self.device.send_cmd_sync(Command.MF1_SET_RANDOM_UID_MODE, data)
+
+    @expect_response(Status.SUCCESS)
+    def mf1_get_random_uid_mode(self):
+        """
+        Get whether random-UID mode is enabled for the current card slot.
+
+        :return:
+        """
+        resp = self.device.send_cmd_sync(Command.MF1_GET_RANDOM_UID_MODE)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = struct.unpack('!B', resp.data)[0] == 1
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def mf1_set_reader_keys_anim(self, enabled: bool):
+        """
+        Enable/disable the reader-key capture LED animation (rainbow radiating
+        from the center of the LED bar outward).
+
+        :param enabled: Whether to run the animation
+        :return:
+        """
+        data = struct.pack('!B', enabled)
+        return self.device.send_cmd_sync(Command.MF1_SET_READER_KEYS_ANIM, data)
+
+    @expect_response(Status.SUCCESS)
     def mf1_get_detection_count(self):
         """
         Get the statistics of the current detection records.

@@ -80,8 +80,10 @@ typedef struct {
     uint8_t field_off_do_reset: 1;
     // PRNG type: 0=static 1=weak/LFSR(default) 2=hard/rand
     uint8_t prng_type: 2;
-    // reserved
-    uint8_t reserved1: 1;
+    // Emulate a new random UID on each reader activation (REQA/WUPA).
+    // Note: this fragments MFKey32 recovery (which needs 2 auths sharing the
+    // same UID), so it is meant for reader fingerprinting/testing, not capture.
+    uint8_t random_uid: 1;
     uint8_t reserved2;
     uint8_t reserved3;
 } nfc_tag_mf1_configure_t;
@@ -154,6 +156,8 @@ int nfc_tag_mf1_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer)
 bool nfc_tag_mf1_data_factory(uint8_t slot, tag_specific_type_t tag_type);
 void nfc_tag_mf1_set_detection_enable(bool enable);
 bool nfc_tag_mf1_is_detection_enable(void);
+void nfc_tag_mf1_set_random_uid_mode(bool enable);
+bool nfc_tag_mf1_is_random_uid_mode(void);
 void nfc_tag_mf1_detection_log_clear(void);
 uint32_t nfc_tag_mf1_detection_log_count(void);
 nfc_tag_14a_coll_res_reference_t *get_mifare_coll_res(void);
