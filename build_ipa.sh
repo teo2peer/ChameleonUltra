@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Flutter GUI project (sibling repo). Override with env GUI_DIR if you moved it.
 PROJECT_DIR="${GUI_DIR:-$SCRIPT_DIR/../ChameleonUltraGUI/chameleonultragui}"
-DEST="${1:-$HOME/Desktop}"
+DEST="/Users/teo/projects/Chamaleon/ChameleonUltra"
 IPA_NAME="ChameleonUltraGUI.ipa"
 
 if [ ! -d "$PROJECT_DIR" ]; then

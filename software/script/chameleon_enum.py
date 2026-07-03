@@ -186,6 +186,18 @@ class Command(enum.IntEnum):
     BLE_SCAN_GET_COUNT = 7002
     BLE_SCAN_GET_RESULTS = 7003
 
+    # BLE directed GATT fuzzing harness — point-to-point against ONE target
+    BLE_CONNECT = 7010
+    BLE_DISCONNECT = 7011
+    BLE_CENTRAL_STATE = 7012
+    BLE_GATT_DISCOVER = 7013
+    BLE_GATT_GET_CHARS = 7014
+    BLE_FUZZ_START = 7015
+    BLE_FUZZ_STOP = 7016
+    BLE_FUZZ_GET_LOG = 7017
+    BLE_GATT_READ = 7018
+    BLE_GATT_GET_READ = 7019
+
 
 @enum.unique
 class Status(enum.IntEnum):

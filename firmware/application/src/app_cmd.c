@@ -4,6 +4,7 @@
 #include "usb_main.h"
 #include "rfid_main.h"
 #include "ble_main.h"
+#include "ble_central.h"
 #include "rgb_marquee.h"
 #include "syssleep.h"
 #include "hex_utils.h"
@@ -3239,17 +3240,39 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
         }
     }
 
-    /* Per application: SelectApplication (0x5A) + GetFileIDs (0x6F) */
+    /* Per application: SelectApplication (0x5A), GetKeySettings (0x45),
+     * GetFileIDs (0x6F), and GetFileSettings (0xF5) per file. */
+    static const uint8_t getks[]    = {0x90, 0x45, 0x00, 0x00, 0x00};
     static const uint8_t getfiles[] = {0x90, 0x6F, 0x00, 0x00, 0x00};
     for (uint8_t a = 0; a < aids_count; a++) {
+        if (out_len >= NETDATA_MAX_DATA_LENGTH - 400) break;
         uint8_t selapp[9] = {0x90, 0x5A, 0x00, 0x00, 0x03,
                              aids[a * 3], aids[a * 3 + 1], aids[a * 3 + 2], 0x00};
         if (!SEND_APDU(selapp, sizeof(selapp), &r, &rl)) continue;
         APPEND_PAIR(selapp, sizeof(selapp), r, rl);
         num_apdus++;
+        /* GetKeySettings (0x45): settings byte + key count */
+        if (SEND_APDU(getks, sizeof(getks), &r, &rl)) {
+            APPEND_PAIR(getks, sizeof(getks), r, rl);
+            num_apdus++;
+        }
         if (SEND_APDU(getfiles, sizeof(getfiles), &r, &rl)) {
             APPEND_PAIR(getfiles, sizeof(getfiles), r, rl);
             num_apdus++;
+            /* Copy file IDs before further SEND_APDU overwrites the chain buf. */
+            uint8_t fids[32];
+            uint8_t fcount = (rl >= 2) ? (uint8_t)(rl - 2) : 0;
+            if (fcount > sizeof(fids)) fcount = sizeof(fids);
+            memcpy(fids, r, fcount);
+            for (uint8_t f = 0; f < fcount; f++) {
+                if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
+                /* GetFileSettings (0xF5) for this file id */
+                uint8_t gfs[7] = {0x90, 0xF5, 0x00, 0x00, 0x01, fids[f], 0x00};
+                if (SEND_APDU(gfs, sizeof(gfs), &r, &rl)) {
+                    APPEND_PAIR(gfs, sizeof(gfs), r, rl);
+                    num_apdus++;
+                }
+            }
         }
     }
 
@@ -3289,6 +3312,79 @@ static data_frame_tx_t *cmd_processor_ble_scan_get_results(uint16_t cmd, uint16_
     uint8_t start_index = (length >= 1) ? data[0] : 0;
     static uint8_t out[NETDATA_MAX_DATA_LENGTH];
     uint16_t out_len = ble_scan_copy_records(start_index, out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
+// ---------------------------------------------------------------------------
+// Directed BLE GATT fuzzing harness commands (central role; see ble_central.c).
+// Point-to-point against ONE operator-specified target address; never broadcasts.
+// ---------------------------------------------------------------------------
+static data_frame_tx_t *cmd_processor_ble_connect(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 7) { // addr_type[1] + addr[6]
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t err_code = ble_central_connect(data[0], &data[1]);
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_disconnect(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t err_code = ble_central_disconnect();
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_central_state(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[8];
+    uint16_t out_len = ble_central_get_state(out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
+static data_frame_tx_t *cmd_processor_ble_gatt_discover(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t err_code = ble_central_gatt_discover();
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_gatt_get_chars(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t start_index = (length >= 1) ? data[0] : 0;
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = ble_central_copy_chars(start_index, out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
+static data_frame_tx_t *cmd_processor_ble_fuzz_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 6) { // value_handle[2] + max_iter[2] + interval_ms[2], big-endian
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t handle   = ((uint16_t)data[0] << 8) | data[1];
+    uint16_t max_iter = ((uint16_t)data[2] << 8) | data[3];
+    uint16_t interval = ((uint16_t)data[4] << 8) | data[5];
+    uint32_t err_code = ble_central_fuzz_start(handle, max_iter, interval);
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_fuzz_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    ble_central_fuzz_stop();
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_fuzz_get_log(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint16_t start_index = (length >= 2) ? (((uint16_t)data[0] << 8) | data[1]) : 0;
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = ble_central_copy_log(start_index, out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
+static data_frame_tx_t *cmd_processor_ble_gatt_read(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 2) { // value_handle[2], big-endian
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t handle = ((uint16_t)data[0] << 8) | data[1];
+    uint32_t err_code = ble_central_gatt_read(handle);
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_gatt_get_read(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[3 + 64]; // state + status + len + up to BLE_READ_VALUE_MAX bytes
+    uint16_t out_len = ble_central_copy_read(out, sizeof(out));
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
 
@@ -3338,6 +3434,17 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_SCAN_STOP,                NULL,                        cmd_processor_ble_scan_stop,                 NULL                   },
     {    DATA_CMD_BLE_SCAN_GET_COUNT,           NULL,                        cmd_processor_ble_scan_get_count,            NULL                   },
     {    DATA_CMD_BLE_SCAN_GET_RESULTS,         NULL,                        cmd_processor_ble_scan_get_results,          NULL                   },
+
+    {    DATA_CMD_BLE_CONNECT,                  NULL,                        cmd_processor_ble_connect,                   NULL                   },
+    {    DATA_CMD_BLE_DISCONNECT,               NULL,                        cmd_processor_ble_disconnect,                NULL                   },
+    {    DATA_CMD_BLE_CENTRAL_STATE,            NULL,                        cmd_processor_ble_central_state,             NULL                   },
+    {    DATA_CMD_BLE_GATT_DISCOVER,            NULL,                        cmd_processor_ble_gatt_discover,             NULL                   },
+    {    DATA_CMD_BLE_GATT_GET_CHARS,           NULL,                        cmd_processor_ble_gatt_get_chars,            NULL                   },
+    {    DATA_CMD_BLE_FUZZ_START,               NULL,                        cmd_processor_ble_fuzz_start,                NULL                   },
+    {    DATA_CMD_BLE_FUZZ_STOP,                NULL,                        cmd_processor_ble_fuzz_stop,                 NULL                   },
+    {    DATA_CMD_BLE_FUZZ_GET_LOG,             NULL,                        cmd_processor_ble_fuzz_get_log,              NULL                   },
+    {    DATA_CMD_BLE_GATT_READ,                NULL,                        cmd_processor_ble_gatt_read,                 NULL                   },
+    {    DATA_CMD_BLE_GATT_GET_READ,            NULL,                        cmd_processor_ble_gatt_get_read,             NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 

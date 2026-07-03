@@ -223,4 +223,20 @@
 #define DATA_CMD_BLE_SCAN_GET_COUNT             (7002)  /* number of distinct devices seen      */
 #define DATA_CMD_BLE_SCAN_GET_RESULTS           (7003)  /* paged device records by start index  */
 
+// Directed GATT fuzzing harness — point-to-point against ONE user-specified
+// target address. Connects out (central role), enumerates the target's GATT
+// characteristics and writes mutated payloads to a chosen characteristic. It
+// NEVER broadcasts to the environment; everything is scoped to the single
+// connected target, and DATA_CMD_BLE_DISCONNECT frees it to reconnect normally.
+#define DATA_CMD_BLE_CONNECT                    (7010)  /* connect to target: addr_type[1]|addr[6] */
+#define DATA_CMD_BLE_DISCONNECT                 (7011)  /* disconnect / free the target            */
+#define DATA_CMD_BLE_CENTRAL_STATE              (7012)  /* poll connection/discovery/fuzz state    */
+#define DATA_CMD_BLE_GATT_DISCOVER              (7013)  /* enumerate target GATT characteristics   */
+#define DATA_CMD_BLE_GATT_GET_CHARS             (7014)  /* paged characteristic list               */
+#define DATA_CMD_BLE_FUZZ_START                 (7015)  /* value_handle[2]|max_iter[2]|interval[2] */
+#define DATA_CMD_BLE_FUZZ_STOP                  (7016)  /* stop fuzzing                            */
+#define DATA_CMD_BLE_FUZZ_GET_LOG               (7017)  /* paged fuzz log by start index           */
+#define DATA_CMD_BLE_GATT_READ                  (7018)  /* read a characteristic value: handle[2] */
+#define DATA_CMD_BLE_GATT_GET_READ              (7019)  /* fetch last GATT read result            */
+
 #endif

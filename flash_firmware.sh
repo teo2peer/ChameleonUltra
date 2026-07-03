@@ -49,7 +49,7 @@ echo "    $(basename "$ZIP")"
 
 # --- Free the serial port (close the GUI if it's holding it) ---
 pkill -f "Chameleon Ultra GUI" 2>/dev/null || true
-sleep 1
+sleep 2  # give macOS time to release the serial port before we reopen it
 
 # --- Enter the DFU bootloader via the client (raw enter_dfu.py is flaky on macOS) ---
 echo "==> Entering DFU bootloader…"
@@ -89,8 +89,12 @@ echo "    programmed OK"
 
 # --- Verify it rebooted and advertises commands (best-effort; never fatal) ---
 set +e
-sleep 3
-PORT="$(nrfutil device list 2>/dev/null | grep -oE '/dev/tty.usbmodem[A-Za-z0-9]+' | head -1)"
+PORT=""
+for _v in 1 2 3 4 5 6; do
+  sleep 1
+  PORT="$(nrfutil device list 2>/dev/null | grep -oE '/dev/tty.usbmodem[A-Za-z0-9]+' | head -1)"
+  [ -n "$PORT" ] && break
+done
 echo "==> Verifying (${PORT:-?})…"
 if [ -n "$PORT" ]; then
   "$PYBIN" - "$SCRIPT_DIR" "$PORT" <<'PY'

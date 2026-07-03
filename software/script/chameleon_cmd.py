@@ -168,6 +168,114 @@ class ChameleonCMD:
             resp.parsed = devices
         return resp
 
+    # --- Directed BLE GATT fuzzing harness (central role) -------------------
+    # Point-to-point against ONE target the operator specifies by address.
+
+    def ble_connect(self, addr: bytes, addr_type: int = 0):
+        """
+        Connect to a single BLE target.
+
+        :param addr: 6-byte target address, little-endian (as the scanner reports)
+        :param addr_type: BLE GAP address type (0=public, 1=random). Default 0.
+        """
+        data = struct.pack('!B', addr_type) + bytes(addr)
+        return self.device.send_cmd_sync(Command.BLE_CONNECT, data)
+
+    def ble_disconnect(self):
+        """Disconnect from the target, freeing it to reconnect normally."""
+        return self.device.send_cmd_sync(Command.BLE_DISCONNECT)
+
+    def ble_central_state(self):
+        """
+        Poll harness state. Returns a dict with conn_state, disc_state,
+        char_count, fuzz_state, fuzz_sent, target_alive, last_reason.
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_CENTRAL_STATE)
+        state = {}
+        if resp.status == Status.SUCCESS and len(resp.data) >= 8:
+            conn, disc, chars, fuzz, sent_hi, sent_lo, alive, reason = \
+                struct.unpack_from('!8B', resp.data, 0)
+            state = {
+                'conn_state': conn, 'disc_state': disc, 'char_count': chars,
+                'fuzz_state': fuzz, 'fuzz_sent': (sent_hi << 8) | sent_lo,
+                'target_alive': bool(alive), 'last_reason': reason,
+            }
+        return state
+
+    def ble_gatt_discover(self):
+        """Start enumerating the connected target's GATT characteristics (async)."""
+        return self.device.send_cmd_sync(Command.BLE_GATT_DISCOVER)
+
+    @expect_response(Status.SUCCESS)
+    def ble_gatt_get_chars(self, start_index: int = 0):
+        """
+        Fetch discovered characteristics. Wire per char:
+        value_handle[2] | props[1] | uuid_type[1] | uuid[2] (big-endian).
+        """
+        data = struct.pack('!B', start_index)
+        resp = self.device.send_cmd_sync(Command.BLE_GATT_GET_CHARS, data)
+        if resp.status == Status.SUCCESS:
+            offset = 0
+            chars = []
+            while offset + 6 <= len(resp.data):
+                value_handle, props, uuid_type, uuid = struct.unpack_from('!HBBH', resp.data, offset)
+                offset += 6
+                chars.append({'handle': value_handle, 'props': props,
+                              'uuid_type': uuid_type, 'uuid': uuid})
+            resp.parsed = chars
+        return resp
+
+    def ble_fuzz_start(self, value_handle: int, max_iterations: int = 0, interval_ms: int = 50):
+        """
+        Start fuzzing: write mutated payloads to value_handle on the connected
+        target, every interval_ms, up to max_iterations (0 = until stopped).
+        """
+        data = struct.pack('!HHH', value_handle, max_iterations, interval_ms)
+        return self.device.send_cmd_sync(Command.BLE_FUZZ_START, data)
+
+    def ble_fuzz_stop(self):
+        """Stop fuzzing."""
+        return self.device.send_cmd_sync(Command.BLE_FUZZ_STOP)
+
+    def ble_gatt_read_start(self, value_handle: int):
+        """Initiate a GATT read of value_handle on the connected target (async)."""
+        return self.device.send_cmd_sync(Command.BLE_GATT_READ,
+                                         struct.pack('!H', value_handle))
+
+    def ble_gatt_read_result(self):
+        """
+        Fetch the last GATT read result: dict {state, gatt_status, data}.
+        state: 0 idle, 1 pending, 2 ready.
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_GATT_GET_READ)
+        out = {'state': 0, 'gatt_status': 0, 'data': b''}
+        if resp.status == Status.SUCCESS and len(resp.data) >= 3:
+            ln = resp.data[2]
+            out = {'state': resp.data[0], 'gatt_status': resp.data[1],
+                   'data': bytes(resp.data[3:3 + ln])}
+        return out
+
+    @expect_response(Status.SUCCESS)
+    def ble_fuzz_get_log(self, start_index: int = 0):
+        """
+        Fetch the fuzz log. Wire per entry:
+        index[2] | payload_len[1] | write_status[1] | data[min(payload_len, 16)].
+        """
+        data = struct.pack('!H', start_index)
+        resp = self.device.send_cmd_sync(Command.BLE_FUZZ_GET_LOG, data)
+        if resp.status == Status.SUCCESS:
+            offset = 0
+            entries = []
+            while offset + 4 <= len(resp.data):
+                index, plen, wstatus = struct.unpack_from('!HBB', resp.data, offset)
+                offset += 4
+                dlen = min(plen, 16)
+                payload = resp.data[offset:offset + dlen]
+                offset += dlen
+                entries.append({'index': index, 'len': plen, 'status': wstatus, 'data': payload})
+            resp.parsed = entries
+        return resp
+
     def mf1_detect_support(self):
         """
         Detect whether it is mifare classic tag.

@@ -20,6 +20,7 @@
 
 #include "syssleep.h"
 #include "ble_main.h"
+#include "ble_central.h"
 #include "dataframe.h"
 #include "hw_connect.h"
 #include "settings.h"
@@ -515,6 +516,12 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
 
     switch (p_ble_evt->header.evt_id) {
         case BLE_GAP_EVT_CONNECTED:
+            // Only the peripheral (app/NUS) link is handled here. Central links
+            // to a fuzzing target are handled in ble_central.c — ignore them so
+            // we don't clobber the app connection state.
+            if (p_ble_evt->evt.gap_evt.params.connected.role != BLE_GAP_ROLE_PERIPH) {
+                break;
+            }
             sleep_timer_stop();
 
             NRF_LOG_INFO("Connected");
@@ -525,6 +532,11 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
+            // Ignore disconnects of the central (target) link; only react to the
+            // app/NUS peripheral link going away.
+            if (p_ble_evt->evt.gap_evt.conn_handle != m_conn_handle) {
+                break;
+            }
             NRF_LOG_INFO("Disconnected");
             // LED indication will be changed when advertising starts.
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
@@ -897,6 +909,7 @@ void ble_slave_init(void) {
     advertising_init();                 // Broadcast parameter initialization
     conn_params_init();                 // Connection parameter initialization
     peer_manager_init();                // Peer manager Initialization
+    ble_central_init();                 // Directed BLE fuzzing harness (central role) timer
 }
 
 void register_lf_adc_callback(lf_adc_callback_t cb) {

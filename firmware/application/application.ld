@@ -6,7 +6,13 @@ GROUP(-lgcc -lc -lnosys)
 MEMORY
 {
   FLASH (rx) : ORIGIN = 0x27000, LENGTH = 0xCC000
-  RAM (rwx) :  ORIGIN = 0x20002ae8, LENGTH = 0x35518
+  /* RAM ORIGIN was 0x20002ae8 (peripheral-only). Enabling the BLE central role
+   * + 2 total links (see sdk_config.h) makes the SoftDevice request more RAM, so
+   * the origin is raised by 0x1000 (4 KB) to 0x20003ae8 and LENGTH reduced to match.
+   * IMPORTANT: this is an estimate. On the first build/flash, if nrf_sdh_ble_enable
+   * asserts (NRF_ERROR_NO_MEM), the SoftDevice logs the exact required RAM start —
+   * set ORIGIN to that value and reduce LENGTH by the same delta, then rebuild. */
+  RAM (rwx) :  ORIGIN = 0x20003ae8, LENGTH = 0x34518
 }
 
 SECTIONS

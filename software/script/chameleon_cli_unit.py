@@ -915,6 +915,66 @@ class RootClear(BaseCLIUnit):
         os.system("clear" if os.name == "posix" else "cls")
 
 
+# Common BLE company identifiers (Bluetooth SIG assigned numbers, subset).
+_BLE_COMPANY_IDS = {
+    0x0001: "Ericsson", 0x0006: "Microsoft", 0x000F: "Broadcom", 0x0059: "Nordic",
+    0x004C: "Apple", 0x004F: "Logitech", 0x0075: "Samsung", 0x0087: "Garmin",
+    0x00D2: "Qualcomm", 0x00E0: "Google", 0x0107: "Fitbit", 0x0131: "Cypress",
+    0x0157: "Huawei", 0x0171: "Amazon", 0x02E5: "Espressif", 0x038F: "Xiaomi",
+    0x0499: "Ruuvi", 0x0A12: "Sony",
+}
+
+
+def decode_ble_adv(adv: bytes):
+    """Decode advertising AD structures (len | type | data...).
+
+    Returns (name, fields): name is the local name if present, fields is a list
+    of human-readable 'label: value' strings for the full breakdown.
+    """
+    name = None
+    fields = []
+    i = 0
+    while i + 1 < len(adv):
+        ln = adv[i]
+        if ln == 0:
+            break
+        ad_type = adv[i + 1]
+        value = adv[i + 2:i + 1 + ln]
+        if ad_type in (0x08, 0x09):
+            name = value.decode('utf-8', errors='replace')
+            fields.append(f"name: {name}")
+        elif ad_type == 0x01 and value:
+            flags = value[0]
+            fl = []
+            if flags & 0x01:
+                fl.append("LE-limited")
+            if flags & 0x02:
+                fl.append("LE-general")
+            if flags & 0x04:
+                fl.append("no-BR/EDR")
+            fields.append(f"flags: {'|'.join(fl) if fl else hex(flags)}")
+        elif ad_type in (0x02, 0x03):
+            uuids = [f"0x{int.from_bytes(value[j:j + 2], 'little'):04X}"
+                     for j in range(0, len(value) - 1, 2)]
+            if uuids:
+                fields.append(f"services16: {', '.join(uuids)}")
+        elif ad_type in (0x06, 0x07):
+            fields.append(f"services128: {len(value) // 16}")
+        elif ad_type == 0x0A and value:
+            fields.append(f"tx_power: {value[0] - 256 if value[0] > 127 else value[0]} dBm")
+        elif ad_type == 0x19 and len(value) >= 2:
+            fields.append(f"appearance: 0x{int.from_bytes(value[0:2], 'little'):04X}")
+        elif ad_type == 0xFF and len(value) >= 2:
+            company = int.from_bytes(value[0:2], 'little')
+            cname = _BLE_COMPANY_IDS.get(company, f"0x{company:04X}")
+            fields.append(f"mfr: {cname} [{value[2:].hex().upper()}]")
+        elif ad_type == 0x16 and len(value) >= 2:
+            svc = int.from_bytes(value[0:2], 'little')
+            fields.append(f"svc_data 0x{svc:04X}: {value[2:].hex().upper()}")
+        i += ln + 1
+    return name, fields
+
+
 @ble.command("scan")
 class BLEScan(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -922,28 +982,14 @@ class BLEScan(DeviceRequiredUnit):
         parser.description = (
             "Passively scan for nearby BLE devices (listen-only: the Chameleon "
             "never transmits, it only receives advertisements already broadcast "
-            "by nearby devices). Prints address, RSSI and advertised name."
+            "by nearby devices). Prints address, RSSI, name and a decode of the "
+            "advertising data (flags, service UUIDs, manufacturer, TX power)."
         )
         parser.add_argument("-t", "--timeout", type=float, default=5.0, metavar="<sec>",
                             help="How long to listen, in seconds (default: 5)")
+        parser.add_argument("-v", "--verbose", action="store_true",
+                            help="Show the full advertising-data breakdown per device")
         return parser
-
-    @staticmethod
-    def parse_adv_name(adv: bytes):
-        # Walk the advertising AD structures (len | type | data...) looking for
-        # the shortened (0x08) or complete (0x09) local name.
-        i = 0
-        name = None
-        while i < len(adv):
-            ln = adv[i]
-            if ln == 0:
-                break
-            ad_type = adv[i + 1] if i + 1 < len(adv) else 0
-            value = adv[i + 2:i + 1 + ln]
-            if ad_type in (0x08, 0x09):
-                name = value.decode('utf-8', errors='replace')
-            i += ln + 1
-        return name
 
     def on_exec(self, args: argparse.Namespace):
         self.cmd.ble_scan_start()
@@ -960,13 +1006,229 @@ class BLEScan(DeviceRequiredUnit):
             return
 
         devices = self.cmd.ble_scan_get_results(0)
+        # Strongest signal first.
+        devices.sort(key=lambda d: d['rssi'], reverse=True)
         print(f"Found {count} device(s):")
         for d in devices:
             # SoftDevice reports the address little-endian; display MSB-first.
             addr = ':'.join(f'{b:02X}' for b in reversed(d['addr']))
-            name = self.parse_adv_name(d['adv'])
-            name_str = f"  name: {name}" if name else ""
+            name, fields = decode_ble_adv(d['adv'])
+            name_str = f"  {name}" if name else ""
             print(f"- {addr}  (type {d['addr_type']})  RSSI {d['rssi']:>4} dBm{name_str}")
+            if args.verbose:
+                for f in fields:
+                    if not f.startswith("name:"):
+                        print(f"    {f}")
+
+
+# ---------------------------------------------------------------------------
+# Directed BLE GATT fuzzing harness (central role).
+# Point-to-point against ONE operator-specified target; never broadcasts.
+# ---------------------------------------------------------------------------
+def _parse_ble_addr(s: str) -> bytes:
+    parts = s.replace('-', ':').split(':')
+    if len(parts) != 6:
+        raise ArgsParserError("address must be 6 hex octets, e.g. AA:BB:CC:DD:EE:FF")
+    try:
+        b = bytes(int(p, 16) for p in parts)
+    except ValueError:
+        raise ArgsParserError("address octets must be hex")
+    return b[::-1]  # displayed MSB-first; firmware/SoftDevice want little-endian
+
+
+@ble.command("connect")
+class BLEConnect(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Connect to ONE BLE target by address (directed fuzzing harness). "
+            "Point-to-point: the Chameleon connects only to this single device you "
+            "specify — it never broadcasts to or disrupts other devices."
+        )
+        parser.add_argument("-a", "--addr", required=True, metavar="<MAC>",
+                            help="Target BLE address, e.g. AA:BB:CC:DD:EE:FF")
+        parser.add_argument("--type", type=int, default=0, choices=[0, 1],
+                            help="Address type: 0=public, 1=random (default 0)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        addr_le = _parse_ble_addr(args.addr)
+        self.cmd.ble_connect(addr_le, args.type)
+        print(f"Connecting to {args.addr} (type {args.type})...")
+        for _ in range(50):  # up to ~5 s
+            time.sleep(0.1)
+            conn = self.cmd.ble_central_state().get('conn_state')
+            if conn == 2:
+                print("Connected. Use 'ble discover' to enumerate characteristics.")
+                return
+            if conn in (0, 3):
+                print("Connection failed / timed out.")
+                return
+        print("Still connecting; check 'ble status'.")
+
+
+@ble.command("disconnect")
+class BLEDisconnect(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Disconnect from the target, freeing it to reconnect normally."
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        self.cmd.ble_fuzz_stop()
+        self.cmd.ble_disconnect()
+        print("Disconnected (target released).")
+
+
+@ble.command("status")
+class BLEStatus(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Show the fuzzing-harness connection / discovery / fuzz state."
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        st = self.cmd.ble_central_state()
+        if not st:
+            print("No state available.")
+            return
+        conn_names = ['idle', 'connecting', 'connected', 'disconnected']
+        disc_names = ['idle', 'discovering', 'done', 'error']
+        fuzz_names = ['idle', 'running', 'stopped']
+        conn = conn_names[st['conn_state']] if st['conn_state'] < len(conn_names) else st['conn_state']
+        disc = disc_names[st['disc_state']] if st['disc_state'] < len(disc_names) else st['disc_state']
+        fuzz = fuzz_names[st['fuzz_state']] if st['fuzz_state'] < len(fuzz_names) else st['fuzz_state']
+        print(f"- connection : {conn}")
+        print(f"- discovery  : {disc} ({st['char_count']} characteristics)")
+        print(f"- fuzz       : {fuzz} ({st['fuzz_sent']} writes sent)")
+        print(f"- target up  : {st['target_alive']}")
+        if st['last_reason']:
+            print(f"- last disconnect reason : 0x{st['last_reason']:02X}")
+
+
+@ble.command("discover")
+class BLEDiscover(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Enumerate the connected target's GATT characteristics."
+        return parser
+
+    @staticmethod
+    def props_str(p: int) -> str:
+        names = []
+        if p & 0x02:
+            names.append('read')
+        if p & 0x04:
+            names.append('write-nr')
+        if p & 0x08:
+            names.append('write')
+        if p & 0x10:
+            names.append('notify')
+        if p & 0x20:
+            names.append('indicate')
+        return ','.join(names) if names else '-'
+
+    def on_exec(self, args: argparse.Namespace):
+        resp = self.cmd.ble_gatt_discover()
+        if resp.status != Status.SUCCESS:
+            print("Not connected to a target (use 'ble connect' first).")
+            return
+        print("Discovering characteristics...")
+        for _ in range(50):  # up to ~5 s
+            time.sleep(0.1)
+            if self.cmd.ble_central_state().get('disc_state') in (2, 3):
+                break
+        chars = self.cmd.ble_gatt_get_chars(0)
+        if not chars:
+            print("No characteristics found.")
+            return
+        print(f"Found {len(chars)} characteristic(s):")
+        for c in chars:
+            print(f"- handle 0x{c['handle']:04X}  UUID 0x{c['uuid']:04X}  "
+                  f"[{self.props_str(c['props'])}]")
+
+
+@ble.command("read")
+class BLERead(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Read a characteristic value from the connected target."
+        parser.add_argument("--handle", type=lambda x: int(x, 0), required=True, metavar="<hex>",
+                            help="Characteristic value handle (from 'ble discover'), e.g. 0x0012")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        resp = self.cmd.ble_gatt_read_start(args.handle)
+        if resp.status != Status.SUCCESS:
+            print("Not connected to a target (use 'ble connect' first).")
+            return
+        for _ in range(40):  # up to ~2 s
+            time.sleep(0.05)
+            r = self.cmd.ble_gatt_read_result()
+            if r['state'] == 2:
+                if r['gatt_status'] != 0:
+                    print(f"Read failed (ATT status 0x{r['gatt_status']:02X})")
+                else:
+                    d = r['data']
+                    printable = f"  \"{d.decode('utf-8', 'replace')}\"" if d else ""
+                    print(f"Handle 0x{args.handle:04X} = {d.hex().upper()}{printable}")
+                return
+        print("Read timed out.")
+
+
+@ble.command("fuzz")
+class BLEFuzz(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Fuzz a characteristic on the connected target by writing mutated "
+            "payloads to it, to exercise its input parsing. Operates only against "
+            "the single connected device (from 'ble connect'). 'ble disconnect' or "
+            "Ctrl-C stops it and frees the target."
+        )
+        parser.add_argument("--handle", type=lambda x: int(x, 0), required=True, metavar="<hex>",
+                            help="Target characteristic value handle (from 'ble discover'), e.g. 0x0012")
+        parser.add_argument("-n", "--count", type=int, default=200, metavar="<n>",
+                            help="Number of writes (0 = until Ctrl-C). Default 200")
+        parser.add_argument("-i", "--interval", type=int, default=50, metavar="<ms>",
+                            help="Delay between writes in ms. Default 50")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        resp = self.cmd.ble_fuzz_start(args.handle, args.count & 0xFFFF, args.interval & 0xFFFF)
+        if resp.status != Status.SUCCESS:
+            print("Could not start fuzzing (is a target connected? use 'ble connect').")
+            return
+        limit = args.count if args.count else 'unlimited'
+        print(f"Fuzzing handle 0x{args.handle:04X}: {limit} writes @ {args.interval}ms. "
+              f"Ctrl-C to stop.")
+        try:
+            while True:
+                time.sleep(0.3)
+                st = self.cmd.ble_central_state()
+                print(f"\r  sent={st.get('fuzz_sent', 0)}  "
+                      f"target_alive={st.get('target_alive', False)}   ", end='', flush=True)
+                if not st.get('target_alive', False) and st.get('conn_state') == 3:
+                    print("\n! Target dropped the connection — possible crash / defensive "
+                          "disconnect.")
+                    break
+                if st.get('fuzz_state') != 1:
+                    print("\n  fuzzing finished.")
+                    break
+        except KeyboardInterrupt:
+            print("\n  interrupted.")
+        finally:
+            self.cmd.ble_fuzz_stop()
+
+        try:
+            log = self.cmd.ble_fuzz_get_log(0)
+        except Exception:
+            log = []
+        if log:
+            print(f"Log ({len(log)} entries, showing last 10):")
+            for e in log[-10:]:
+                st_str = 'ok' if e['status'] == 0 else f"err0x{e['status']:02X}"
+                print(f"  #{e['index']:>5}  len={e['len']:>3}  {st_str}  {e['data'].hex().upper()}")
 
 
 @root.command("rem")
