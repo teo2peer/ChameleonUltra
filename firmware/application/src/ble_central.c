@@ -291,7 +291,9 @@ static uint32_t probe_load_scan_targets(void) {
     uint16_t o = 0;
     uint8_t count = 0;
 
-    while (o + BLE_GAP_ADDR_LEN + 3 <= raw_len && count < BLE_SCAN_MAX_DEVICES) {
+    // Bound by the destination array (m_probe_targets[BLE_PROBE_BATCH_MAX]) so a
+    // larger scan table can never overflow it, even if the two maxes diverge.
+    while (o + BLE_GAP_ADDR_LEN + 3 <= raw_len && count < BLE_PROBE_BATCH_MAX) {
         ble_probe_target_t *target = &m_probe_targets[count];
         memcpy(target->addr, &raw[o], BLE_GAP_ADDR_LEN);
         o += BLE_GAP_ADDR_LEN;
