@@ -67,6 +67,7 @@
 #define DATA_CMD_MF1_NESTED_ACQUIRE             (2006)
 #define DATA_CMD_MF1_AUTH_ONE_KEY_BLOCK         (2007)
 #define DATA_CMD_MF1_READ_ONE_BLOCK             (2008)
+#define DATA_CMD_MF1_READ_BLOCKS                (2018)  /* auth once, read N consecutive blocks in a sector */
 #define DATA_CMD_MF1_WRITE_ONE_BLOCK            (2009)
 #define DATA_CMD_HF14A_RAW                      (2010)
 #define DATA_CMD_HF14A_SCAN_KEEP                (2016)  /* scan+RATS, keep field alive for APDU exchange */
@@ -244,5 +245,7 @@
 #define DATA_CMD_BLE_GATT_GET_READ              (7019)  /* fetch last GATT read result            */
 #define DATA_CMD_BLE_SUBSCRIBE                   (7020)  /* CCCD subscribe: cccd_handle[2]|mode[1] */
 #define DATA_CMD_BLE_GET_NOTIFICATIONS          (7021)  /* paged received notifications           */
+#define DATA_CMD_BLE_FIND_CCCD                   (7022)  /* discover a char's CCCD: value_handle[2] */
+#define DATA_CMD_BLE_GET_CCCD                    (7023)  /* fetch CCCD lookup result               */
 
 #endif

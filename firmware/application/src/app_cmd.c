@@ -498,6 +498,42 @@ static data_frame_tx_t *cmd_processor_mf1_read_one_block(uint16_t cmd, uint16_t 
     return data_frame_make(cmd, status, sizeof(block), block);
 }
 
+// Authenticate once to a sector, then read `count` consecutive blocks from it
+// (MIFARE keeps the sector authenticated across reads) — ~4x fewer auths than
+// read-one-block per block when dumping. All blocks must be in the one sector
+// the start block belongs to. Returns the blocks actually read (16 bytes each);
+// the host fills any tail it didn't get.
+static data_frame_tx_t *cmd_processor_mf1_read_blocks(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    typedef struct {
+        uint8_t type;
+        uint8_t block;   // start block
+        uint8_t count;   // consecutive blocks to read (same sector)
+        uint8_t key[6];
+    } PACKED payload_t;
+    if (length != sizeof(payload_t)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    payload_t *payload = (payload_t *)data;
+    if (payload->count == 0 || payload->count > 16) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    status = auth_key_use_522_hw(payload->block, payload->type, payload->key);
+    if (status != STATUS_HF_TAG_OK) {
+        return data_frame_make(cmd, status, 0, NULL);
+    }
+    static uint8_t out[16 * 16];
+    uint16_t out_len = 0;
+    for (uint8_t i = 0; i < payload->count; i++) {
+        status = pcd_14a_reader_mf1_read(payload->block + i, &out[out_len]);
+        if (status != STATUS_HF_TAG_OK) break; // return the prefix we did read
+        out_len += 16;
+    }
+    if (out_len == 0) {
+        return data_frame_make(cmd, status, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, out_len, out);
+}
+
 static data_frame_tx_t *cmd_processor_mf1_write_one_block(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     typedef struct {
         uint8_t type;
@@ -3444,6 +3480,21 @@ static data_frame_tx_t *cmd_processor_ble_get_notifications(uint16_t cmd, uint16
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
 
+static data_frame_tx_t *cmd_processor_ble_find_cccd(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 2) { // value_handle[2]
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t value_handle = ((uint16_t)data[0] << 8) | data[1];
+    uint32_t err_code = ble_central_find_cccd(value_handle);
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_get_cccd(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[3];
+    uint16_t out_len = ble_central_get_cccd(out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
@@ -3506,6 +3557,8 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_GATT_GET_READ,            NULL,                        cmd_processor_ble_gatt_get_read,             NULL                   },
     {    DATA_CMD_BLE_SUBSCRIBE,                NULL,                        cmd_processor_ble_subscribe,                 NULL                   },
     {    DATA_CMD_BLE_GET_NOTIFICATIONS,        NULL,                        cmd_processor_ble_get_notifications,         NULL                   },
+    {    DATA_CMD_BLE_FIND_CCCD,                NULL,                        cmd_processor_ble_find_cccd,                 NULL                   },
+    {    DATA_CMD_BLE_GET_CCCD,                 NULL,                        cmd_processor_ble_get_cccd,                  NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
@@ -3520,6 +3573,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
 
     {    DATA_CMD_MF1_AUTH_ONE_KEY_BLOCK,       before_hf_reader_run,        cmd_processor_mf1_auth_one_key_block,        after_hf_reader_run    },
     {    DATA_CMD_MF1_READ_ONE_BLOCK,           before_hf_reader_run,        cmd_processor_mf1_read_one_block,            after_hf_reader_run    },
+    {    DATA_CMD_MF1_READ_BLOCKS,              before_hf_reader_run,        cmd_processor_mf1_read_blocks,               after_hf_reader_run    },
     {    DATA_CMD_MF1_WRITE_ONE_BLOCK,          before_hf_reader_run,        cmd_processor_mf1_write_one_block,           after_hf_reader_run    },
     {    DATA_CMD_HF14A_RAW,                    before_reader_run,           cmd_processor_hf14a_raw,                     NULL                   },
     {    DATA_CMD_MF1_MANIPULATE_VALUE_BLOCK,   before_hf_reader_run,        cmd_processor_mf1_manipulate_value_block,    after_hf_reader_run    },
