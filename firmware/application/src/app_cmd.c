@@ -3315,6 +3315,35 @@ static data_frame_tx_t *cmd_processor_ble_scan_get_results(uint16_t cmd, uint16_
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
 
+static data_frame_tx_t *cmd_processor_ble_advertising_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length < 1 || length > 2 || data[0] > 1 || (length == 2 && data[1] > 1)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    if (data[0] == 0) {
+        advertising_stop();
+    } else {
+        advertising_start((length == 2) ? (data[1] != 0) : false);
+    }
+
+    uint8_t state = is_ble_advertising();
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &state);
+}
+
+static data_frame_tx_t *cmd_processor_ble_advertising_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t state = is_ble_advertising();
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &state);
+}
+
+static data_frame_tx_t *cmd_processor_ble_link_probe(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length > 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t global_mode = (length == 1) ? (data[0] != 0) : 0;
+    uint32_t err_code = ble_central_link_probe(global_mode);
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
 // ---------------------------------------------------------------------------
 // Directed BLE GATT fuzzing harness commands (central role; see ble_central.c).
 // Point-to-point against ONE operator-specified target address; never broadcasts.
@@ -3333,7 +3362,7 @@ static data_frame_tx_t *cmd_processor_ble_disconnect(uint16_t cmd, uint16_t stat
 }
 
 static data_frame_tx_t *cmd_processor_ble_central_state(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[8];
+    uint8_t out[16]; // ble_central_get_state now serializes 10 bytes; keep headroom
     uint16_t out_len = ble_central_get_state(out, sizeof(out));
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
@@ -3434,6 +3463,9 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_SCAN_STOP,                NULL,                        cmd_processor_ble_scan_stop,                 NULL                   },
     {    DATA_CMD_BLE_SCAN_GET_COUNT,           NULL,                        cmd_processor_ble_scan_get_count,            NULL                   },
     {    DATA_CMD_BLE_SCAN_GET_RESULTS,         NULL,                        cmd_processor_ble_scan_get_results,          NULL                   },
+    {    DATA_CMD_BLE_ADVERTISING_SET,          NULL,                        cmd_processor_ble_advertising_set,           NULL                   },
+    {    DATA_CMD_BLE_ADVERTISING_GET,          NULL,                        cmd_processor_ble_advertising_get,           NULL                   },
+    {    DATA_CMD_BLE_LINK_PROBE,               NULL,                        cmd_processor_ble_link_probe,                NULL                   },
 
     {    DATA_CMD_BLE_CONNECT,                  NULL,                        cmd_processor_ble_connect,                   NULL                   },
     {    DATA_CMD_BLE_DISCONNECT,               NULL,                        cmd_processor_ble_disconnect,                NULL                   },

@@ -185,6 +185,9 @@ class Command(enum.IntEnum):
     BLE_SCAN_STOP = 7001
     BLE_SCAN_GET_COUNT = 7002
     BLE_SCAN_GET_RESULTS = 7003
+    BLE_ADVERTISING_SET = 7004
+    BLE_ADVERTISING_GET = 7005
+    BLE_LINK_PROBE = 7006
 
     # BLE directed GATT fuzzing harness — point-to-point against ONE target
     BLE_CONNECT = 7010

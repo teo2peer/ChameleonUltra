@@ -41,6 +41,11 @@ uint32_t ble_central_gatt_read(uint16_t value_handle);
 // state: 0 idle, 1 pending, 2 ready.
 uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap);
 
+// Start a native BLE link probe. When global_mode is 0 this probes the
+// currently connected target. When global_mode is non-zero it runs a batch
+// probe across the devices discovered by the passive BLE scanner.
+uint32_t ble_central_link_probe(uint8_t global_mode);
+
 // Start fuzzing: write mutated payloads to value_handle every interval_ms, up to
 // max_iterations (0 = until stopped). Must be connected.
 uint32_t ble_central_fuzz_start(uint16_t value_handle, uint16_t max_iterations, uint16_t interval_ms);
@@ -48,11 +53,17 @@ uint32_t ble_central_fuzz_stop(void);
 
 // Serialize harness state. Wire format:
 // conn_state[1] disc_state[1] char_count[1] fuzz_state[1] fuzz_sent[2 BE]
-// target_alive[1] last_disconnect_reason[1].  (8 bytes)
+// target_alive[1] last_disconnect_reason[1] probe_state[1] probe_result[1]
+// probe_index[1] probe_total[1].
 // conn_state: 0 idle, 1 connecting, 2 connected, 3 disconnected
 // disc_state: 0 idle, 1 discovering, 2 done, 3 error
 // fuzz_state: 0 idle, 1 running, 2 stopped/finished
 uint16_t ble_central_get_state(uint8_t *out, uint16_t out_cap);
+
+// Serialize the probe batch log from start index. Wire format per entry:
+// addr[6] | addr_type[1] | rssi[1] | connect_status[1] | probe_result[1] |
+// disconnect_reason[1]. Returns bytes written.
+uint16_t ble_central_copy_probe_log(uint8_t start_index, uint8_t *out, uint16_t out_cap);
 
 // Serialize fuzz log from start index. Wire format per entry:
 // index[2 BE] | payload_len[1] | write_status[1] | data[min(payload_len, 16)].

@@ -103,6 +103,7 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 };
 volatile bool g_is_ble_connected = false;
 volatile bool g_is_low_battery_shutdown = false;
+volatile bool g_is_ble_advertising = false;
 static ble_opt_t m_static_pin_option;
 
 // Simple function to provide an index to the next input buffer
@@ -496,9 +497,11 @@ static void conn_params_init(void) {
 static void on_adv_evt(ble_adv_evt_t ble_adv_evt) {
     switch (ble_adv_evt) {
         case BLE_ADV_EVT_FAST:
+            g_is_ble_advertising = true;
             NRF_LOG_INFO("BLE_ADV_EVT_FAST");
             break;
         case BLE_ADV_EVT_IDLE:
+            g_is_ble_advertising = false;
             NRF_LOG_INFO("BLE_ADV_EVT_IDLE");
             break;
         default:
@@ -720,6 +723,14 @@ static void whitelist_set(pm_peer_id_list_skip_t skip) {
 /**@brief Function for starting advertising.
  */
 void advertising_start(bool erase_bonds) {
+    if (g_is_ble_advertising && !erase_bonds) {
+        return;
+    }
+
+    if (g_is_ble_advertising) {
+        advertising_stop();
+    }
+
     if (erase_bonds == true && settings_get_ble_pairing_enable_first_load()) {
         // Advertising is started by PM_EVT_PEERS_DELETE_SUCCEEDED event.
         // So we don't call `ble_advertising_start()` after `delete_bonds_all()`.
@@ -730,6 +741,7 @@ void advertising_start(bool erase_bonds) {
         }
         ret_code_t ret = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
         APP_ERROR_CHECK(ret);
+        g_is_ble_advertising = true;
     }
 }
 
@@ -737,7 +749,15 @@ void advertising_start(bool erase_bonds) {
  * @brief Function for stop advertising.
  */
 void advertising_stop(void) {
+    if (!g_is_ble_advertising) {
+        return;
+    }
     sd_ble_gap_adv_stop(m_advertising.adv_handle);
+    g_is_ble_advertising = false;
+}
+
+bool is_ble_advertising(void) {
+    return g_is_ble_advertising;
 }
 
 /**@brief Function for handling Peer Manager events.

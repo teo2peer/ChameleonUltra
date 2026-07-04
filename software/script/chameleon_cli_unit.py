@@ -924,6 +924,30 @@ _BLE_COMPANY_IDS = {
     0x0499: "Ruuvi", 0x0A12: "Sony",
 }
 
+# Common Bluetooth SIG 16-bit UUIDs (services 0x18xx, characteristics 0x2Axx).
+_BLE_UUID_NAMES = {
+    0x1800: "Generic Access", 0x1801: "Generic Attribute", 0x1802: "Immediate Alert",
+    0x1803: "Link Loss", 0x1804: "Tx Power", 0x1805: "Current Time",
+    0x1808: "Glucose", 0x1809: "Health Thermometer", 0x180A: "Device Information",
+    0x180D: "Heart Rate", 0x180F: "Battery", 0x1810: "Blood Pressure",
+    0x1812: "HID", 0x1816: "Cycling Speed", 0x1818: "Cycling Power",
+    0x1819: "Location and Navigation", 0x181A: "Environmental Sensing",
+    0x181C: "User Data", 0x1826: "Fitness Machine",
+    0xFE59: "Nordic DFU", 0xFD6F: "Exposure Notification",
+    0x2A00: "Device Name", 0x2A01: "Appearance", 0x2A04: "Preferred Conn Params",
+    0x2A05: "Service Changed", 0x2A06: "Alert Level", 0x2A19: "Battery Level",
+    0x2A23: "System ID", 0x2A24: "Model Number", 0x2A25: "Serial Number",
+    0x2A26: "Firmware Rev", 0x2A27: "Hardware Rev", 0x2A28: "Software Rev",
+    0x2A29: "Manufacturer", 0x2A2B: "Current Time", 0x2A37: "Heart Rate Meas",
+    0x2A38: "Body Sensor Loc", 0x2A50: "PnP ID", 0x2A6E: "Temperature",
+    0x2A6F: "Humidity",
+}
+
+
+def ble_uuid_name(uuid: int):
+    """Return the human-readable name for a 16-bit BLE UUID, or None."""
+    return _BLE_UUID_NAMES.get(uuid)
+
 
 def decode_ble_adv(adv: bytes):
     """Decode advertising AD structures (len | type | data...).
@@ -954,8 +978,11 @@ def decode_ble_adv(adv: bytes):
                 fl.append("no-BR/EDR")
             fields.append(f"flags: {'|'.join(fl) if fl else hex(flags)}")
         elif ad_type in (0x02, 0x03):
-            uuids = [f"0x{int.from_bytes(value[j:j + 2], 'little'):04X}"
-                     for j in range(0, len(value) - 1, 2)]
+            uuids = []
+            for j in range(0, len(value) - 1, 2):
+                u = int.from_bytes(value[j:j + 2], 'little')
+                nm = ble_uuid_name(u)
+                uuids.append(f"0x{u:04X}" + (f"({nm})" if nm else ""))
             if uuids:
                 fields.append(f"services16: {', '.join(uuids)}")
         elif ad_type in (0x06, 0x07):
@@ -1106,6 +1133,101 @@ class BLEStatus(DeviceRequiredUnit):
             print(f"- last disconnect reason : 0x{st['last_reason']:02X}")
 
 
+@ble.command("ping")
+class BLEPing(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Run a native firmware-side BLE link probe against one target or all scanned devices."
+        parser.add_argument("--addr", metavar="<MAC>",
+                            help="Target BLE address for a single probe, e.g. AA:BB:CC:DD:EE:FF")
+        parser.add_argument("--all", action="store_true",
+                            help="Probe all devices from the last passive scan instead of a single target")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.all:
+            self.cmd.ble_link_probe(True)
+            print("Probing all scanned devices...")
+            for _ in range(80):
+                time.sleep(0.1)
+                st = self.cmd.ble_central_state()
+                if st.get('probe_state') == 2:
+                    total = st.get('probe_total', 0)
+                    print(f"Global probe completed ({total} devices).")
+                    return
+                if st.get('probe_state') == 3:
+                    print(f"Global probe failed (0x{st.get('probe_result', 0):02X}).")
+                    return
+                if st.get('probe_total'):
+                    print(f"Progress: {st.get('probe_index', 0)}/{st.get('probe_total', 0)}")
+            print("Global probe timed out.")
+            return
+
+        if not args.addr:
+            print("Either --addr or --all is required.")
+            return
+
+        addr_le = _parse_ble_addr(args.addr)
+
+        self.cmd.ble_connect(addr_le, 0)
+        print(f"Connecting to {args.addr}...")
+        for _ in range(50):
+            time.sleep(0.1)
+            st = self.cmd.ble_central_state()
+            if st.get('conn_state') == 2:
+                break
+            if st.get('conn_state') in (0, 3):
+                print("Connection failed / timed out.")
+                return
+        else:
+            print("Still connecting; check 'ble status'.")
+            return
+
+        self.cmd.ble_link_probe()
+        print("Probing link...")
+        for _ in range(40):
+            time.sleep(0.05)
+            st = self.cmd.ble_central_state()
+            if st.get('probe_state') == 2:
+                print("Ping completed successfully.")
+                self.cmd.ble_disconnect()
+                return
+            if st.get('probe_state') == 3:
+                print(f"Ping failed (0x{st.get('probe_result', 0):02X}).")
+                self.cmd.ble_disconnect()
+                return
+
+        print("Ping timed out.")
+        self.cmd.ble_disconnect()
+
+
+@ble.command("advertise")
+class BLEAdvertise(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Control local BLE advertising / discoverable state."
+        parser.add_argument("action", nargs="?", choices=["on", "off", "toggle", "status"], default="status",
+                            help="Advertising action (default: status)")
+        parser.add_argument("--erase-bonds", action="store_true",
+                            help="When enabling, clear stored bonds first")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.action == "status":
+            enabled = self.cmd.ble_advertising_get()
+            print(f"Advertising: {'on' if enabled else 'off'}")
+            return
+
+        if args.action == "toggle":
+            enabled = self.cmd.ble_advertising_get()
+            target = not enabled
+        else:
+            target = args.action == "on"
+
+        state = self.cmd.ble_advertising_set(target, args.erase_bonds and target)
+        print(f"Advertising: {'on' if state else 'off'}")
+
+
 @ble.command("discover")
 class BLEDiscover(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -1144,7 +1266,9 @@ class BLEDiscover(DeviceRequiredUnit):
             return
         print(f"Found {len(chars)} characteristic(s):")
         for c in chars:
-            print(f"- handle 0x{c['handle']:04X}  UUID 0x{c['uuid']:04X}  "
+            nm = ble_uuid_name(c['uuid'])
+            name_str = f" ({nm})" if nm else ""
+            print(f"- handle 0x{c['handle']:04X}  UUID 0x{c['uuid']:04X}{name_str}  "
                   f"[{self.props_str(c['props'])}]")
 
 

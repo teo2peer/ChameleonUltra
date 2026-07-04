@@ -168,6 +168,32 @@ class ChameleonCMD:
             resp.parsed = devices
         return resp
 
+    @expect_response(Status.SUCCESS)
+    def ble_advertising_get(self):
+        """Query whether the device is currently advertising."""
+        resp = self.device.send_cmd_sync(Command.BLE_ADVERTISING_GET)
+        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+            resp.parsed = bool(resp.data[0])
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def ble_advertising_set(self, enabled: bool, erase_bonds: bool = False):
+        """
+        Enable or disable local advertising.
+
+        :param enabled: True to start advertising, False to stop it.
+        :param erase_bonds: When enabling, optionally clear bonds first.
+        """
+        data = struct.pack('!BB', 1 if enabled else 0, 1 if erase_bonds else 0)
+        return self.device.send_cmd_sync(Command.BLE_ADVERTISING_SET, data)
+
+    @expect_response(Status.SUCCESS)
+    def ble_link_probe(self, global_mode: bool = False):
+        """Start a native firmware-side BLE link probe, targeted or global."""
+        if global_mode:
+            return self.device.send_cmd_sync(Command.BLE_LINK_PROBE, b"\x01")
+        return self.device.send_cmd_sync(Command.BLE_LINK_PROBE)
+
     # --- Directed BLE GATT fuzzing harness (central role) -------------------
     # Point-to-point against ONE target the operator specifies by address.
 
@@ -188,18 +214,24 @@ class ChameleonCMD:
     def ble_central_state(self):
         """
         Poll harness state. Returns a dict with conn_state, disc_state,
-        char_count, fuzz_state, fuzz_sent, target_alive, last_reason.
+        char_count, fuzz_state, fuzz_sent, target_alive, last_reason,
+        probe_state, probe_result.
         """
         resp = self.device.send_cmd_sync(Command.BLE_CENTRAL_STATE)
         state = {}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 8:
-            conn, disc, chars, fuzz, sent_hi, sent_lo, alive, reason = \
-                struct.unpack_from('!8B', resp.data, 0)
+        if resp.status == Status.SUCCESS and len(resp.data) >= 10:
+            conn, disc, chars, fuzz, sent_hi, sent_lo, alive, reason, probe_state, probe_result = \
+                struct.unpack_from('!10B', resp.data, 0)
             state = {
                 'conn_state': conn, 'disc_state': disc, 'char_count': chars,
                 'fuzz_state': fuzz, 'fuzz_sent': (sent_hi << 8) | sent_lo,
                 'target_alive': bool(alive), 'last_reason': reason,
+                'probe_state': probe_state, 'probe_result': probe_result,
             }
+            if len(resp.data) >= 12:
+                probe_index, probe_total = struct.unpack_from('!2B', resp.data, 10)
+                state['probe_index'] = probe_index
+                state['probe_total'] = probe_total
         return state
 
     def ble_gatt_discover(self):

@@ -14,6 +14,7 @@ typedef void (*lf_adc_callback_t)(nrf_saadc_value_t *, size_t);
 void ble_slave_init(void);
 void advertising_start(bool erase_bonds);
 void advertising_stop(void);
+bool is_ble_advertising(void);
 void delete_bonds_all(void);
 void nus_data_response(uint8_t *p_data, uint16_t length);
 bool is_nus_working(void);
@@ -30,6 +31,10 @@ void unregister_lf_adc_callback(void);
 // advertisements that nearby devices already broadcast. There is no central
 // connection and no transmission of any kind here.
 // ---------------------------------------------------------------------------
+// Max distinct devices retained per passive scan. Shared so ble_central.c's
+// batch link-probe can bound its iteration over the scanner records.
+#define BLE_SCAN_MAX_DEVICES 40
+
 uint32_t ble_scan_start(void);   // clear results and start a passive scan
 uint32_t ble_scan_stop(void);    // stop the passive scan
 uint8_t  ble_scan_get_count(void);

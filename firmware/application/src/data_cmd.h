@@ -223,6 +223,10 @@
 #define DATA_CMD_BLE_SCAN_GET_COUNT             (7002)  /* number of distinct devices seen      */
 #define DATA_CMD_BLE_SCAN_GET_RESULTS           (7003)  /* paged device records by start index  */
 
+#define DATA_CMD_BLE_ADVERTISING_SET            (7004)  /* enable/disable local advertising     */
+#define DATA_CMD_BLE_ADVERTISING_GET            (7005)  /* query local advertising state        */
+#define DATA_CMD_BLE_LINK_PROBE                 (7006)  /* probe target[0] or batch-scan all[1] */
+
 // Directed GATT fuzzing harness — point-to-point against ONE user-specified
 // target address. Connects out (central role), enumerates the target's GATT
 // characteristics and writes mutated payloads to a chosen characteristic. It
