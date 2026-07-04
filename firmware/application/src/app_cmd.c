@@ -231,7 +231,7 @@ static data_frame_tx_t *cmd_processor_get_ble_pairing_enable(uint16_t cmd, uint1
 }
 
 static data_frame_tx_t *cmd_processor_set_ble_pairing_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 1 && data[0] > 1) {
+    if (length != 1 || data[0] > 1) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     settings_set_ble_pairing_enable(data[0]);
@@ -1469,6 +1469,16 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_read_emu_page_data(uint16_t cmd, 
     int pages_count = data[1];
 
     if (pages_count == 0) return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    // Bounds-check page_index/pages_count against the slot's page count, just
+    // like the write sibling — otherwise this reads (and returns) RAM past the
+    // slot's memory[] buffer (remote info-disclosure over BLE/USB).
+    else if (
+        (page_index >= ((int)nr_pages))
+        || (pages_count > (((int)nr_pages) - page_index))
+    ) {
+        byte = nr_pages;
+        return data_frame_make(cmd, STATUS_PAR_ERR, 1, &byte);
+    }
 
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(active_slot_tag_types.tag_hf);
     nfc_tag_mf0_ntag_information_t *info = (nfc_tag_mf0_ntag_information_t *)buffer->buffer;
@@ -1734,7 +1744,7 @@ static data_frame_tx_t *cmd_processor_mf1_get_gen1a_mode(uint16_t cmd, uint16_t 
 }
 
 static data_frame_tx_t *cmd_processor_mf1_set_gen1a_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 1 && data[0] > 1) {
+    if (length != 1 || data[0] > 1) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     nfc_tag_mf1_set_gen1a_magic_mode(data[0]);
@@ -1747,7 +1757,7 @@ static data_frame_tx_t *cmd_processor_mf1_get_gen2_mode(uint16_t cmd, uint16_t s
 }
 
 static data_frame_tx_t *cmd_processor_mf1_set_gen2_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 1 && data[0] > 1) {
+    if (length != 1 || data[0] > 1) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     nfc_tag_mf1_set_gen2_magic_mode(data[0]);
@@ -1760,7 +1770,7 @@ static data_frame_tx_t *cmd_processor_mf1_get_block_anti_coll_mode(uint16_t cmd,
 }
 
 static data_frame_tx_t *cmd_processor_mf1_set_block_anti_coll_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 1 && data[0] > 1) {
+    if (length != 1 || data[0] > 1) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     nfc_tag_mf1_set_use_mf1_coll_res(data[0]);
@@ -3417,6 +3427,22 @@ static data_frame_tx_t *cmd_processor_ble_gatt_get_read(uint16_t cmd, uint16_t s
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
 
+static data_frame_tx_t *cmd_processor_ble_subscribe(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 3) { // cccd_handle[2] + mode[1]
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t cccd = ((uint16_t)data[0] << 8) | data[1];
+    uint32_t err_code = ble_central_subscribe(cccd, data[2]);
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_get_notifications(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint16_t start_index = (length >= 2) ? (((uint16_t)data[0] << 8) | data[1]) : 0;
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = ble_central_copy_notifs(start_index, out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
@@ -3477,6 +3503,8 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_FUZZ_GET_LOG,             NULL,                        cmd_processor_ble_fuzz_get_log,              NULL                   },
     {    DATA_CMD_BLE_GATT_READ,                NULL,                        cmd_processor_ble_gatt_read,                 NULL                   },
     {    DATA_CMD_BLE_GATT_GET_READ,            NULL,                        cmd_processor_ble_gatt_get_read,             NULL                   },
+    {    DATA_CMD_BLE_SUBSCRIBE,                NULL,                        cmd_processor_ble_subscribe,                 NULL                   },
+    {    DATA_CMD_BLE_GET_NOTIFICATIONS,        NULL,                        cmd_processor_ble_get_notifications,         NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 

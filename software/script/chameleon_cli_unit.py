@@ -1300,6 +1300,56 @@ class BLERead(DeviceRequiredUnit):
         print("Read timed out.")
 
 
+@ble.command("subscribe")
+class BLESubscribe(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Subscribe to notifications/indications from a characteristic on the "
+            "connected target and print incoming values (receive-only)."
+        )
+        parser.add_argument("--handle", type=lambda x: int(x, 0), required=True, metavar="<hex>",
+                            help="Characteristic VALUE handle (from 'ble discover'), e.g. 0x0012")
+        parser.add_argument("--cccd", type=lambda x: int(x, 0), metavar="<hex>",
+                            help="CCCD handle (default: value handle + 1, the common layout)")
+        parser.add_argument("--indicate", action="store_true",
+                            help="Use indications instead of notifications")
+        parser.add_argument("--off", action="store_true", help="Unsubscribe and exit")
+        parser.add_argument("-t", "--timeout", type=float, default=10.0, metavar="<sec>",
+                            help="How long to listen after subscribing (default: 10)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        cccd = args.cccd if args.cccd is not None else args.handle + 1
+        mode = 0 if args.off else (2 if args.indicate else 1)
+        resp = self.cmd.ble_subscribe(cccd, mode)
+        if resp.status != Status.SUCCESS:
+            print("Subscribe failed (is a target connected? use 'ble connect').")
+            return
+        if args.off:
+            print("Unsubscribed.")
+            return
+        print(f"Subscribed (CCCD 0x{cccd:04X}, {'indicate' if args.indicate else 'notify'}). "
+              f"Listening {args.timeout:.1f}s...")
+        seen = 0
+        end = time.time() + args.timeout
+        try:
+            while time.time() < end:
+                time.sleep(0.3)
+                notifs = self.cmd.ble_get_notifications(0)
+                while seen < len(notifs):
+                    n = notifs[seen]
+                    seen += 1
+                    d = n['data']
+                    printable = f"  \"{d.decode('utf-8', 'replace')}\"" if d else ""
+                    print(f"  handle 0x{n['handle']:04X} = {d.hex().upper()}{printable}")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.cmd.ble_subscribe(cccd, 0)  # unsubscribe on exit
+        print(f"Done ({seen} notifications).")
+
+
 @ble.command("fuzz")
 class BLEFuzz(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:

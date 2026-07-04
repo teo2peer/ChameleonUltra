@@ -44,6 +44,8 @@ NRF_LOG_MODULE_REGISTER();
 #define BLE_FUZZ_PAYLOAD_MAX        20      // <= default ATT_MTU(23) - 3, avoids DATA_SIZE
 #define BLE_FUZZ_LOG_DATA           16      // payload bytes kept per log entry
 #define BLE_READ_VALUE_MAX          64      // bytes retained from a GATT read response
+#define BLE_NOTIF_LOG_MAX           64      // received notifications/indications retained
+#define BLE_NOTIF_DATA_MAX          20      // bytes kept per notification
 
 // ---- discovered-characteristic table -------------------------------------
 typedef struct {
@@ -109,6 +111,15 @@ static volatile uint8_t m_read_state = 0;   // 0 idle,1 pending,2 ready
 static uint8_t          m_read_status = 0;  // gatt_status of the last read
 static uint16_t         m_read_len = 0;
 static uint8_t          m_read_value[BLE_READ_VALUE_MAX];
+
+// Received notifications/indications from the connected target (receive-only).
+typedef struct {
+    uint16_t handle;
+    uint8_t  len;
+    uint8_t  data[BLE_NOTIF_DATA_MAX];
+} ble_notif_t;
+static ble_notif_t       m_notif_log[BLE_NOTIF_LOG_MAX];
+static volatile uint16_t m_notif_count = 0;
 
 APP_TIMER_DEF(m_fuzz_timer);
 
@@ -497,6 +508,26 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
             m_read_state = 2; // ready
             break;
 
+        case BLE_GATTC_EVT_HVX: {
+            // Notification/indication pushed by the target (receive-only).
+            if (gattc->conn_handle != m_conn_handle) {
+                break;
+            }
+            const ble_gattc_evt_hvx_t *hvx = &gattc->params.hvx;
+            if (m_notif_count < BLE_NOTIF_LOG_MAX) {
+                ble_notif_t *n = &m_notif_log[m_notif_count++];
+                n->handle = hvx->handle;
+                uint8_t l = MIN(hvx->len, (uint16_t)BLE_NOTIF_DATA_MAX);
+                n->len = l;
+                memcpy(n->data, hvx->data, l);
+            }
+            // Indications must be confirmed back to the target.
+            if (hvx->type == BLE_GATT_HVX_INDICATION) {
+                sd_ble_gattc_hv_confirm(m_conn_handle, hvx->handle);
+            }
+            break;
+        }
+
         default:
             break;
     }
@@ -570,6 +601,7 @@ uint32_t ble_central_connect(uint8_t addr_type, const uint8_t *addr) {
     m_fuzz_sent = 0;
     m_fuzz_log_count = 0;
     m_read_state = 0;
+    m_notif_count = 0;
     m_probe_state = 0;
     m_probe_result = 0;
     m_conn_state = 1; // connecting
@@ -668,6 +700,52 @@ uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap) {
     out[o++] = n;
     memcpy(out + o, m_read_value, n);
     o += n;
+    return o;
+}
+
+// Subscribe to notifications/indications by writing the target's CCCD.
+// mode: 0 = off, 1 = notifications, 2 = indications.
+uint32_t ble_central_subscribe(uint16_t cccd_handle, uint8_t mode) {
+    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    uint16_t cccd = (mode == 1) ? 0x0001 : (mode == 2) ? 0x0002 : 0x0000;
+    static uint8_t val[2];
+    val[0] = cccd & 0xFF;
+    val[1] = (cccd >> 8) & 0xFF;
+    ble_gattc_write_params_t w = {
+        .write_op = BLE_GATT_OP_WRITE_REQ,
+        .flags    = 0,
+        .handle   = cccd_handle,
+        .offset   = 0,
+        .len      = 2,
+        .p_value  = val,
+    };
+    if (mode != 0) {
+        m_notif_count = 0; // fresh capture on (re)subscribe
+    }
+    return sd_ble_gattc_write(m_conn_handle, &w);
+}
+
+uint16_t ble_central_notif_count(void) {
+    return m_notif_count;
+}
+
+uint16_t ble_central_copy_notifs(uint16_t start_index, uint8_t *out, uint16_t out_cap) {
+    // Wire per entry: handle[2 BE] | len[1] | data[len]
+    uint16_t o = 0;
+    for (uint16_t i = start_index; i < m_notif_count; i++) {
+        ble_notif_t *n = &m_notif_log[i];
+        uint16_t rec = 2 + 1 + n->len;
+        if (o + rec > out_cap) {
+            break;
+        }
+        out[o++] = (n->handle >> 8) & 0xFF;
+        out[o++] = n->handle & 0xFF;
+        out[o++] = n->len;
+        memcpy(out + o, n->data, n->len);
+        o += n->len;
+    }
     return o;
 }
 

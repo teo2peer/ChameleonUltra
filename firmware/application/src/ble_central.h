@@ -41,6 +41,14 @@ uint32_t ble_central_gatt_read(uint16_t value_handle);
 // state: 0 idle, 1 pending, 2 ready.
 uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap);
 
+// Subscribe to notifications/indications on the connected target by writing its
+// CCCD. mode: 0 = off, 1 = notifications, 2 = indications. Receive-only.
+uint32_t ble_central_subscribe(uint16_t cccd_handle, uint8_t mode);
+uint16_t ble_central_notif_count(void);
+// Serialize received notifications from start index. Wire per entry:
+// handle[2 BE] | len[1] | data[len].
+uint16_t ble_central_copy_notifs(uint16_t start_index, uint8_t *out, uint16_t out_cap);
+
 // Start a native BLE link probe. When global_mode is 0 this probes the
 // currently connected target. When global_mode is non-zero it runs a batch
 // probe across the devices discovered by the passive BLE scanner.

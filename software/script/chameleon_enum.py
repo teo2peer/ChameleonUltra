@@ -200,6 +200,8 @@ class Command(enum.IntEnum):
     BLE_FUZZ_GET_LOG = 7017
     BLE_GATT_READ = 7018
     BLE_GATT_GET_READ = 7019
+    BLE_SUBSCRIBE = 7020
+    BLE_GET_NOTIFICATIONS = 7021
 
 
 @enum.unique

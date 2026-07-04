@@ -287,6 +287,34 @@ class ChameleonCMD:
                    'data': bytes(resp.data[3:3 + ln])}
         return out
 
+    def ble_subscribe(self, cccd_handle: int, mode: int = 1):
+        """
+        Subscribe to notifications/indications on the connected target by writing
+        its CCCD. mode: 0=off, 1=notifications, 2=indications.
+        """
+        data = struct.pack('!HB', cccd_handle, mode)
+        return self.device.send_cmd_sync(Command.BLE_SUBSCRIBE, data)
+
+    @expect_response(Status.SUCCESS)
+    def ble_get_notifications(self, start_index: int = 0):
+        """
+        Fetch received notifications. Wire per entry: handle[2] | len[1] | data[len].
+
+        :return: list of dicts {handle, data}
+        """
+        data = struct.pack('!H', start_index)
+        resp = self.device.send_cmd_sync(Command.BLE_GET_NOTIFICATIONS, data)
+        if resp.status == Status.SUCCESS:
+            offset = 0
+            out = []
+            while offset + 3 <= len(resp.data):
+                handle, ln = struct.unpack_from('!HB', resp.data, offset)
+                offset += 3
+                out.append({'handle': handle, 'data': bytes(resp.data[offset:offset + ln])})
+                offset += ln
+            resp.parsed = out
+        return resp
+
     @expect_response(Status.SUCCESS)
     def ble_fuzz_get_log(self, start_index: int = 0):
         """

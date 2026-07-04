@@ -242,5 +242,7 @@
 #define DATA_CMD_BLE_FUZZ_GET_LOG               (7017)  /* paged fuzz log by start index           */
 #define DATA_CMD_BLE_GATT_READ                  (7018)  /* read a characteristic value: handle[2] */
 #define DATA_CMD_BLE_GATT_GET_READ              (7019)  /* fetch last GATT read result            */
+#define DATA_CMD_BLE_SUBSCRIBE                   (7020)  /* CCCD subscribe: cccd_handle[2]|mode[1] */
+#define DATA_CMD_BLE_GET_NOTIFICATIONS          (7021)  /* paged received notifications           */
 
 #endif
