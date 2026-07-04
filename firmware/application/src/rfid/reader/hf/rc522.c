@@ -704,7 +704,12 @@ uint8_t pcd_14a_reader_scan_once(picc_14a_tag_t *tag) {
     // OK we will select at least at cascade 1, lets see if first byte of UID was 0x88 in
     // which case we need to make a cascade 2 request and select - this is a long UID
     // While the UID is not complete, the 3nd bit (from the right) is set in the SAK.
-    for (; do_cascade; cascade_level++) {
+    // Cap at ISO14443-3's 3 cascade levels (4/7/10-byte UID). Without this a
+    // hostile card that keeps setting SAK bit 0x04 ("cascade again") drives the
+    // loop past level 2, so memcpy(tag->uid + cascade_level*3, ...) writes past
+    // the 10-byte uid[] and marches off the end of picc_14a_tag_t (OOB write
+    // with card-controlled length/content — just from scanning the card).
+    for (; do_cascade && cascade_level < 3; cascade_level++) {
         // SELECT_* (L1: 0x93, L2: 0x95, L3: 0x97)
         uint8_t sel_all[]    = { PICC_ANTICOLL1, 0x20 };
         uint8_t sel_uid[]    = { PICC_ANTICOLL1, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
