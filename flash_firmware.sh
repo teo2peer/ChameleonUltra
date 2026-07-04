@@ -84,7 +84,22 @@ done
 [ "$ok" = 1 ] || { echo "ERROR: DFU bootloader not detected." >&2; exit 1; }
 
 echo "==> Programming…"
-nrfutil device program --firmware "$ZIP" --traits nordicDfu >/dev/null
+# Retry: a transient port contention (e.g. the GUI still holding the port) can
+# fail one attempt but leaves the device in DFU, so re-programming succeeds.
+prog_ok=0
+for attempt in 1 2 3; do
+  if nrfutil device program --firmware "$ZIP" --traits nordicDfu >/dev/null 2>&1; then
+    prog_ok=1
+    break
+  fi
+  echo "    program attempt $attempt failed — retrying in 2s…"
+  sleep 2
+done
+if [ "$prog_ok" != 1 ]; then
+  echo "ERROR: programming failed after 3 attempts. The device is likely still" >&2
+  echo "       in the DFU bootloader — just re-run ./flash_firmware.sh." >&2
+  exit 1
+fi
 echo "    programmed OK"
 
 # --- Verify it rebooted and advertises commands (best-effort; never fatal) ---
