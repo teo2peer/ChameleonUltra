@@ -120,12 +120,15 @@ class ChameleonCMD:
             resp.parsed = data
         return resp
 
-    def ble_scan_start(self):
+    def ble_scan_start(self, active: bool = False):
         """
-        Start a passive (listen-only) BLE scan. The device never transmits:
-        it only receives advertisements already broadcast by nearby devices.
+        Start a BLE scan. Passive (default) is listen-only — the device transmits
+        nothing. Active (active=True) also sends scan requests to collect scan
+        responses (e.g. the full device name); this is the standard BLE discovery
+        exchange, not disruption.
         """
-        return self.device.send_cmd_sync(Command.BLE_SCAN_START)
+        return self.device.send_cmd_sync(Command.BLE_SCAN_START,
+                                         struct.pack('!B', 1 if active else 0))
 
     def ble_scan_stop(self):
         """

@@ -611,6 +611,14 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             // I received a block -related reading instruction without verification.
                             if (m_gen1a_state == GEN1A_STATE_UNLOCKED_RW_WAIT) {
                                 CurrentAddress = p_data[1];
+                                // Reject blocks past the emulated card: memory[]
+                                // is a fixed array, so an out-of-range block
+                                // would read adjacent RAM (other slots) back to
+                                // the reader — unauthenticated via the backdoor.
+                                if (check_block_max_overflow(CurrentAddress)) {
+                                    nfc_tag_14a_tx_nbit(NAK_INVALID_OPERATION_TBIV, 4);
+                                    break;
+                                }
                                 memcpy(m_tag_tx_buffer.tx_raw_buffer, m_tag_information->memory[CurrentAddress], NFC_TAG_MF1_DATA_SIZE);
                                 nfc_tag_14a_tx_bytes(m_tag_tx_buffer.tx_raw_buffer, NFC_TAG_MF1_DATA_SIZE, true);
                             } else {
@@ -623,6 +631,13 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             if (m_gen1a_state == GEN1A_STATE_UNLOCKED_RW_WAIT) {
                                 //Save the block and update status machine to be written
                                 CurrentAddress = p_data[1];
+                                // Reject out-of-range blocks up front so the
+                                // later memory[CurrentAddress] write stays in
+                                // bounds (unauthenticated backdoor write).
+                                if (check_block_max_overflow(CurrentAddress)) {
+                                    nfc_tag_14a_tx_nbit(NAK_INVALID_OPERATION_TBIV, 4);
+                                    break;
+                                }
                                 m_gen1a_state = GEN1A_STATE_WRITING;
                                 // Responsive ACK, let the read head continue the next step data to come over
                                 nfc_tag_14a_tx_nbit(ACK_VALUE, 4);
@@ -735,6 +750,11 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                         case CMD_READ: {
                             // Save the block address of the current operation
                             CurrentAddress = p_data[1];
+                            // Reject blocks past the emulated card (would read
+                            // adjacent RAM / other slots into the reply).
+                            if (check_block_max_overflow(CurrentAddress)) {
+                                break;
+                            }
                             // Generate access control, for data access control below
                             uint8_t Acc = abTrailerAccessConditions[ GetAccessCondition(CurrentAddress) ][ KeyInUse ];
                             // Read the command.Read data from memory and add CRCA.Note: Reading operations are limited by the control bit, but at present we only restrict the reading of the control bit
@@ -783,6 +803,10 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                                 nfc_tag_14a_set_state(NFC_TAG_STATE_14A_HALTED);
                                 // Tell me to read the head. This operation is not allowed to be allowed
                                 mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                            } else if (check_block_max_overflow(p_data[1])) {
+                                // Block past the emulated card -> reject (the
+                                // MF1_STATE_WRITE handler would write memory[] OOB).
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
                             } else {
                                 // Normally write command.Store the address and prepare to receive the upcoming data.
                                 CurrentAddress = p_data[1];
@@ -794,18 +818,30 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                         }
                         // Although I think the following three case code is a bit stupid. Except for the different other ones, the space is the same, but the space is changed (psychological comfort)
                         case CMD_DECREMENT: {
+                            if (check_block_max_overflow(p_data[1])) {
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                                break;
+                            }
                             CurrentAddress = p_data[1];
                             m_mf1_state = MF1_STATE_DECREMENT;
                             mf1_response_4bit_auto_encrypt(ACK_VALUE);
                             break;
                         }
                         case CMD_INCREMENT: {
+                            if (check_block_max_overflow(p_data[1])) {
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                                break;
+                            }
                             CurrentAddress = p_data[1];
                             m_mf1_state = MF1_STATE_INCREMENT;
                             mf1_response_4bit_auto_encrypt(ACK_VALUE);
                             break;
                         }
                         case CMD_RESTORE: {
+                            if (check_block_max_overflow(p_data[1])) {
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                                break;
+                            }
                             CurrentAddress = p_data[1];
                             m_mf1_state = MF1_STATE_RESTORE;
                             mf1_response_4bit_auto_encrypt(ACK_VALUE);
@@ -820,6 +856,10 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             } else if (m_tag_information->config.mode_block_write == NFC_TAG_MF1_WRITE_DECEIVE) {
                                 // This mode responds to ACK, but it is not written in RAM
                                 status = ACK_VALUE;
+                            } else if (check_block_max_overflow(p_data[1])) {
+                                // Block past the emulated card -> reject (avoids
+                                // an out-of-range memory[] write).
+                                status = NAK_INVALID_OPERATION_TBIV;
                             } else {
                                 // Write the block address specified by the global buffer back in the instruction parameter
                                 memcpy(m_tag_information->memory[p_data[1]], m_data_block_buffer, MEM_BYTES_PER_BLOCK);

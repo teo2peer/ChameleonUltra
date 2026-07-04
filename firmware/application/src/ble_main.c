@@ -250,8 +250,11 @@ static volatile bool     m_scan_active = false;
 static uint8_t    m_scan_buffer_data[BLE_GAP_SCAN_BUFFER_MIN];
 static ble_data_t m_scan_buffer = { m_scan_buffer_data, BLE_GAP_SCAN_BUFFER_MIN };
 
-static const ble_gap_scan_params_t m_scan_params = {
-    .active        = 0,                                  // PASSIVE: never transmit scan requests
+// active is chosen per scan: 0 = passive (listen only, default), 1 = active
+// (send scan requests to also collect scan responses, e.g. the full device
+// name). Active scan is the standard BLE discovery exchange, not disruption.
+static ble_gap_scan_params_t m_scan_params = {
+    .active        = 0,
     .filter_policy = BLE_GAP_SCAN_FP_ACCEPT_ALL,
     .scan_phys     = BLE_GAP_PHY_1MBPS,
     .interval      = MSEC_TO_UNITS(100, UNIT_0_625_MS),
@@ -287,11 +290,12 @@ static void ble_scan_record_update(const ble_gap_evt_adv_report_t *report) {
     m_scan_count++;
 }
 
-uint32_t ble_scan_start(void) {
+uint32_t ble_scan_start(uint8_t active) {
     if (m_scan_active) {
         return NRF_SUCCESS;
     }
     m_scan_count = 0;
+    m_scan_params.active = active ? 1 : 0;
     m_scan_buffer.len = BLE_GAP_SCAN_BUFFER_MIN;
     ret_code_t err_code = sd_ble_gap_scan_start(&m_scan_params, &m_scan_buffer);
     if (err_code == NRF_SUCCESS) {

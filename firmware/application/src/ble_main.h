@@ -35,8 +35,8 @@ void unregister_lf_adc_callback(void);
 // batch link-probe can bound its iteration over the scanner records.
 #define BLE_SCAN_MAX_DEVICES 40
 
-uint32_t ble_scan_start(void);   // clear results and start a passive scan
-uint32_t ble_scan_stop(void);    // stop the passive scan
+uint32_t ble_scan_start(uint8_t active); // start a scan (0=passive listen-only, 1=active)
+uint32_t ble_scan_stop(void);    // stop the scan
 uint8_t  ble_scan_get_count(void);
 // Serialize discovered records starting at start_index into out (max out_cap
 // bytes). Wire format per record: addr[6] | addr_type[1] | rssi[1] | adv_len[1]

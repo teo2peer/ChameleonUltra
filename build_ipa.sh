@@ -19,6 +19,8 @@ PROJECT_DIR="${GUI_DIR:-$SCRIPT_DIR/../ChameleonUltraGUI/chameleonultragui}"
 DEST="/Users/teo/projects/Chamaleon/ChameleonUltra"
 IPA_NAME="ChameleonUltraGUI.ipa"
 
+rm -f "$DEST/$IPA_NAME"
+
 if [ ! -d "$PROJECT_DIR" ]; then
   echo "ERROR: GUI project not found at $PROJECT_DIR" >&2
   echo "       Set GUI_DIR=/path/to/chameleonultragui and retry." >&2

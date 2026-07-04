@@ -1016,12 +1016,15 @@ class BLEScan(DeviceRequiredUnit):
                             help="How long to listen, in seconds (default: 5)")
         parser.add_argument("-v", "--verbose", action="store_true",
                             help="Show the full advertising-data breakdown per device")
+        parser.add_argument("--active", action="store_true",
+                            help="Active scan: send scan requests to also get scan "
+                                 "responses (e.g. full device names). Default: passive")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
-        self.cmd.ble_scan_start()
-        print(f"Listening for BLE advertisements for {args.timeout:.1f}s "
-              f"(passive, no transmission)...")
+        self.cmd.ble_scan_start(args.active)
+        mode = "active (sends scan requests)" if args.active else "passive, no transmission"
+        print(f"Listening for BLE advertisements for {args.timeout:.1f}s ({mode})...")
         try:
             time.sleep(args.timeout)
         finally:

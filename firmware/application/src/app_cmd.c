@@ -3304,7 +3304,8 @@ static data_frame_tx_t *cmd_processor_hf14a_4_debug_counters(uint16_t cmd, uint1
 // already broadcast by nearby devices. Available on both Ultra and Lite.
 // ---------------------------------------------------------------------------
 static data_frame_tx_t *cmd_processor_ble_scan_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t err_code = ble_scan_start();
+    uint8_t active = (length >= 1) ? data[0] : 0; // 0 = passive (default), 1 = active
+    uint32_t err_code = ble_scan_start(active);
     return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
 }
 

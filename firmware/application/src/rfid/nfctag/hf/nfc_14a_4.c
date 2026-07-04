@@ -196,7 +196,13 @@ static void send_wtx(void) {
 /*  State handler (called from NFCT ISR on each received frame)        */
 /* ------------------------------------------------------------------ */
 
-static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBytes) {
+static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBits) {
+    // The .cb_state contract delivers the frame length in BITS (see nfc_mf1.c
+    // comparing szDataBits == 32/64/144). ISO14443-4 blocks are byte-aligned, so
+    // convert here. Previously this arg was used as a byte count (~8x too large),
+    // which over-ran the 257-byte RX buffer (e.g. data[szBytes-1] on the WTX
+    // path, and an inflated I-block apdu_len).
+    uint16_t szBytes = szBits >> 3;
     if (szBytes == 0) return;
     uint8_t pcb = data[0];
 
