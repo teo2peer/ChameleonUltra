@@ -9,3 +9,6 @@ Docs for features in this fork not yet covered by the wiki:
 - [HF reader additions](hf-additions.md) — `hf mf rdsc` (fast sector read),
   `hf 14a field`, `hf des enum` (fast DESFire enumeration), and the extended
   `emv scan`.
+- [Autopwn optimizations](autopwn-optimizations.md) — MIFARE Classic key-recovery
+  speedups (nested candidate intersection, likely-key ordering, RF08S 3-phase
+  backdoor, batched dump, hardnested nonce batching) and the dictionary picker.

@@ -36,7 +36,8 @@ fuzzer exercises a device you own/control; it is not a mass-disruption tool.
 | `ble scan [-t <sec>] [-v] [--active] [--min-rssi <dbm>] [--name <substr>] [--out <file.json>]` | Passive (default) or active scan. Lists address, type, RSSI, name and a decode of the advertising data (flags, service UUIDs with names, manufacturer/company, TX power, appearance). Sorts by RSSI; `-v` prints the full breakdown; `--out` exports JSON. |
 | `ble connect -a <MAC> [--type <0-3>]` | Connect to one target. `--type`: 0 public, 1 random, 2 random-RPA, 3 random-NRPA. |
 | `ble status` | Show connection / discovery / fuzz state. |
-| `ble discover [--out <file.json>]` | Enumerate the connected target's GATT characteristics (handle, UUID + SIG name, properties). |
+| `ble discover [--out <file.json>]` | Enumerate the target's GATT characteristics (handle, UUID + SIG name, properties), grouped under their primary services. |
+| `ble descriptors` | List all GATT descriptors of the connected target (handle + UUID + name). |
 | `ble read --handle <hex>` | Read a characteristic value from the target. |
 | `ble write --handle <hex> --data <hex>` | Write a value to a characteristic (write-with-response; shows the target's ATT status). |
 | `ble subscribe --handle <hex> [--cccd <hex>] [--indicate] [--off] [-t <sec>]` | Subscribe to notifications/indications and stream incoming values. The CCCD descriptor is auto-discovered (override with `--cccd`). |
@@ -90,6 +91,9 @@ BLE commands occupy the **7000** block of the request/response command protocol
 | 7020–7021 | Subscribe / get-notifications |
 | 7022–7023 | Find CCCD / get-CCCD |
 | 7024–7025 | GATT write / get-write-result |
+| 7026 | Get effective ATT MTU |
+| 7027–7028 | Descriptor discover / get |
+| 7029–7030 | Primary-service discover / get |
 
 There is no async push channel; continuous data (scan results, fuzz log,
 notifications) is buffered in firmware and paged out by index by the host.
