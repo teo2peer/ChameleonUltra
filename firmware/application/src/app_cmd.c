@@ -3519,6 +3519,30 @@ static data_frame_tx_t *cmd_processor_ble_get_mtu(uint16_t cmd, uint16_t status,
     return data_frame_make(cmd, STATUS_SUCCESS, 2, out);
 }
 
+static data_frame_tx_t *cmd_processor_ble_desc_discover(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t err_code = ble_central_desc_discover();
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_desc_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t start_index = (length >= 1) ? data[0] : 0;
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = ble_central_copy_descs(start_index, out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
+static data_frame_tx_t *cmd_processor_ble_svc_discover(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t err_code = ble_central_svc_discover();
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_svc_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t start_index = (length >= 1) ? data[0] : 0;
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = ble_central_copy_svcs(start_index, out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
@@ -3586,6 +3610,10 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_GATT_WRITE,               NULL,                        cmd_processor_ble_gatt_write,                NULL                   },
     {    DATA_CMD_BLE_GET_WRITE,                NULL,                        cmd_processor_ble_get_write,                 NULL                   },
     {    DATA_CMD_BLE_GET_MTU,                  NULL,                        cmd_processor_ble_get_mtu,                   NULL                   },
+    {    DATA_CMD_BLE_DESC_DISCOVER,            NULL,                        cmd_processor_ble_desc_discover,             NULL                   },
+    {    DATA_CMD_BLE_DESC_GET,                 NULL,                        cmd_processor_ble_desc_get,                  NULL                   },
+    {    DATA_CMD_BLE_SVC_DISCOVER,             NULL,                        cmd_processor_ble_svc_discover,              NULL                   },
+    {    DATA_CMD_BLE_SVC_GET,                  NULL,                        cmd_processor_ble_svc_get,                   NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 

@@ -35,6 +35,16 @@ uint8_t  ble_central_get_char_count(void);
 // value_handle[2 BE] | props[1] | uuid_type[1] | uuid[2 BE]. Returns bytes written.
 uint16_t ble_central_copy_chars(uint8_t start_index, uint8_t *out, uint16_t out_cap);
 
+// Enumerate ALL descriptors of the connected target (async — poll copy_descs).
+uint32_t ble_central_desc_discover(void);
+// Wire: state[1] | per descriptor: handle[2 BE] | uuid_type[1] | uuid[2 BE].
+uint16_t ble_central_copy_descs(uint8_t start_index, uint8_t *out, uint16_t out_cap);
+
+// Discover the target's primary services (async — poll copy_svcs).
+uint32_t ble_central_svc_discover(void);
+// Wire: state[1] | per service: uuid_type[1] | uuid[2 BE] | start[2 BE] | end[2 BE].
+uint16_t ble_central_copy_svcs(uint8_t start_index, uint8_t *out, uint16_t out_cap);
+
 // Read a characteristic value from the connected target (async — poll copy_read).
 uint32_t ble_central_gatt_read(uint16_t value_handle);
 // Serialize the last read result. Wire: state[1] | gatt_status[1] | len[1] | data[len].
@@ -46,6 +56,9 @@ uint32_t ble_central_gatt_write(uint16_t value_handle, const uint8_t *data, uint
 // Serialize the last write result. Wire: state[1] | gatt_status[1].
 // state: 0 idle, 1 pending, 2 done.
 uint16_t ble_central_get_write_result(uint8_t *out, uint16_t out_cap);
+
+// Effective ATT MTU of the target link (23 until negotiated / when not connected).
+uint16_t ble_central_mtu(void);
 
 // Find a characteristic's CCCD descriptor (async — poll get_cccd), so subscribe
 // can use the real handle instead of assuming value_handle + 1.

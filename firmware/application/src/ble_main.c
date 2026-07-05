@@ -667,6 +667,18 @@ void gatt_init(void) {
 
     err_code = nrf_ble_gatt_att_mtu_periph_set(&m_gatt, NRF_SDH_BLE_GATT_MAX_MTU_SIZE);
     APP_ERROR_CHECK(err_code);
+
+    // Also negotiate a larger MTU on the central (BLE-audit target) link, so GATT
+    // read/write/fuzz aren't limited to the 23-byte default. nrf_ble_gatt is a
+    // global observer, so it auto-exchanges MTU on the central connection too.
+    err_code = nrf_ble_gatt_att_mtu_central_set(&m_gatt, NRF_SDH_BLE_GATT_MAX_MTU_SIZE);
+    APP_ERROR_CHECK(err_code);
+}
+
+// Effective ATT MTU for a connection (used by the central harness to size
+// reads/writes). Returns the SoftDevice default (23) until MTU exchange completes.
+uint16_t ble_link_mtu(uint16_t conn_handle) {
+    return nrf_ble_gatt_eff_mtu_get(&m_gatt, conn_handle);
 }
 
 

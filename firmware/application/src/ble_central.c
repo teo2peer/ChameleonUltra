@@ -44,9 +44,12 @@ NRF_LOG_MODULE_REGISTER();
 #define BLE_FUZZ_LOG_MAX            128     // fuzz-log entries retained
 #define BLE_FUZZ_PAYLOAD_MAX        20      // <= default ATT_MTU(23) - 3, avoids DATA_SIZE
 #define BLE_FUZZ_LOG_DATA           16      // payload bytes kept per log entry
-#define BLE_READ_VALUE_MAX          64      // bytes retained from a GATT read response
+#define BLE_WRITE_MAX               244     // <= max negotiated ATT_MTU(247) - 3
+#define BLE_READ_VALUE_MAX          244     // bytes retained from a GATT read response
 #define BLE_NOTIF_LOG_MAX           64      // received notifications/indications retained
 #define BLE_NOTIF_DATA_MAX          20      // bytes kept per notification
+#define BLE_MAX_DESCS               48      // descriptors retained per full listing
+#define BLE_MAX_SERVICES            16      // primary services retained
 
 // ---- discovered-characteristic table -------------------------------------
 typedef struct {
@@ -55,6 +58,21 @@ typedef struct {
     uint8_t  uuid_type;
     uint16_t uuid;
 } ble_char_rec_t;
+
+// ---- discovered-descriptor table (full listing) --------------------------
+typedef struct {
+    uint16_t handle;
+    uint16_t uuid;
+    uint8_t  uuid_type;
+} ble_desc_rec_t;
+
+// ---- discovered primary-service table ------------------------------------
+typedef struct {
+    uint16_t uuid;
+    uint8_t  uuid_type;
+    uint16_t start_handle;
+    uint16_t end_handle;
+} ble_svc_rec_t;
 
 // ---- fuzz log ------------------------------------------------------------
 typedef struct {
@@ -86,6 +104,14 @@ static uint8_t          m_last_disc_reason = 0;
 
 static ble_char_rec_t   m_chars[BLE_MAX_CHARS];
 static volatile uint8_t m_char_count = 0;
+
+static ble_desc_rec_t   m_descs[BLE_MAX_DESCS];
+static volatile uint8_t m_desc_count = 0;
+static volatile uint8_t m_desc_state = 0;    // 0 idle,1 discovering,2 done,3 error
+
+static ble_svc_rec_t    m_svcs[BLE_MAX_SERVICES];
+static volatile uint8_t m_svc_count = 0;
+static volatile uint8_t m_svc_state = 0;     // 0 idle,1 discovering,2 done,3 error
 
 static volatile uint8_t  m_fuzz_state = 0;  // 0 idle,1 running,2 stopped/finished
 static uint16_t          m_fuzz_handle = 0;
@@ -549,8 +575,36 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
         }
 
         case BLE_GATTC_EVT_DESC_DISC_RSP: {
-            // Looking for a characteristic's CCCD (UUID 0x2902).
-            if (gattc->conn_handle != m_conn_handle || m_cccd_state != 1) {
+            if (gattc->conn_handle != m_conn_handle) {
+                break;
+            }
+            // Full descriptor-listing mode (enumerate every descriptor).
+            if (m_desc_state == 1) {
+                if (gattc->gatt_status != BLE_GATT_STATUS_SUCCESS) {
+                    m_desc_state = (m_desc_count > 0) ? 2 : 3;
+                    break;
+                }
+                const ble_gattc_evt_desc_disc_rsp_t *dr = &gattc->params.desc_disc_rsp;
+                uint16_t dlast = 0;
+                for (uint16_t i = 0; i < dr->count && m_desc_count < BLE_MAX_DESCS; i++) {
+                    ble_desc_rec_t *rec = &m_descs[m_desc_count++];
+                    rec->handle    = dr->descs[i].handle;
+                    rec->uuid      = dr->descs[i].uuid.uuid;
+                    rec->uuid_type = dr->descs[i].uuid.type;
+                    dlast = dr->descs[i].handle;
+                }
+                if (m_desc_count < BLE_MAX_DESCS && dlast != 0 && dlast < 0xFFFF) {
+                    ble_gattc_handle_range_t range = { .start_handle = dlast + 1, .end_handle = 0xFFFF };
+                    if (sd_ble_gattc_descriptors_discover(m_conn_handle, &range) != NRF_SUCCESS) {
+                        m_desc_state = 2;
+                    }
+                } else {
+                    m_desc_state = 2;
+                }
+                break;
+            }
+            // Otherwise: CCCD search (looking for UUID 0x2902).
+            if (m_cccd_state != 1) {
                 break;
             }
             if (gattc->gatt_status != BLE_GATT_STATUS_SUCCESS) {
@@ -582,6 +636,34 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
                         m_cccd_state = 3;
                     }
                 }
+            }
+            break;
+        }
+
+        case BLE_GATTC_EVT_PRIM_SRVC_DISC_RSP: {
+            if (gattc->conn_handle != m_conn_handle || m_svc_state != 1) {
+                break;
+            }
+            if (gattc->gatt_status != BLE_GATT_STATUS_SUCCESS) {
+                m_svc_state = (m_svc_count > 0) ? 2 : 3; // done (or none)
+                break;
+            }
+            const ble_gattc_evt_prim_srvc_disc_rsp_t *sr = &gattc->params.prim_srvc_disc_rsp;
+            uint16_t slast = 0;
+            for (uint16_t i = 0; i < sr->count && m_svc_count < BLE_MAX_SERVICES; i++) {
+                ble_svc_rec_t *rec = &m_svcs[m_svc_count++];
+                rec->uuid         = sr->services[i].uuid.uuid;
+                rec->uuid_type    = sr->services[i].uuid.type;
+                rec->start_handle = sr->services[i].handle_range.start_handle;
+                rec->end_handle   = sr->services[i].handle_range.end_handle;
+                slast = sr->services[i].handle_range.end_handle;
+            }
+            if (m_svc_count < BLE_MAX_SERVICES && slast != 0 && slast < 0xFFFF) {
+                if (sd_ble_gattc_primary_services_discover(m_conn_handle, slast + 1, NULL) != NRF_SUCCESS) {
+                    m_svc_state = 2;
+                }
+            } else {
+                m_svc_state = 2;
             }
             break;
         }
@@ -656,6 +738,10 @@ uint32_t ble_central_connect(uint8_t addr_type, const uint8_t *addr) {
 
     m_char_count = 0;
     m_disc_state = 0;
+    m_desc_state = 0;
+    m_desc_count = 0;
+    m_svc_state = 0;
+    m_svc_count = 0;
     m_fuzz_state = 0;
     m_fuzz_sent = 0;
     m_fuzz_log_count = 0;
@@ -736,6 +822,81 @@ uint8_t ble_central_get_char_count(void) {
     return m_char_count;
 }
 
+// ---- full descriptor listing --------------------------------------------
+uint32_t ble_central_desc_discover(void) {
+    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    m_desc_count = 0;
+    m_desc_state = 1; // discovering
+    ble_gattc_handle_range_t range = { .start_handle = 0x0001, .end_handle = 0xFFFF };
+    ret_code_t err = sd_ble_gattc_descriptors_discover(m_conn_handle, &range);
+    if (err != NRF_SUCCESS) {
+        m_desc_state = 3;
+    }
+    return err;
+}
+
+uint16_t ble_central_copy_descs(uint8_t start_index, uint8_t *out, uint16_t out_cap) {
+    // Wire: state[1] | per descriptor: handle[2 BE] | uuid_type[1] | uuid[2 BE]
+    // state: 0 idle, 1 discovering, 2 done, 3 error.
+    if (out_cap < 1) {
+        return 0;
+    }
+    out[0] = m_desc_state;
+    uint16_t o = 1;
+    for (uint8_t i = start_index; i < m_desc_count; i++) {
+        if (o + 5 > out_cap) {
+            break;
+        }
+        ble_desc_rec_t *r = &m_descs[i];
+        out[o++] = (r->handle >> 8) & 0xFF;
+        out[o++] = r->handle & 0xFF;
+        out[o++] = r->uuid_type;
+        out[o++] = (r->uuid >> 8) & 0xFF;
+        out[o++] = r->uuid & 0xFF;
+    }
+    return o;
+}
+
+// ---- primary service discovery ------------------------------------------
+uint32_t ble_central_svc_discover(void) {
+    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    m_svc_count = 0;
+    m_svc_state = 1; // discovering
+    ret_code_t err = sd_ble_gattc_primary_services_discover(m_conn_handle, 0x0001, NULL);
+    if (err != NRF_SUCCESS) {
+        m_svc_state = 3;
+    }
+    return err;
+}
+
+uint16_t ble_central_copy_svcs(uint8_t start_index, uint8_t *out, uint16_t out_cap) {
+    // Wire: state[1] | per service: uuid_type[1] | uuid[2 BE] | start[2 BE] | end[2 BE]
+    // state: 0 idle, 1 discovering, 2 done, 3 error.
+    if (out_cap < 1) {
+        return 0;
+    }
+    out[0] = m_svc_state;
+    uint16_t o = 1;
+    for (uint8_t i = start_index; i < m_svc_count; i++) {
+        if (o + 7 > out_cap) {
+            break;
+        }
+        ble_svc_rec_t *r = &m_svcs[i];
+        out[o++] = r->uuid_type;
+        out[o++] = (r->uuid >> 8) & 0xFF;
+        out[o++] = r->uuid & 0xFF;
+        out[o++] = (r->start_handle >> 8) & 0xFF;
+        out[o++] = r->start_handle & 0xFF;
+        out[o++] = (r->end_handle >> 8) & 0xFF;
+        out[o++] = r->end_handle & 0xFF;
+    }
+    return o;
+}
+
 uint32_t ble_central_gatt_read(uint16_t value_handle) {
     if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
@@ -752,9 +913,14 @@ uint32_t ble_central_gatt_write(uint16_t value_handle, const uint8_t *data, uint
     if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
-    static uint8_t wbuf[BLE_FUZZ_PAYLOAD_MAX];
-    if (len > BLE_FUZZ_PAYLOAD_MAX) {
-        len = BLE_FUZZ_PAYLOAD_MAX; // capped to default ATT_MTU - 3
+    static uint8_t wbuf[BLE_WRITE_MAX];
+    // Cap to the effective ATT MTU (minus the 3-byte write header), up to the
+    // buffer size. Larger writes would be rejected by the stack with DATA_SIZE.
+    uint16_t mtu = ble_link_mtu(m_conn_handle);
+    uint8_t maxlen = (mtu > 3 && (uint16_t)(mtu - 3) < BLE_WRITE_MAX)
+                     ? (uint8_t)(mtu - 3) : BLE_WRITE_MAX;
+    if (len > maxlen) {
+        len = maxlen;
     }
     memcpy(wbuf, data, len);
     m_write_state  = 1;    // pending
@@ -782,6 +948,13 @@ uint16_t ble_central_get_write_result(uint8_t *out, uint16_t out_cap) {
     out[0] = m_write_state;
     out[1] = m_write_status;
     return 2;
+}
+
+uint16_t ble_central_mtu(void) {
+    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return 23; // default ATT MTU when not connected
+    }
+    return ble_link_mtu(m_conn_handle);
 }
 
 uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap) {

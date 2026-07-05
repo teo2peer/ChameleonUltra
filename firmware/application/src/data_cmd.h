@@ -249,5 +249,10 @@
 #define DATA_CMD_BLE_GET_CCCD                    (7023)  /* fetch CCCD lookup result               */
 #define DATA_CMD_BLE_GATT_WRITE                  (7024)  /* write a characteristic: handle[2]|data */
 #define DATA_CMD_BLE_GET_WRITE                   (7025)  /* fetch last GATT write result           */
+#define DATA_CMD_BLE_GET_MTU                     (7026)  /* effective ATT MTU of the target link   */
+#define DATA_CMD_BLE_DESC_DISCOVER               (7027)  /* enumerate all descriptors of target    */
+#define DATA_CMD_BLE_DESC_GET                     (7028)  /* paged descriptor list                  */
+#define DATA_CMD_BLE_SVC_DISCOVER                (7029)  /* discover primary services              */
+#define DATA_CMD_BLE_SVC_GET                     (7030)  /* paged primary-service list             */
 
 #endif

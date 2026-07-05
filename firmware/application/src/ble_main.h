@@ -35,6 +35,8 @@ void unregister_lf_adc_callback(void);
 // batch link-probe can bound its iteration over the scanner records.
 #define BLE_SCAN_MAX_DEVICES 40
 
+uint16_t ble_link_mtu(uint16_t conn_handle); // effective ATT MTU for a connection
+
 uint32_t ble_scan_start(uint8_t active); // start a scan (0=passive listen-only, 1=active)
 uint32_t ble_scan_stop(void);    // stop the scan
 uint8_t  ble_scan_get_count(void);
