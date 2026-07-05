@@ -9,7 +9,8 @@ addition to the RFID/NFC features. They cover two jobs:
    subscribe / fuzz its GATT attributes.
 
 They are reachable from the Python CLI (`ble` command group in
-`software/script/`) and from the Flutter GUI (*Ethical Hacking → BLE audit*).
+`software/script/`) and from the Flutter GUI (*Ethical Hacking → Bluetooth (BLE)
+→ BLE audit*).
 
 ## Scope / design constraints
 
@@ -69,11 +70,17 @@ can reconnect to its normal source. While a BLE test runs, the device shows an
 - **Passive scan** — duration, active-scan toggle, name/RSSI filters, tap a
   device for a full advertising-data dialog, "Fuzz this" to target it.
 - **Directed fuzz** — target address + type, Connect / Discover / Disconnect /
-  Ping (single-target liveness), per-characteristic Read / Write / Notify /
-  Select, fuzz handle/count/interval with a live status panel and log, and
-  copy/export. A Cancel button stops the batch; the AppBar has a
+  Ping (single-target liveness). After Discover, characteristics are listed
+  **grouped under their primary services**, each with Read / Write / Notify /
+  Select actions; a header button lists **all descriptors** in a dialog. The
+  live status panel shows connection / discovery / fuzz state, the negotiated
+  **ATT MTU**, and link-probe result. Fuzz handle/count/interval with a log and
+  copy/export; a Cancel button stops the batch; the AppBar has a
   local-advertising toggle. The target is released to reconnect when the batch
   ends.
+
+  These GUI controls only appear once connected and after Discover — they are
+  conditional on the central connection state.
 
 ## Protocol / command IDs
 
@@ -102,10 +109,13 @@ notifications) is buffered in firmware and paged out by index by the host.
 
 - `ble_main.c` — BLE peripheral (advertising, NUS command transport, battery,
   pairing) **and** the passive observer scanner.
-- `ble_central.c` — the central-role harness (connect, GATT discovery, read,
-  fuzz, subscribe, CCCD discovery, link probe). Registers its own SoftDevice
-  observer; the peripheral handler in `ble_main.c` is role/handle-guarded so it
-  ignores the central link.
+- `ble_central.c` — the central-role harness (connect, primary-service /
+  characteristic / descriptor discovery, CCCD lookup, read, write, subscribe,
+  link probe, and the directed fuzzer). MTU is negotiated by `nrf_ble_gatt`
+  (`nrf_ble_gatt_att_mtu_central_set` in `ble_main.c`'s `gatt_init`), so read /
+  write / fuzz scale to the negotiated ATT MTU (up to ~244 bytes) instead of the
+  23-byte default. Registers its own SoftDevice observer; the peripheral handler
+  in `ble_main.c` is role/handle-guarded so it ignores the central link.
 - Enabling the central role required `NRF_SDH_BLE_CENTRAL_LINK_COUNT=1` /
   `TOTAL=2` in `sdk_config.h` and a **RAM-origin bump** in `application.ld`. The
   origin there is an estimate — if `nrf_sdh_ble_enable` asserts `NRF_ERROR_NO_MEM`
