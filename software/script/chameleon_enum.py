@@ -210,6 +210,11 @@ class Command(enum.IntEnum):
     BLE_GET_CCCD = 7023
     BLE_GATT_WRITE = 7024
     BLE_GET_WRITE = 7025
+    BLE_GET_MTU = 7026
+    BLE_DESC_DISCOVER = 7027
+    BLE_DESC_GET = 7028
+    BLE_SVC_DISCOVER = 7029
+    BLE_SVC_GET = 7030
 
 
 @enum.unique

@@ -260,6 +260,49 @@ class ChameleonCMD:
             resp.parsed = chars
         return resp
 
+    def ble_desc_discover(self):
+        """Start enumerating all descriptors of the connected target (async)."""
+        return self.device.send_cmd_sync(Command.BLE_DESC_DISCOVER)
+
+    def ble_get_descs(self, start_index: int = 0):
+        """
+        Fetch discovered descriptors: dict {state, items:[{handle, uuid_type, uuid}]}.
+        state: 0 idle, 1 discovering, 2 done, 3 error. Wire: state[1] then per
+        descriptor handle[2] | uuid_type[1] | uuid[2] (big-endian).
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_DESC_GET, struct.pack('!B', start_index))
+        out = {'state': 0, 'items': []}
+        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+            out['state'] = resp.data[0]
+            off = 1
+            while off + 5 <= len(resp.data):
+                handle, uuid_type, uuid = struct.unpack_from('!HBH', resp.data, off)
+                off += 5
+                out['items'].append({'handle': handle, 'uuid_type': uuid_type, 'uuid': uuid})
+        return out
+
+    def ble_svc_discover(self):
+        """Start discovering the connected target's primary services (async)."""
+        return self.device.send_cmd_sync(Command.BLE_SVC_DISCOVER)
+
+    def ble_get_svcs(self, start_index: int = 0):
+        """
+        Fetch discovered primary services: dict {state, items:[{uuid_type, uuid,
+        start, end}]}. Wire: state[1] then per service uuid_type[1] | uuid[2] |
+        start_handle[2] | end_handle[2] (big-endian).
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_SVC_GET, struct.pack('!B', start_index))
+        out = {'state': 0, 'items': []}
+        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+            out['state'] = resp.data[0]
+            off = 1
+            while off + 7 <= len(resp.data):
+                uuid_type, uuid, start, end = struct.unpack_from('!BHHH', resp.data, off)
+                off += 7
+                out['items'].append({'uuid_type': uuid_type, 'uuid': uuid,
+                                     'start': start, 'end': end})
+        return out
+
     def ble_fuzz_start(self, value_handle: int, max_iterations: int = 0, interval_ms: int = 50):
         """
         Start fuzzing: write mutated payloads to value_handle on the connected
@@ -305,6 +348,13 @@ class ChameleonCMD:
         if resp.status == Status.SUCCESS and len(resp.data) >= 2:
             out = {'state': resp.data[0], 'gatt_status': resp.data[1]}
         return out
+
+    def ble_get_mtu(self):
+        """Effective ATT MTU of the connected target link (23 if not negotiated)."""
+        resp = self.device.send_cmd_sync(Command.BLE_GET_MTU)
+        if resp.status == Status.SUCCESS and len(resp.data) >= 2:
+            return (resp.data[0] << 8) | resp.data[1]
+        return 23
 
     def ble_subscribe(self, cccd_handle: int, mode: int = 1):
         """

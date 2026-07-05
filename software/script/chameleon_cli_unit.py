@@ -942,6 +942,11 @@ _BLE_UUID_NAMES = {
     0x2A29: "Manufacturer", 0x2A2B: "Current Time", 0x2A37: "Heart Rate Meas",
     0x2A38: "Body Sensor Loc", 0x2A50: "PnP ID", 0x2A6E: "Temperature",
     0x2A6F: "Humidity",
+    # descriptors
+    0x2900: "Char Extended Properties", 0x2901: "Char User Description",
+    0x2902: "CCCD", 0x2903: "Server Char Config",
+    0x2904: "Char Presentation Format", 0x2905: "Char Aggregate Format",
+    0x2907: "External Report Ref", 0x2908: "Report Reference",
 }
 
 
@@ -1181,6 +1186,8 @@ class BLEStatus(DeviceRequiredUnit):
         print(f"- discovery  : {disc} ({st['char_count']} characteristics)")
         print(f"- fuzz       : {fuzz} ({st['fuzz_sent']} writes sent)")
         print(f"- target up  : {st['target_alive']}")
+        if st.get('conn_state') == 2:
+            print(f"- ATT MTU    : {self.cmd.ble_get_mtu()}")
         if st['last_reason']:
             print(f"- last disconnect reason : 0x{st['last_reason']:02X}")
 
@@ -1318,12 +1325,41 @@ class BLEDiscover(DeviceRequiredUnit):
         if not chars:
             print("No characteristics found.")
             return
-        print(f"Found {len(chars)} characteristic(s):")
-        for c in chars:
+        # Discover primary services so characteristics can be grouped under them.
+        self.cmd.ble_svc_discover()
+        services = []
+        for _ in range(30):  # up to ~3 s
+            time.sleep(0.1)
+            sv = self.cmd.ble_get_svcs(0)
+            if sv['state'] in (2, 3):
+                services = sv['items']
+                break
+
+        def _print_char(c, indent=""):
             nm = ble_uuid_name(c['uuid'])
             name_str = f" ({nm})" if nm else ""
-            print(f"- handle 0x{c['handle']:04X}  UUID 0x{c['uuid']:04X}{name_str}  "
+            print(f"{indent}- handle 0x{c['handle']:04X}  UUID 0x{c['uuid']:04X}{name_str}  "
                   f"[{self.props_str(c['props'])}]")
+
+        if services:
+            print(f"Found {len(chars)} characteristic(s) in {len(services)} service(s):")
+            grouped = set()
+            for s in services:
+                snm = ble_uuid_name(s['uuid'])
+                snm_str = f" ({snm})" if snm else ""
+                print(f"Service 0x{s['uuid']:04X}{snm_str}  "
+                      f"[0x{s['start']:04X}-0x{s['end']:04X}]")
+                for c in chars:
+                    if s['start'] <= c['handle'] <= s['end']:
+                        _print_char(c, "  ")
+                        grouped.add(c['handle'])
+            for c in chars:  # any characteristic not inside a discovered service
+                if c['handle'] not in grouped:
+                    _print_char(c)
+        else:
+            print(f"Found {len(chars)} characteristic(s):")
+            for c in chars:
+                _print_char(c)
         if args.out:
             with open(args.out, 'w') as fp:
                 json.dump([{
@@ -1332,6 +1368,36 @@ class BLEDiscover(DeviceRequiredUnit):
                     'props': c['props'], 'props_str': self.props_str(c['props']),
                 } for c in chars], fp, indent=2)
             print(f"Wrote {len(chars)} characteristic(s) to {args.out}")
+
+
+@ble.command("descriptors")
+class BLEDescriptors(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "List all GATT descriptors of the connected target."
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        resp = self.cmd.ble_desc_discover()
+        if resp.status != Status.SUCCESS:
+            print("Not connected to a target (use 'ble connect' first).")
+            return
+        print("Discovering descriptors...")
+        items = []
+        for _ in range(50):  # up to ~5 s
+            time.sleep(0.1)
+            r = self.cmd.ble_get_descs(0)
+            if r['state'] in (2, 3):
+                items = r['items']
+                break
+        if not items:
+            print("No descriptors found.")
+            return
+        print(f"Found {len(items)} descriptor(s):")
+        for d in items:
+            nm = ble_uuid_name(d['uuid'])
+            name_str = f" ({nm})" if nm else ""
+            print(f"- handle 0x{d['handle']:04X}  UUID 0x{d['uuid']:04X}{name_str}")
 
 
 @ble.command("read")
