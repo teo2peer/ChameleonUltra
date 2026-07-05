@@ -451,10 +451,13 @@ static data_frame_tx_t *cmd_processor_mf1_hardnested_nonces_acquire(uint16_t cmd
     }
     payload_t *payload = (payload_t *)data;
 
-    // It is enough to collect 110 nonces at a time. The total transmitted data payload is 495 + 1 bytes
-    // Then, the total length can be controlled within 4096, so that when encountering a BLE host that supports large packets, one communication can be completed.
-    // There is no need to send or receive packets in separate packets, which improves communication speed.
-    uint8_t nonces[500] = { 0x00 };
+    // Collect up to ~254 nonces per call. The count is returned in a single
+    // leading byte (max 255), so the buffer is sized just under that limit
+    // (254 * 4.5 = 1143 payload bytes, +1 count). Bigger batches than the old
+    // 110 mean far fewer host round-trips and card re-selections while gathering
+    // the ~1400 nonces hardnested needs. Still one frame (<= 4096), so a
+    // large-packet BLE host completes each batch in a single exchange.
+    uint8_t nonces[1148] = { 0x00 };
     if (length < 11) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
@@ -3459,7 +3462,7 @@ static data_frame_tx_t *cmd_processor_ble_gatt_read(uint16_t cmd, uint16_t statu
 }
 
 static data_frame_tx_t *cmd_processor_ble_gatt_get_read(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[3 + 64]; // state + status + len + up to BLE_READ_VALUE_MAX bytes
+    uint8_t out[3 + 244]; // state + status + len + up to BLE_READ_VALUE_MAX bytes
     uint16_t out_len = ble_central_copy_read(out, sizeof(out));
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
@@ -3508,6 +3511,12 @@ static data_frame_tx_t *cmd_processor_ble_get_write(uint16_t cmd, uint16_t statu
     uint8_t out[2];
     uint16_t out_len = ble_central_get_write_result(out, sizeof(out));
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
+static data_frame_tx_t *cmd_processor_ble_get_mtu(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint16_t mtu = ble_central_mtu();
+    uint8_t out[2] = { (mtu >> 8) & 0xFF, mtu & 0xFF };
+    return data_frame_make(cmd, STATUS_SUCCESS, 2, out);
 }
 
 static cmd_data_map_t m_data_cmd_map[] = {
@@ -3576,6 +3585,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_GET_CCCD,                 NULL,                        cmd_processor_ble_get_cccd,                  NULL                   },
     {    DATA_CMD_BLE_GATT_WRITE,               NULL,                        cmd_processor_ble_gatt_write,                NULL                   },
     {    DATA_CMD_BLE_GET_WRITE,                NULL,                        cmd_processor_ble_get_write,                 NULL                   },
+    {    DATA_CMD_BLE_GET_MTU,                  NULL,                        cmd_processor_ble_get_mtu,                   NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
