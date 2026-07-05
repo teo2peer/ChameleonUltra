@@ -13,6 +13,7 @@ import serial.tools.list_ports
 import threading
 import random
 import struct
+import json
 import queue
 from enum import Enum
 from multiprocessing import Pool, cpu_count
@@ -949,6 +950,27 @@ def ble_uuid_name(uuid: int):
     return _BLE_UUID_NAMES.get(uuid)
 
 
+# BLE appearance categories (top 10 bits); a few specific subtypes too.
+_BLE_APPEARANCE = {
+    0x0040: "Phone", 0x0080: "Computer", 0x00C0: "Watch", 0x0100: "Clock",
+    0x0140: "Display", 0x0180: "Remote Control", 0x01C0: "Eye-glasses",
+    0x0200: "Tag", 0x0240: "Keyring", 0x0280: "Media Player",
+    0x02C0: "Barcode Scanner", 0x0300: "Thermometer", 0x0340: "Heart Rate Sensor",
+    0x0380: "Blood Pressure", 0x03C0: "HID", 0x0400: "Glucose Meter",
+    0x0440: "Running/Walking Sensor", 0x0480: "Cycling", 0x0840: "Insulin Pump",
+    0x0C40: "Outdoor Sports",
+}
+_BLE_APPEARANCE_SPECIFIC = {
+    0x03C1: "Keyboard", 0x03C2: "Mouse", 0x03C3: "Joystick", 0x03C4: "Gamepad",
+    0x03C5: "Digitizer Tablet", 0x0341: "Heart Rate Belt",
+}
+
+
+def ble_appearance_name(value: int):
+    """Return a human name for a 16-bit BLE appearance value, or None."""
+    return _BLE_APPEARANCE_SPECIFIC.get(value) or _BLE_APPEARANCE.get(value & 0xFFC0)
+
+
 def decode_ble_adv(adv: bytes):
     """Decode advertising AD structures (len | type | data...).
 
@@ -990,7 +1012,9 @@ def decode_ble_adv(adv: bytes):
         elif ad_type == 0x0A and value:
             fields.append(f"tx_power: {value[0] - 256 if value[0] > 127 else value[0]} dBm")
         elif ad_type == 0x19 and len(value) >= 2:
-            fields.append(f"appearance: 0x{int.from_bytes(value[0:2], 'little'):04X}")
+            appv = int.from_bytes(value[0:2], 'little')
+            appn = ble_appearance_name(appv)
+            fields.append(f"appearance: 0x{appv:04X}" + (f" ({appn})" if appn else ""))
         elif ad_type == 0xFF and len(value) >= 2:
             company = int.from_bytes(value[0:2], 'little')
             cname = _BLE_COMPANY_IDS.get(company, f"0x{company:04X}")
@@ -1019,6 +1043,12 @@ class BLEScan(DeviceRequiredUnit):
         parser.add_argument("--active", action="store_true",
                             help="Active scan: send scan requests to also get scan "
                                  "responses (e.g. full device names). Default: passive")
+        parser.add_argument("--out", metavar="<file.json>",
+                            help="Write the discovered devices to a JSON file")
+        parser.add_argument("--min-rssi", type=int, metavar="<dbm>",
+                            help="Only show devices with RSSI >= this value (e.g. -70)")
+        parser.add_argument("--name", metavar="<substr>",
+                            help="Only show devices whose name contains this substring")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -1038,7 +1068,18 @@ class BLEScan(DeviceRequiredUnit):
         devices = self.cmd.ble_scan_get_results(0)
         # Strongest signal first.
         devices.sort(key=lambda d: d['rssi'], reverse=True)
-        print(f"Found {count} device(s):")
+        if args.min_rssi is not None:
+            devices = [d for d in devices if d['rssi'] >= args.min_rssi]
+        if args.name:
+            needle = args.name.lower()
+            devices = [d for d in devices
+                       if needle in (decode_ble_adv(d['adv'])[0] or '').lower()]
+        if not devices:
+            print(f"No devices match the filter (of {count} seen).")
+            return
+        print(f"Found {len(devices)} device(s)"
+              f"{f' (filtered from {count})' if len(devices) != count else ''}:")
+        export = []
         for d in devices:
             # SoftDevice reports the address little-endian; display MSB-first.
             addr = ':'.join(f'{b:02X}' for b in reversed(d['addr']))
@@ -1049,6 +1090,14 @@ class BLEScan(DeviceRequiredUnit):
                 for f in fields:
                     if not f.startswith("name:"):
                         print(f"    {f}")
+            export.append({
+                'address': addr, 'addr_type': d['addr_type'], 'rssi': d['rssi'],
+                'name': name, 'adv': d['adv'].hex(), 'decoded': fields,
+            })
+        if args.out:
+            with open(args.out, 'w') as fp:
+                json.dump(export, fp, indent=2)
+            print(f"Wrote {len(export)} device(s) to {args.out}")
 
 
 # ---------------------------------------------------------------------------
@@ -1236,6 +1285,8 @@ class BLEDiscover(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
         parser = ArgumentParserNoExit()
         parser.description = "Enumerate the connected target's GATT characteristics."
+        parser.add_argument("--out", metavar="<file.json>",
+                            help="Write the discovered characteristics to a JSON file")
         return parser
 
     @staticmethod
@@ -1273,6 +1324,14 @@ class BLEDiscover(DeviceRequiredUnit):
             name_str = f" ({nm})" if nm else ""
             print(f"- handle 0x{c['handle']:04X}  UUID 0x{c['uuid']:04X}{name_str}  "
                   f"[{self.props_str(c['props'])}]")
+        if args.out:
+            with open(args.out, 'w') as fp:
+                json.dump([{
+                    'handle': c['handle'], 'uuid': c['uuid'],
+                    'uuid_name': ble_uuid_name(c['uuid']),
+                    'props': c['props'], 'props_str': self.props_str(c['props']),
+                } for c in chars], fp, indent=2)
+            print(f"Wrote {len(chars)} characteristic(s) to {args.out}")
 
 
 @ble.command("read")
@@ -1303,6 +1362,43 @@ class BLERead(DeviceRequiredUnit):
         print("Read timed out.")
 
 
+@ble.command("write")
+class BLEWrite(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Write a value to a characteristic on the connected target."
+        parser.add_argument("--handle", type=lambda x: int(x, 0), required=True, metavar="<hex>",
+                            help="Characteristic value handle (from 'ble discover'), e.g. 0x0012")
+        parser.add_argument("--data", required=True, metavar="<hex>",
+                            help="Value to write as hex, e.g. 0100")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        try:
+            payload = bytes.fromhex(args.data.replace(' ', ''))
+        except ValueError:
+            print("Invalid hex data")
+            return
+        if not payload:
+            print("No data to write")
+            return
+        resp = self.cmd.ble_gatt_write_start(args.handle, payload)
+        if resp.status != Status.SUCCESS:
+            print("Not connected to a target (use 'ble connect' first).")
+            return
+        for _ in range(40):  # up to ~2 s
+            time.sleep(0.05)
+            r = self.cmd.ble_gatt_write_result()
+            if r['state'] == 2:
+                gs = r['gatt_status']
+                if gs == 0:
+                    print(f"Write to 0x{args.handle:04X} OK ({len(payload)} bytes)")
+                else:
+                    print(f"Write rejected (ATT status 0x{gs:02X})")
+                return
+        print("Write timed out.")
+
+
 @ble.command("subscribe")
 class BLESubscribe(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -1323,7 +1419,21 @@ class BLESubscribe(DeviceRequiredUnit):
         return parser
 
     def on_exec(self, args: argparse.Namespace):
-        cccd = args.cccd if args.cccd is not None else args.handle + 1
+        if args.cccd is not None:
+            cccd = args.cccd
+        else:
+            # Auto-discover the real CCCD descriptor rather than assuming +1.
+            cccd = args.handle + 1
+            if self.cmd.ble_find_cccd_start(args.handle).status == Status.SUCCESS:
+                for _ in range(40):  # up to ~2 s
+                    time.sleep(0.05)
+                    r = self.cmd.ble_get_cccd()
+                    if r['state'] == 2:
+                        cccd = r['handle']
+                        break
+                    if r['state'] == 3:
+                        print(f"No CCCD found; falling back to 0x{cccd:04X}.")
+                        break
         mode = 0 if args.off else (2 if args.indicate else 1)
         resp = self.cmd.ble_subscribe(cccd, mode)
         if resp.status != Status.SUCCESS:
@@ -1369,6 +1479,8 @@ class BLEFuzz(DeviceRequiredUnit):
                             help="Number of writes (0 = until Ctrl-C). Default 200")
         parser.add_argument("-i", "--interval", type=int, default=50, metavar="<ms>",
                             help="Delay between writes in ms. Default 50")
+        parser.add_argument("--out", metavar="<file.json>",
+                            help="Write the full fuzz log to a JSON file when done")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -1378,7 +1490,8 @@ class BLEFuzz(DeviceRequiredUnit):
             return
         limit = args.count if args.count else 'unlimited'
         print(f"Fuzzing handle 0x{args.handle:04X}: {limit} writes @ {args.interval}ms. "
-              f"Ctrl-C to stop.")
+              f"Ctrl-C to cancel. The target is freed to reconnect to its normal "
+              f"source when the batch finishes.")
         try:
             while True:
                 time.sleep(0.3)
@@ -1406,6 +1519,18 @@ class BLEFuzz(DeviceRequiredUnit):
             for e in log[-10:]:
                 st_str = 'ok' if e['status'] == 0 else f"err0x{e['status']:02X}"
                 print(f"  #{e['index']:>5}  len={e['len']:>3}  {st_str}  {e['data'].hex().upper()}")
+        # Free the target so it can reconnect to its normal source.
+        self.cmd.ble_disconnect()
+        print("Target released — it can now reconnect to its normal source.")
+        if args.out:
+            with open(args.out, 'w') as fp:
+                json.dump({
+                    'handle': args.handle,
+                    'entries': [{'index': e['index'], 'len': e['len'],
+                                 'status': e['status'], 'data': e['data'].hex()}
+                                for e in log],
+                }, fp, indent=2)
+            print(f"Wrote {len(log)} log entr{'y' if len(log) == 1 else 'ies'} to {args.out}")
 
 
 @root.command("rem")
@@ -1779,6 +1904,23 @@ class HF14AInfo(ReaderRequiredUnit):
         scan = HF14AScan()
         scan.device_com = self.device_com
         scan.scan(deep=True)
+
+
+@hf_14a.command("field")
+class HF14AField(ReaderRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Turn the HF reader antenna field on or off"
+        parser.add_argument("state", choices=["on", "off"], help="Field state")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.state == "on":
+            self.cmd.hf14a_set_field_on()
+            print("HF field ON")
+        else:
+            self.cmd.hf14a_set_field_off()
+            print("HF field OFF")
 
 
 @hf_mf.command("nested")
@@ -3197,6 +3339,23 @@ class HFMFAutopwn(ReaderRequiredUnit):
             num_blocks, first_block = (
                 (4, s * 4) if s < 32 else (16, 128 + (s - 32) * 16)
             )
+            # Fast path: read the whole sector with a single authentication.
+            sector_blocks = None
+            for typ, key in ((MfcKeyType.B, key_b), (MfcKeyType.A, key_a)):
+                if key is None:
+                    continue
+                try:
+                    resp = self.cmd.mf1_read_blocks(first_block, num_blocks, typ, key)
+                    if resp.status == Status.HF_TAG_OK and len(resp.parsed) == num_blocks:
+                        sector_blocks = resp.parsed
+                        break
+                except Exception:
+                    pass
+            if sector_blocks is not None:
+                for blk in sector_blocks:
+                    buffer.extend(blk)
+                continue
+            # Fallback: per-block reads with key fallback (original behaviour).
             for b in range(num_blocks):
                 block_num = first_block + b
                 block_data = None
@@ -3451,6 +3610,29 @@ class HFMFRDBL(MF1AuthArgsUnit):
         print(f" - Data: {resp.hex()}")
 
 
+@hf_mf.command("rdsc")
+class HFMFRDSC(MF1AuthArgsUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = super().args_parser()
+        parser.description = ("Mifare Classic read N consecutive blocks with a single "
+                              "auth (all within the sector the start block belongs to)")
+        parser.add_argument("-c", "--count", type=int, default=4, metavar="<n>",
+                            help="Number of consecutive blocks to read (1-16, default 4)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        param = self.get_param(args)
+        count = max(1, min(16, args.count))
+        resp = self.cmd.mf1_read_blocks(param.block, count, param.type, param.key)
+        if resp.status != Status.HF_TAG_OK:
+            print(f" - Failed: {Status(resp.status)}")
+            return
+        for i, blk in enumerate(resp.parsed):
+            print(f" - Block {param.block + i}: {blk.hex().upper()}")
+        if len(resp.parsed) < count:
+            print(f" - (read {len(resp.parsed)}/{count}; a read failed part-way)")
+
+
 @hf_mf.command("wrbl")
 class HFMFWRBL(MF1AuthArgsUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -3641,10 +3823,17 @@ class HFMFDump(MF1AuthArgsUnit):
                     pass
             else:
                 raise Exception(f"No key found for sector {s}")
-            # iterate over blocks
-            for b in range(4):
-                block_data = self.cmd.mf1_read_one_block(4 * s + b, typ, key)
-                # add data to buffer
+            # Fast path: authenticate once and read all 4 blocks of the sector in
+            # a single command. Fall back to per-block reads if it doesn't return
+            # the full sector (keeps the original behaviour on any hiccup).
+            resp = self.cmd.mf1_read_blocks(4 * s, 4, typ, key)
+            if resp.status == Status.HF_TAG_OK and len(resp.parsed) == 4:
+                blocks = resp.parsed
+            else:
+                blocks = [self.cmd.mf1_read_one_block(4 * s + b, typ, key)
+                          for b in range(4)]
+            # add data to buffer
+            for block_data in blocks:
                 if content_type == "bin":
                     buffer.extend(block_data)
                 elif content_type == "hex":
@@ -10204,6 +10393,90 @@ class EMVScan(DeviceRequiredUnit):
             except Exception:
                 pass
 
+        # ---- Extra data elements (more info gathering) ------------------
+        _emv_currency = {
+            '0978': 'EUR', '0840': 'USD', '0826': 'GBP', '0392': 'JPY',
+            '0756': 'CHF', '0036': 'AUD', '0124': 'CAD', '0156': 'CNY',
+            '0356': 'INR', '0986': 'BRL', '0484': 'MXN', '0410': 'KRW',
+            '0643': 'RUB', '0752': 'SEK', '0578': 'NOK', '0208': 'DKK',
+            '0985': 'PLN', '0710': 'ZAR', '0344': 'HKD', '0702': 'SGD',
+        }
+        more = tlv_find(all_search_data, 0x5F25, 0x5F34, 0x9F42, 0x82,
+                        0x9F08, 0x9F07, 0x5F2D)
+
+        # Application Effective Date (5F25: YYMMDD BCD)
+        for v in more.get(0x5F25, []):
+            if len(v) == 3:
+                eff = v.hex().upper()
+                print(f' {CG}Effective     :{C0} {CY}20{eff[0:2]}/{eff[2:4]}{C0}')
+                result.setdefault('Decoded', {})['EffectiveDate'] = f'20{eff[0:2]}/{eff[2:4]}'
+                break
+
+        # PAN Sequence Number (5F34)
+        for v in more.get(0x5F34, []):
+            if v:
+                print(f' {CG}PAN Seq       :{C0} {CY}{v.hex().upper()}{C0}')
+                result.setdefault('Decoded', {})['PANSeq'] = v.hex().upper()
+                break
+
+        # Application Currency Code (9F42, ISO 4217 numeric)
+        for v in more.get(0x9F42, []):
+            code = v.hex().upper()
+            cur = _emv_currency.get(code, '')
+            print(f' {CG}Currency      :{C0} {CY}{code}{C0}' + (f' ({cur})' if cur else ''))
+            result.setdefault('Decoded', {})['Currency'] = cur or code
+            break
+
+        # Language Preference (5F2D, ASCII)
+        for v in more.get(0x5F2D, []):
+            try:
+                lang = v.decode('ascii', errors='replace').strip()
+                if lang:
+                    print(f' {CG}Language      :{C0} {CY}{lang}{C0}')
+                    result.setdefault('Decoded', {})['Language'] = lang
+            except Exception:
+                pass
+            break
+
+        # Application Version Number (9F08)
+        for v in more.get(0x9F08, []):
+            if v:
+                print(f' {CG}App Version   :{C0} {CY}{v.hex().upper()}{C0}')
+            break
+
+        # Application Interchange Profile (82) — supported capabilities
+        for v in more.get(0x82, []):
+            if len(v) >= 1:
+                b = v[0]
+                caps = []
+                if b & 0x40:
+                    caps.append('SDA')
+                if b & 0x20:
+                    caps.append('DDA')
+                if b & 0x10:
+                    caps.append('CardholderVerif')
+                if b & 0x08:
+                    caps.append('TerminalRiskMgmt')
+                if b & 0x04:
+                    caps.append('IssuerAuth')
+                if b & 0x01:
+                    caps.append('CDA')
+                cap_str = ', '.join(caps) if caps else 'none'
+                print(f' {CG}AIP           :{C0} {CY}{v.hex().upper()}{C0}  [{cap_str}]')
+                result.setdefault('Decoded', {})['AIP'] = v.hex().upper()
+            break
+
+        # Service code — 3 digits after the expiry (YYMM) in Track2
+        for v in tags.get(0x57, []):
+            t2 = v.hex().upper()
+            sep = t2.find('D')
+            if sep > 0 and len(t2) >= sep + 8:
+                svc = t2[sep + 5:sep + 8]
+                if svc.isdigit():
+                    print(f' {CG}Service Code  :{C0} {CY}{svc}{C0}')
+                    result.setdefault('Decoded', {})['ServiceCode'] = svc
+            break
+
         print(f' {CG}──────────────────────────────────────{C0}')
 
         json_str = jsonlib.dumps(result, indent=2)
@@ -10966,6 +11239,90 @@ class HfDesInfo(ReaderRequiredUnit):
                 print(f"\n Applications  : none")
         except Exception as e:
             print(f" {CY}[!] GetApplicationIDs failed: {e}{C0}")
+
+
+@hf_des.command("enum")
+class HfDesEnum(ReaderRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Fast DESFire enumeration in a single firmware call — version, UID, "
+            "AIDs and files per app, without per-APDU USB round-trips.")
+        parser.epilog = "examples:\n  hf des enum\n"
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        resp = self.cmd.hf14a_4_desfire_scan()
+        if resp.status != Status.HF_TAG_OK or not resp.data:
+            print(f" {CR}No DESFire card found (status={resp.status}){C0}")
+            return
+        d = bytes(resp.data)
+        try:
+            off = 0
+            uid_len = d[off]; off += 1
+            uid = d[off:off + uid_len]; off += uid_len
+            atqa = d[off:off + 2]; off += 2
+            sak = d[off]; off += 1
+            ats_len = d[off]; off += 1
+            ats = d[off:off + ats_len]; off += ats_len
+            num = d[off]; off += 1
+            pairs = []
+            for _ in range(num):
+                cl = d[off]; off += 1
+                c = d[off:off + cl]; off += cl
+                rl = d[off] | (d[off + 1] << 8); off += 2
+                r = d[off:off + rl]; off += rl
+                pairs.append((c, r))
+        except IndexError:
+            print(f" {CR}Malformed scan response{C0}")
+            return
+
+        print(f" UID           : {uid.hex().upper()}")
+        print(f" ATQA/SAK      : {atqa.hex().upper()} / {sak:02X}")
+        if ats:
+            print(f" ATS           : {ats.hex().upper()}")
+
+        # Walk the APDU pairs, decode by DESFire instruction byte.
+        version = b''
+        aids = []
+        files = {}
+        cur_aid = None
+        for c, r in pairs:
+            ins = c[1] if len(c) >= 2 else 0
+            body = r[:-2] if len(r) >= 2 else r  # strip 91 xx status word
+            if ins in (0x60, 0xAF):
+                version += body
+            elif ins == 0x6A:  # GetApplicationIDs
+                for i in range(0, len(body) - 2, 3):
+                    aids.append(body[i:i + 3])
+            elif ins == 0x5A:  # SelectApplication
+                cur_aid = bytes(c[5:8]) if len(c) >= 8 else None
+            elif ins == 0x6F and cur_aid is not None:  # GetFileIDs
+                files[cur_aid.hex().upper()] = list(body)
+
+        # GetVersion: HW(7) + SW(7) + production(14)
+        if len(version) >= 7:
+            gen = _DESFIRE_HW_MAJOR.get(version[3], f"hw_major 0x{version[3]:02X}")
+            print(f" HW version    : {version[3]:x}.{version[4]:x}  ({gen})  "
+                  f"storage: {_DESFIRE_STORAGE.get(version[5], f'0x{version[5]:02X}')}")
+            print(f" Protocol      : {_DESFIRE_PROTOCOL.get(version[6], f'0x{version[6]:02X}')}")
+        if len(version) >= 14:
+            print(f" SW version    : {version[10]:x}.{version[11]:x}  "
+                  f"storage: {_DESFIRE_STORAGE.get(version[12], f'0x{version[12]:02X}')}")
+        if len(version) >= 28:
+            print(f" Card UID      : {version[14:21].hex().upper()}")
+            print(f" Batch no      : {version[21:26].hex().upper()}")
+            print(f" Production    : week {version[26]:02X} / 20{version[27]:02X}")
+
+        if aids:
+            print(f"\n Applications  : {len(aids)} found")
+            for aid in aids:
+                aid_hex = aid.hex().upper()
+                fl = files.get(aid_hex)
+                fstr = f"  files: {', '.join(f'{f:02X}' for f in fl)}" if fl else ""
+                print(f"   AID {aid_hex}  ({int.from_bytes(aid, 'little'):06X}){fstr}")
+        else:
+            print(f"\n Applications  : none")
 
 
 @hf_des.command("chk")

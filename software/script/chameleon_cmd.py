@@ -290,6 +290,22 @@ class ChameleonCMD:
                    'data': bytes(resp.data[3:3 + ln])}
         return out
 
+    def ble_gatt_write_start(self, value_handle: int, data: bytes):
+        """Write a value to a characteristic on the connected target (async)."""
+        return self.device.send_cmd_sync(Command.BLE_GATT_WRITE,
+                                         struct.pack('!H', value_handle) + bytes(data))
+
+    def ble_gatt_write_result(self):
+        """
+        Fetch the last GATT write result: dict {state, gatt_status}.
+        state: 0 idle, 1 pending, 2 done.
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_GET_WRITE)
+        out = {'state': 0, 'gatt_status': 0}
+        if resp.status == Status.SUCCESS and len(resp.data) >= 2:
+            out = {'state': resp.data[0], 'gatt_status': resp.data[1]}
+        return out
+
     def ble_subscribe(self, cccd_handle: int, mode: int = 1):
         """
         Subscribe to notifications/indications on the connected target by writing
@@ -297,6 +313,23 @@ class ChameleonCMD:
         """
         data = struct.pack('!HB', cccd_handle, mode)
         return self.device.send_cmd_sync(Command.BLE_SUBSCRIBE, data)
+
+    def ble_find_cccd_start(self, value_handle: int):
+        """Start discovering the CCCD descriptor of a characteristic (async)."""
+        return self.device.send_cmd_sync(Command.BLE_FIND_CCCD,
+                                         struct.pack('!H', value_handle))
+
+    def ble_get_cccd(self):
+        """
+        Fetch the CCCD lookup result: dict {state, handle}.
+        state: 0 idle, 1 searching, 2 found, 3 not-found.
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_GET_CCCD)
+        out = {'state': 0, 'handle': 0}
+        if resp.status == Status.SUCCESS and len(resp.data) >= 3:
+            out = {'state': resp.data[0],
+                   'handle': (resp.data[1] << 8) | resp.data[2]}
+        return out
 
     @expect_response(Status.SUCCESS)
     def ble_get_notifications(self, start_index: int = 0):
@@ -438,6 +471,21 @@ class ChameleonCMD:
         resp.parsed = resp.data
         return resp
 
+    def mf1_read_blocks(self, block, count, type_value: MfcKeyType, key):
+        """
+        Authenticate once to a sector, then read `count` consecutive blocks from
+        it (all in the sector `block` belongs to) — far fewer auths than
+        read-one-block per block when dumping.
+
+        :return: response; resp.parsed is a list of the 16-byte blocks actually
+                 read (may be shorter than `count` if a read failed part-way).
+        """
+        data = struct.pack('!BBB6s', type_value, block, count, key)
+        resp = self.device.send_cmd_sync(Command.MF1_READ_BLOCKS, data)
+        if resp.status == Status.HF_TAG_OK:
+            resp.parsed = [resp.data[i:i + 16] for i in range(0, len(resp.data), 16)]
+        return resp
+
     @expect_response(Status.HF_TAG_OK)
     def mf1_write_one_block(self, block, type_value: MfcKeyType, key, block_data):
         """
@@ -547,6 +595,22 @@ class ChameleonCMD:
         """
         resp = self.device.send_cmd_sync(Command.HF14A_4_EMV_SCAN, b'', timeout=10)
         return resp
+
+    def hf14a_4_desfire_scan(self):
+        """
+        Full DESFire enumeration in a single firmware call. Same packed response
+        layout as hf14a_4_emv_scan: tag info + num_apdus + (cmd, resp) pairs
+        (GetVersion, GetApplicationIDs, per-app SelectApplication + GetFileIDs).
+        """
+        return self.device.send_cmd_sync(Command.HF14A_4_DESFIRE_SCAN, b'', timeout=10)
+
+    def hf14a_set_field_on(self):
+        """Reset the HF reader and turn the antenna field on (reader mode)."""
+        return self.device.send_cmd_sync(Command.HF14A_SET_FIELD_ON)
+
+    def hf14a_set_field_off(self):
+        """Turn the HF reader antenna field off (reader mode)."""
+        return self.device.send_cmd_sync(Command.HF14A_SET_FIELD_OFF)
 
     def hf14a_4_clear_static_responses(self):
         """Clear all static APDU responses from the active HF14A_4 slot."""
