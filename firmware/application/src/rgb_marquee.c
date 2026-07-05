@@ -37,6 +37,7 @@ static uint8_t rgb_marquee_usb_idle_step = 0;
 static uint8_t rgb_marquee_usb_idle_color = RGB_RED;
 static uint8_t rgb_marquee_usb_open_step = 0;
 static bool m_reader_keys_anim_active = false;
+static bool m_ble_test_anim_active = false;
 extern bool g_usb_led_marquee_enable;
 
 
@@ -732,6 +733,69 @@ void rgb_marquee_reader_keys_loop(void) {
 
     if (++radius > 4) {
         radius = 1;
+        color_index = (color_index + 1) % 6;
+    }
+}
+
+/**
+ * @brief Enable/disable the BLE-test animation (outside -> center).
+ *
+ * Mirrors rgb_marquee_set_reader_keys_anim: on enable, release any PWM the
+ * idle/open marquee still drives so the loop can drive the LEDs directly.
+ */
+void rgb_marquee_set_ble_test_anim(bool enable) {
+    m_ble_test_anim_active = enable;
+    if (enable) {
+        if (rgb_marquee_usb_idle_step != 0 || rgb_marquee_usb_open_step != 0) {
+            rgb_marquee_stop();
+        }
+    } else {
+        rgb_marquee_reset();
+    }
+}
+
+bool rgb_marquee_is_ble_test_anim(void) {
+    return m_ble_test_anim_active;
+}
+
+/**
+ * @brief BLE-test animation: a bar that fills from the outer edges toward the
+ *        centre (the reverse of the reader-key centre-out effect).
+ *
+ * Frame 0 lights the edge pair (0,7), frame 1 (0,1,6,7), ... frame 3 the whole
+ * bar, then it restarts with the next rainbow colour. Non-blocking: advances
+ * one frame per call, throttled with app_timer.
+ */
+void rgb_marquee_ble_test_loop(void) {
+    static uint8_t step = 0;           // 0..3 pairs lit, growing from the edges in
+    static uint8_t color_index = 0;
+    static uint32_t last_update = 0;
+
+    uint32_t now = app_timer_cnt_get();
+    if (app_timer_cnt_diff_compute(now, last_update) < APP_TIMER_TICKS(120)) {
+        return;
+    }
+    last_update = now;
+
+    const uint8_t colors[] = {RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_MAGENTA, RGB_RED, RGB_YELLOW};
+    uint32_t *led_pins = hw_get_led_array();
+
+    set_slot_light_color(colors[color_index]);
+    for (uint8_t i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_clear(led_pins[i]);
+    }
+    // Light pairs from the edges (0,7) inward up to the current step.
+    for (uint8_t i = 0; i <= step; i++) {
+        if (i < RGB_LIST_NUM) {
+            nrf_gpio_pin_set(led_pins[i]);
+        }
+        if ((7 - i) < RGB_LIST_NUM) {
+            nrf_gpio_pin_set(led_pins[7 - i]);
+        }
+    }
+
+    if (++step > 3) {
+        step = 0;
         color_index = (color_index + 1) % 6;
     }
 }

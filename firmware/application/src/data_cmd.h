@@ -247,5 +247,7 @@
 #define DATA_CMD_BLE_GET_NOTIFICATIONS          (7021)  /* paged received notifications           */
 #define DATA_CMD_BLE_FIND_CCCD                   (7022)  /* discover a char's CCCD: value_handle[2] */
 #define DATA_CMD_BLE_GET_CCCD                    (7023)  /* fetch CCCD lookup result               */
+#define DATA_CMD_BLE_GATT_WRITE                  (7024)  /* write a characteristic: handle[2]|data */
+#define DATA_CMD_BLE_GET_WRITE                   (7025)  /* fetch last GATT write result           */
 
 #endif

@@ -25,4 +25,10 @@ void rgb_marquee_reader_keys_loop(void);
 void rgb_marquee_set_reader_keys_anim(bool enable);
 bool rgb_marquee_is_reader_keys_anim(void);
 
+// BLE-test animation: a bar filling from the outer edges toward the centre
+// (outside -> center), used while a directed BLE test (fuzz) is running.
+void rgb_marquee_ble_test_loop(void);
+void rgb_marquee_set_ble_test_anim(bool enable);
+bool rgb_marquee_is_ble_test_anim(void);
+
 #endif

@@ -28,6 +28,7 @@
 
 #include "ble_main.h"
 #include "ble_central.h"
+#include "rgb_marquee.h"
 
 #define NRF_LOG_MODULE_NAME ble_central
 #include "nrf_log.h"
@@ -112,6 +113,10 @@ static uint8_t          m_read_status = 0;  // gatt_status of the last read
 static uint16_t         m_read_len = 0;
 static uint8_t          m_read_value[BLE_READ_VALUE_MAX];
 
+// Last GATT write result (write-with-response to the connected target).
+static volatile uint8_t m_write_state = 0;  // 0 idle,1 pending,2 done
+static uint8_t          m_write_status = 0; // gatt_status returned by the target
+
 // Received notifications/indications from the connected target (receive-only).
 typedef struct {
     uint16_t handle;
@@ -120,6 +125,11 @@ typedef struct {
 } ble_notif_t;
 static ble_notif_t       m_notif_log[BLE_NOTIF_LOG_MAX];
 static volatile uint16_t m_notif_count = 0;
+
+// CCCD lookup for a characteristic (so 'subscribe' uses the real descriptor
+// handle instead of assuming value_handle + 1).
+static volatile uint8_t  m_cccd_state = 0;   // 0 idle, 1 searching, 2 found, 3 not-found
+static uint16_t          m_cccd_handle = 0;
 
 APP_TIMER_DEF(m_fuzz_timer);
 
@@ -431,6 +441,7 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
                     m_fuzz_state = 2;
                     app_timer_stop(m_fuzz_timer);
                 }
+                rgb_marquee_set_ble_test_anim(false);
                 NRF_LOG_INFO("Central target disconnected, reason 0x%x", m_last_disc_reason);
             }
             break;
@@ -489,6 +500,15 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
             }
             break;
 
+        case BLE_GATTC_EVT_WRITE_RSP:
+            // Result of a user write-with-response (the fuzzer uses WRITE_CMD,
+            // which produces no response, so this is only our explicit writes).
+            if (gattc->conn_handle == m_conn_handle && m_write_state == 1) {
+                m_write_status = gattc->gatt_status;
+                m_write_state = 2; // done
+            }
+            break;
+
         case BLE_GATTC_EVT_READ_RSP:
             if (gattc->conn_handle != m_conn_handle) {
                 break;
@@ -528,6 +548,44 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
             break;
         }
 
+        case BLE_GATTC_EVT_DESC_DISC_RSP: {
+            // Looking for a characteristic's CCCD (UUID 0x2902).
+            if (gattc->conn_handle != m_conn_handle || m_cccd_state != 1) {
+                break;
+            }
+            if (gattc->gatt_status != BLE_GATT_STATUS_SUCCESS) {
+                m_cccd_state = 3; // not found
+                break;
+            }
+            const ble_gattc_evt_desc_disc_rsp_t *r = &gattc->params.desc_disc_rsp;
+            uint16_t last = 0;
+            for (uint16_t i = 0; i < r->count; i++) {
+                uint16_t uuid = r->descs[i].uuid.uuid;
+                last = r->descs[i].handle;
+                if (uuid == BLE_UUID_DESCRIPTOR_CLIENT_CHAR_CONFIG) { // 0x2902
+                    m_cccd_handle = r->descs[i].handle;
+                    m_cccd_state = 2; // found
+                    break;
+                }
+                if (uuid == BLE_UUID_CHARACTERISTIC) { // 0x2803: reached the next char
+                    m_cccd_state = 3;
+                    break;
+                }
+            }
+            if (m_cccd_state == 1) {
+                // Not decided yet: keep scanning descriptors after `last`.
+                if (last == 0 || last >= 0xFFFF) {
+                    m_cccd_state = 3;
+                } else {
+                    ble_gattc_handle_range_t range = { .start_handle = last + 1, .end_handle = 0xFFFF };
+                    if (sd_ble_gattc_descriptors_discover(m_conn_handle, &range) != NRF_SUCCESS) {
+                        m_cccd_state = 3;
+                    }
+                }
+            }
+            break;
+        }
+
         default:
             break;
     }
@@ -544,6 +602,7 @@ static void fuzz_timer_handler(void *p_context) {
     if (m_fuzz_max != 0 && m_fuzz_sent >= m_fuzz_max) {
         m_fuzz_state = 2;
         app_timer_stop(m_fuzz_timer);
+        rgb_marquee_set_ble_test_anim(false);
         return;
     }
 
@@ -601,7 +660,9 @@ uint32_t ble_central_connect(uint8_t addr_type, const uint8_t *addr) {
     m_fuzz_sent = 0;
     m_fuzz_log_count = 0;
     m_read_state = 0;
+    m_write_state = 0;
     m_notif_count = 0;
+    m_cccd_state = 0;
     m_probe_state = 0;
     m_probe_result = 0;
     m_conn_state = 1; // connecting
@@ -685,6 +746,44 @@ uint32_t ble_central_gatt_read(uint16_t value_handle) {
     return sd_ble_gattc_read(m_conn_handle, value_handle, 0);
 }
 
+// Write a user-specified value to a characteristic (write-with-response), so the
+// target's ATT status comes back. Point-to-point against the connected target.
+uint32_t ble_central_gatt_write(uint16_t value_handle, const uint8_t *data, uint8_t len) {
+    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    static uint8_t wbuf[BLE_FUZZ_PAYLOAD_MAX];
+    if (len > BLE_FUZZ_PAYLOAD_MAX) {
+        len = BLE_FUZZ_PAYLOAD_MAX; // capped to default ATT_MTU - 3
+    }
+    memcpy(wbuf, data, len);
+    m_write_state  = 1;    // pending
+    m_write_status = 0xFF;
+    ble_gattc_write_params_t w = {
+        .write_op = BLE_GATT_OP_WRITE_REQ,
+        .flags    = 0,
+        .handle   = value_handle,
+        .offset   = 0,
+        .len      = len,
+        .p_value  = wbuf,
+    };
+    ret_code_t err = sd_ble_gattc_write(m_conn_handle, &w);
+    if (err != NRF_SUCCESS) {
+        m_write_state = 0;
+    }
+    return err;
+}
+
+uint16_t ble_central_get_write_result(uint8_t *out, uint16_t out_cap) {
+    // Wire: state[1] | gatt_status[1]. state: 0 idle, 1 pending, 2 done.
+    if (out_cap < 2) {
+        return 0;
+    }
+    out[0] = m_write_state;
+    out[1] = m_write_status;
+    return 2;
+}
+
 uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap) {
     // Wire: state[1] | gatt_status[1] | len[1] | data[len]
     if (out_cap < 3) {
@@ -705,6 +804,31 @@ uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap) {
 
 // Subscribe to notifications/indications by writing the target's CCCD.
 // mode: 0 = off, 1 = notifications, 2 = indications.
+uint32_t ble_central_find_cccd(uint16_t value_handle) {
+    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    m_cccd_state = 1;   // searching
+    m_cccd_handle = 0;
+    ble_gattc_handle_range_t range = { .start_handle = value_handle + 1, .end_handle = 0xFFFF };
+    ret_code_t err = sd_ble_gattc_descriptors_discover(m_conn_handle, &range);
+    if (err != NRF_SUCCESS) {
+        m_cccd_state = 3;
+    }
+    return err;
+}
+
+uint16_t ble_central_get_cccd(uint8_t *out, uint16_t out_cap) {
+    // Wire: state[1] | cccd_handle[2 BE]. state: 0 idle,1 searching,2 found,3 not-found.
+    if (out_cap < 3) {
+        return 0;
+    }
+    out[0] = m_cccd_state;
+    out[1] = (m_cccd_handle >> 8) & 0xFF;
+    out[2] = m_cccd_handle & 0xFF;
+    return 3;
+}
+
 uint32_t ble_central_subscribe(uint16_t cccd_handle, uint8_t mode) {
     if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
@@ -785,6 +909,7 @@ uint32_t ble_central_fuzz_start(uint16_t value_handle, uint16_t max_iterations, 
     m_fuzz_seed      = 0x1234ABCDu ^ (0x9E3779B1u * (uint32_t)value_handle);
     if (m_fuzz_seed == 0) m_fuzz_seed = 0xDEADBEEFu; // xorshift needs non-zero
     m_fuzz_state     = 1; // running
+    rgb_marquee_set_ble_test_anim(true); // outside->center LED animation while testing
     return app_timer_start(m_fuzz_timer, APP_TIMER_TICKS(interval_ms), NULL);
 }
 
@@ -793,6 +918,7 @@ uint32_t ble_central_fuzz_stop(void) {
         app_timer_stop(m_fuzz_timer);
         m_fuzz_state = 2;
     }
+    rgb_marquee_set_ble_test_anim(false);
     return NRF_SUCCESS;
 }
 

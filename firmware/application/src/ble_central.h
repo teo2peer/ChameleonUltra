@@ -41,6 +41,19 @@ uint32_t ble_central_gatt_read(uint16_t value_handle);
 // state: 0 idle, 1 pending, 2 ready.
 uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap);
 
+// Write a value to a characteristic (write-with-response; async — poll get_write_result).
+uint32_t ble_central_gatt_write(uint16_t value_handle, const uint8_t *data, uint8_t len);
+// Serialize the last write result. Wire: state[1] | gatt_status[1].
+// state: 0 idle, 1 pending, 2 done.
+uint16_t ble_central_get_write_result(uint8_t *out, uint16_t out_cap);
+
+// Find a characteristic's CCCD descriptor (async — poll get_cccd), so subscribe
+// can use the real handle instead of assuming value_handle + 1.
+uint32_t ble_central_find_cccd(uint16_t value_handle);
+// Serialize the CCCD lookup result. Wire: state[1] | cccd_handle[2 BE].
+// state: 0 idle, 1 searching, 2 found, 3 not-found.
+uint16_t ble_central_get_cccd(uint8_t *out, uint16_t out_cap);
+
 // Subscribe to notifications/indications on the connected target by writing its
 // CCCD. mode: 0 = off, 1 = notifications, 2 = indications. Receive-only.
 uint32_t ble_central_subscribe(uint16_t cccd_handle, uint8_t mode);

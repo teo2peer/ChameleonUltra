@@ -1070,10 +1070,13 @@ int main(void) {
         field_generator_rainbow_loop();
 #endif
 
-        // Reader-key capture animation takes over the LEDs while armed; otherwise
-        // fall back to the normal USB-status marquee / slot indicator.
+        // Reader-key capture / BLE-test animations take over the LEDs while
+        // armed; otherwise fall back to the normal USB-status marquee / slot
+        // indicator.
         if (rgb_marquee_is_reader_keys_anim()) {
             rgb_marquee_reader_keys_loop();
+        } else if (rgb_marquee_is_ble_test_anim()) {
+            rgb_marquee_ble_test_loop();
         } else if (!m_is_field_on) {
             // Led blink at usb status (only if field generator is off)
             blink_usb_led_status();

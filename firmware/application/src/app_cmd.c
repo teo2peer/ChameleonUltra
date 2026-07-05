@@ -3495,6 +3495,21 @@ static data_frame_tx_t *cmd_processor_ble_get_cccd(uint16_t cmd, uint16_t status
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
 
+static data_frame_tx_t *cmd_processor_ble_gatt_write(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length < 3) { // value_handle[2] + at least 1 data byte
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t handle = ((uint16_t)data[0] << 8) | data[1];
+    uint32_t err_code = ble_central_gatt_write(handle, &data[2], (uint8_t)(length - 2));
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_get_write(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[2];
+    uint16_t out_len = ble_central_get_write_result(out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
@@ -3559,6 +3574,8 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_GET_NOTIFICATIONS,        NULL,                        cmd_processor_ble_get_notifications,         NULL                   },
     {    DATA_CMD_BLE_FIND_CCCD,                NULL,                        cmd_processor_ble_find_cccd,                 NULL                   },
     {    DATA_CMD_BLE_GET_CCCD,                 NULL,                        cmd_processor_ble_get_cccd,                  NULL                   },
+    {    DATA_CMD_BLE_GATT_WRITE,               NULL,                        cmd_processor_ble_gatt_write,                NULL                   },
+    {    DATA_CMD_BLE_GET_WRITE,                NULL,                        cmd_processor_ble_get_write,                 NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
