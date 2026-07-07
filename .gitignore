@@ -229,12 +229,17 @@ celerybeat.pid
 
 # Environments
 .env
+.env.local
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# iOS signing secrets (used by build_ipa.sh — never commit these)
+*.p12
+*.mobileprovision
 # Spyder project settings
 .spyderproject
 .spyproject

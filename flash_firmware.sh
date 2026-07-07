@@ -20,19 +20,31 @@ PYBIN="$SCRIPT_DIR/software/script/venv/bin/python3"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
 
 # --- ARM toolchain resolution ---
-DEFAULT_TC="/private/tmp/claude-501/-Users-teo-projects-Chamaleon-ChameleonUltra/5e9562ef-ee36-41c0-94cb-8d92012ae58a/scratchpad/armtc/bin"
-TC="${ARM_TOOLCHAIN_BIN:-$DEFAULT_TC}"
-if [ -x "$TC/arm-none-eabi-gcc" ]; then
-  export GNU_INSTALL_ROOT="$TC/"
-elif command -v arm-none-eabi-gcc >/dev/null 2>&1; then
-  export GNU_INSTALL_ROOT="$(dirname "$(command -v arm-none-eabi-gcc)")/"
-else
-  echo "ERROR: arm-none-eabi-gcc not found. Set ARM_TOOLCHAIN_BIN to its bin dir." >&2
+# We need arm-none-eabi-gcc AND binutils (objcopy/size/ld). Those may live in
+# one self-contained dir, or — with a Homebrew install — in two separate
+# keg-only dirs (arm-none-eabi-gcc@8 + arm-none-eabi-binutils, neither on PATH).
+# Put every candidate dir on PATH and leave GNU_INSTALL_ROOT empty so the
+# Makefile resolves each tool via PATH, which works for both layouts.
+[ -n "${ARM_TOOLCHAIN_BIN:-}" ] && [ -d "$ARM_TOOLCHAIN_BIN" ] && PATH="$ARM_TOOLCHAIN_BIN:$PATH"
+for _keg in arm-none-eabi-gcc@8 arm-none-eabi-gcc arm-none-eabi-binutils; do
+  _pref="$(brew --prefix "$_keg" 2>/dev/null)"
+  [ -n "$_pref" ] && [ -d "$_pref/bin" ] && PATH="$_pref/bin:$PATH"
+done
+export PATH
+if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then
+  echo "ERROR: arm-none-eabi-gcc not found. Set ARM_TOOLCHAIN_BIN to its bin dir," >&2
+  echo "       or install it: brew install arm-none-eabi-gcc arm-none-eabi-binutils" >&2
   exit 1
 fi
-export GNU_VERSION="$("${GNU_INSTALL_ROOT}arm-none-eabi-gcc" -dumpversion)"
+if ! command -v arm-none-eabi-objcopy >/dev/null 2>&1; then
+  echo "ERROR: arm-none-eabi-objcopy not found — install arm-none-eabi-binutils" >&2
+  echo "       (Homebrew keeps it in a separate keg from the gcc formula)." >&2
+  exit 1
+fi
+export GNU_INSTALL_ROOT=""       # empty -> Makefile resolves arm-none-eabi-* via PATH
+export GNU_VERSION="$(arm-none-eabi-gcc -dumpversion)"
 export GNU_PREFIX="arm-none-eabi"
-echo "==> Toolchain: ${GNU_INSTALL_ROOT} (gcc ${GNU_VERSION})"
+echo "==> Toolchain: $(command -v arm-none-eabi-gcc) (gcc ${GNU_VERSION})"
 
 # --- Build ---
 echo "==> Building application…"
