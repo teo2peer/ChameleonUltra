@@ -98,11 +98,23 @@ Firmware dispatch lives in `firmware/application/src/app_cmd.c`: the `m_data_cmd
 
 Tooling layered on top of the upstream project. Each area has a reference under `docs/` (`docs/README.md` indexes them):
 
-- **BLE audit** (commands 7000–7030, `docs/ble-audit.md`) — passive scanner + directed single-target GATT client: connect, discover services/characteristics/descriptors, read, write, subscribe, MTU exchange, link-probe, and the directed fuzzer. Receive-only or point-to-point against one operator-specified target (see Conventions). Firmware in `ble_central.c`; CLI under `ble …`; GUI page `lib/gui/menu/hacking/ble_audit.dart`.
+- **BLE audit** (commands 7000–7032, `docs/ble-audit.md`) — passive scanner + directed GATT client: connect, discover services/characteristics/descriptors, read, write, subscribe, device-info pull, MTU exchange, link-probe, and the directed fuzzer. Per-call scope is selectable: single target, scan-buffer-wide, or environment-wide broadcast (operator-authorised, see fork-specific exemption). Firmware in `ble_central.c`; CLI under `ble …`; GUI page `lib/gui/menu/hacking/ble_audit.dart`.
 - **HF reader additions** (`docs/hf-additions.md`) — `MF1_READ_BLOCKS` (2018, authenticate-once sector read; used by `hf mf dump`/autopwn), `HF14A_SCAN_KEEP` (2016) / `HF14A_AUTH_TRACE` (2017), `MF1_CHECK_KEYS_OF_SECTORS` (2012), `HF14A_4_DESFIRE_SCAN` (6006, one-call DESFire enum via `hf des enum`), and a richer `emv scan`.
 - **MIFARE Classic key-recovery optimizations** (`docs/autopwn-optimizations.md`) — live in the **GUI** engine `lib/helpers/mifare_classic/recovery.dart` (`MifareClassicRecovery`; orchestrates dictionary check → darkside/nested/hardnested/static/RF08S-backdoor → dump via the native FFI in `lib/recovery/`). The order-only ranking/intersection logic is factored into the pure, unit-tested `lib/helpers/mifare_classic/candidate_priority.dart` (`test/candidate_priority_test.dart`). All changes are **speed-/order-only and confirmed on-card** — they never mark a wrong key. When touching recovery, preserve that invariant and the per-step fallbacks.
 
 ## Conventions
 
 - Multi-byte protocol fields are **big-endian** on the wire (`U16HTONS`/`struct.pack('!...')`); BLE GAP addresses are little-endian as the SoftDevice reports them.
-- The 7000-block BLE commands (currently **7000–7030**) are scoped **receive-only or point-to-point against a single operator-specified target** by design (passive scan transmits nothing; the GATT discover/read/write/subscribe/fuzz talk only to the one connected target). Do not add environment-wide emission (advertisement floods, carrier, BLE-spam, or "probe/attack all nearby devices" batches) — jamming/DoS/mass-spam and third-party-product exploit suites have been declined and must not be reintroduced.
+
+## Fork-specific exemptions (branch `cybersecurity`)
+
+This fork is maintained by the branch owner with **explicit authorisation** to relax the upstream "no jamming / DoS / mass-spam" rule in this checkout. Everything BlueKit does (and the upstream declines) is in scope here, with explicit per-command scope selection (single-target / scan-buffer-wide / environment-wide broadcast) at runtime.
+
+Scope of the exemption:
+- Applies **only** to this fork (`branch = cybersecurity`). Do not propagate it to the upstream `RfidResearchGroup/ChameleonUltra` repository.
+- Operators are expected to target hardware / devices they own or are explicitly authorised to test (lab equipment, own accessories, CTF / education kits). Use against third-party devices without written consent is out of scope and out of bounds.
+- Third-party-product exploit payloads (crash-suite ports, commercial-tool clones) remain excluded — the exemption is for raw-radio / link-layer stress and target exercise, not for shipping known-vendor exploit code.
+- **All 7000-block commands in this fork are allowed to be used as environment-wide broadcast / flood / mass-spam tools at the operator's discretion**, scoped per-call (single-target / scan-buffer-wide / full environment-wide broadcast on the 2.4 GHz BLE spectrum). The CLI and GUI surface this as an explicit `scope` selector on every relevant command; there is no implicit downgrade to point-to-point.
+
+
+If the maintainer of this fork loses authorisation or the upstream policy changes incompatibly, this section must be reverted in the same commit that removes the affected commands.

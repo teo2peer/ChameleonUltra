@@ -1363,7 +1363,14 @@ static data_frame_tx_t *cmd_processor_mf1_set_detection_enable(uint16_t cmd, uin
     if (length != 1 || data[0] > 1) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    nfc_tag_mf1_detection_log_clear();
+    // Clear the on-device log only when *enabling* detection (i.e. starting a
+    // fresh capture session). This previously ran on disable too, which wiped a
+    // completed capture the instant the host stopped detection, forcing the host
+    // to read results before disabling. Clearing only on enable makes Stop
+    // non-destructive; a subsequent enable still starts fresh.
+    if (data[0]) {
+        nfc_tag_mf1_detection_log_clear();
+    }
     nfc_tag_mf1_set_detection_enable(data[0]);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
@@ -2451,7 +2458,7 @@ static data_frame_tx_t *cmd_processor_hf14a_4_set_anti_coll(uint16_t cmd, uint16
 
 /**
  * HF14A-4 add static APDU response pair (pre-load before hw mode -e).
- * payload: cmd_len(1) cmd(n) resp_len(1) resp(m)
+ * payload: cmd_len(1) cmd(n) resp_len(2 BE) resp(m)
  * If cmd_len==0, clears all static responses.
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_static_resp(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -2465,7 +2472,7 @@ static data_frame_tx_t *cmd_processor_hf14a_4_static_resp(uint16_t cmd, uint16_t
     /* resp_len is 2 bytes big-endian to support responses > 255 bytes */
     uint16_t resp_len = ((uint16_t)data[1 + cmd_len] << 8) | data[2 + cmd_len];
     if (length < (uint16_t)(1 + cmd_len + 2 + resp_len)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    nfc_tag_14a_4_add_static_response(&data[1], cmd_len, &data[3 + cmd_len], (uint8_t)resp_len);
+    nfc_tag_14a_4_add_static_response(&data[1], cmd_len, &data[3 + cmd_len], resp_len);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
@@ -2719,15 +2726,26 @@ static bool tcl_apdu_(
  * offline-terminal data. amount is a 6-byte n12 BCD value. Unknown fields are
  * zero-filled. Returns the number of bytes written to out. Used to build the
  * GPO PDOL and the GENERATE AC CDOL1 for an offline purchase simulation. */
+static void emv_dol_put(uint8_t *dst, uint8_t len,
+                        const uint8_t *src, uint8_t src_len) {
+    if (len == 0 || src_len == 0) return;
+    uint8_t n = src_len < len ? src_len : len;
+    memcpy(&dst[len - n], &src[src_len - n], n);
+}
+
 static uint8_t emv_fill_dol(const uint8_t *dol, uint8_t dol_len, uint8_t *out,
                             uint8_t out_cap, const uint8_t amount[6]) {
     uint8_t o = 0, i = 0;
     while (i < dol_len) {
-        uint16_t tag = dol[i];
+        uint32_t tag = dol[i];
         uint8_t tl = 1;
         if ((dol[i] & 0x1F) == 0x1F && i + 1 < dol_len) {
             tag = (tag << 8) | dol[i + 1];
             tl = 2;
+            if ((dol[i + 1] & 0x80) && i + 2 < dol_len) {
+                tag = (tag << 8) | dol[i + 2];
+                tl = 3;
+            }
         }
         i += tl;
         if (i >= dol_len) break;
@@ -2736,19 +2754,105 @@ static uint8_t emv_fill_dol(const uint8_t *dol, uint8_t dol_len, uint8_t *out,
          * lengths can sum far past the buffer (stack overflow) otherwise. */
         if (o + len > out_cap) break;
         for (uint8_t k = 0; k < len; k++) out[o + k] = 0x00;
+        static const uint8_t amount_other[6] = {0, 0, 0, 0, 0, 0};
+        static const uint8_t terminal_country[2] = {0x07, 0x24}; /* Spain */
+        static const uint8_t currency[2] = {0x09, 0x78};         /* EUR */
+        static const uint8_t txn_date[3] = {0x26, 0x07, 0x07};   /* YYMMDD */
+        static const uint8_t tvr[5] = {0, 0, 0, 0, 0};
+        static const uint8_t terminal_caps[3] = {0xE0, 0xA0, 0x00};
+        static const uint8_t add_terminal_caps[5] = {0x8E, 0x00, 0xB0, 0x50, 0x05};
+        static const uint8_t ttq[4] = {0xD6, 0x20, 0xC0, 0x00};
+        static const uint8_t cvm_results[3] = {0x1F, 0x03, 0x00};
+        static const uint8_t txn_seq_counter[4] = {0, 0, 0, 1};
+        static const uint8_t merchant_category[2] = {0x59, 0x99};
+        static const uint8_t terminal_txn_info[3] = {0xC8, 0x80, 0x00};
+        static const uint8_t terminal_txn_type[1] = {0x00};
+        static const uint8_t merchant_type_indicator[1] = {0x01};
+        static const uint8_t txn_cert[20] = {0};
         switch (tag) {
-            case 0x9F02: if (len == 6) memcpy(&out[o], amount, 6); break; /* Amount Authorised */
-            case 0x5F2A: if (len == 2) { out[o] = 0x09; out[o + 1] = 0x78; } break; /* Currency EUR */
-            case 0x9F1A: if (len == 2) { out[o] = 0x07; out[o + 1] = 0x24; } break; /* Country ES */
-            case 0x9A:   if (len == 3) { out[o] = 0x25; out[o + 1] = 0x01; out[o + 2] = 0x01; } break; /* Date */
+            case 0x9F02: emv_dol_put(&out[o], len, amount, 6); break; /* Amount Authorised */
+            case 0x9F03: emv_dol_put(&out[o], len, amount_other, sizeof(amount_other)); break;
+            case 0x9F1A: emv_dol_put(&out[o], len, terminal_country, sizeof(terminal_country)); break;
+            case 0x5F2A: emv_dol_put(&out[o], len, currency, sizeof(currency)); break;
+            case 0x9A:   emv_dol_put(&out[o], len, txn_date, sizeof(txn_date)); break;
+            case 0x95:   emv_dol_put(&out[o], len, tvr, sizeof(tvr)); break;
+            case 0x9C:   if (len >= 1) out[o + len - 1] = 0x00; break; /* Purchase */
             case 0x9F37: for (uint8_t k = 0; k < len; k++) out[o + k] = (uint8_t)(0x11 * (k + 1)); break; /* Unpredictable Number */
             case 0x9F35: if (len >= 1) out[o] = 0x22; break; /* Terminal Type */
-            case 0x9F66: if (len == 4) out[o] = 0x36; break; /* TTQ (qVSDC, online) */
+            case 0x9F33: emv_dol_put(&out[o], len, terminal_caps, sizeof(terminal_caps)); break;
+            case 0x9F34: emv_dol_put(&out[o], len, cvm_results, sizeof(cvm_results)); break;
+            case 0x9F40: emv_dol_put(&out[o], len, add_terminal_caps, sizeof(add_terminal_caps)); break;
+            case 0x9F41: emv_dol_put(&out[o], len, txn_seq_counter, sizeof(txn_seq_counter)); break;
+            case 0x9F53: if (len >= 1) out[o + len - 1] = 0x52; break; /* Transaction category */
+            case 0x9F58: emv_dol_put(&out[o], len, merchant_type_indicator, sizeof(merchant_type_indicator)); break;
+            case 0x9F59: emv_dol_put(&out[o], len, terminal_txn_info, sizeof(terminal_txn_info)); break;
+            case 0x9F5A: emv_dol_put(&out[o], len, terminal_txn_type, sizeof(terminal_txn_type)); break;
+            case 0x9F66: emv_dol_put(&out[o], len, ttq, sizeof(ttq)); break;
+            case 0x9F15: emv_dol_put(&out[o], len, merchant_category, sizeof(merchant_category)); break;
+            case 0x98:   emv_dol_put(&out[o], len, txn_cert, sizeof(txn_cert)); break;
             default: break; /* 9C type=00, 95 TVR=0, 9F03 other amount=0, ... */
         }
         o += len;
     }
     return o;
+}
+
+static uint8_t emv_dol_value_len(const uint8_t *dol, uint8_t dol_len,
+                                 uint8_t out_cap) {
+    uint16_t total = 0;
+    uint8_t i = 0;
+    while (i < dol_len) {
+        uint8_t tl = 1;
+        if ((dol[i] & 0x1F) == 0x1F && i + 1 < dol_len) {
+            tl = 2;
+            if ((dol[i + 1] & 0x80) && i + 2 < dol_len) tl = 3;
+        }
+        i += tl;
+        if (i >= dol_len) return 0;
+        total += dol[i++];
+        if (total > out_cap) return 0;
+    }
+    return (uint8_t)total;
+}
+
+static bool emv_find_tlv_value(const uint8_t *d, uint16_t dl, uint32_t wanted,
+                               uint8_t *out, uint8_t *out_len,
+                               uint8_t out_cap, uint8_t depth) {
+    if (depth > 6) return false;
+    uint16_t i = 0;
+    while (i < dl) {
+        if (d[i] == 0x00 || d[i] == 0xFF) { i++; continue; }
+        uint8_t first = d[i++];
+        uint32_t tag = first;
+        bool constructed = (first & 0x20) != 0;
+        if ((first & 0x1F) == 0x1F) {
+            tag = first;
+            while (i < dl) {
+                tag = (tag << 8) | d[i];
+                if ((d[i++] & 0x80) == 0) break;
+            }
+        }
+        if (i >= dl) break;
+        uint16_t len = d[i++];
+        if (len & 0x80) {
+            uint8_t nb = len & 0x7F;
+            len = 0;
+            for (uint8_t k = 0; k < nb && i < dl; k++) len = (len << 8) | d[i++];
+        }
+        if (i + len > dl) break;
+        if (tag == wanted) {
+            uint8_t n = (uint8_t)(len > out_cap ? out_cap : len);
+            memcpy(out, &d[i], n);
+            *out_len = n;
+            return true;
+        }
+        if (constructed && emv_find_tlv_value(&d[i], len, wanted, out, out_len,
+                                             out_cap, depth + 1)) {
+            return true;
+        }
+        i += len;
+    }
+    return false;
 }
 
 /* Find CDOL1 (tag 8C) inside an EMV record body, recursing into constructed
@@ -2780,6 +2884,39 @@ static bool emv_find_cdol1(const uint8_t *d, uint16_t dl, uint8_t *out,
             return true;
         }
         if (constructed && emv_find_cdol1(&d[i], len, out, out_len, depth + 1)) {
+            return true;
+        }
+        i += len;
+    }
+    return false;
+}
+
+static bool emv_has_card_identity_tlv(const uint8_t *d, uint16_t dl,
+                                      uint8_t depth) {
+    if (depth > 6) return false;
+    uint16_t i = 0;
+    while (i < dl) {
+        if (d[i] == 0x00 || d[i] == 0xFF) { i++; continue; }
+        uint8_t first = d[i++];
+        uint16_t tag = first;
+        bool constructed = (first & 0x20) != 0;
+        if ((first & 0x1F) == 0x1F) {
+            tag = first;
+            while (i < dl) {
+                tag = (tag << 8) | d[i];
+                if ((d[i++] & 0x80) == 0) break;
+            }
+        }
+        if (i >= dl) break;
+        uint16_t len = d[i++];
+        if (len & 0x80) {
+            uint8_t nb = len & 0x7F;
+            len = 0;
+            for (uint8_t k = 0; k < nb && i < dl; k++) len = (len << 8) | d[i++];
+        }
+        if (i + len > dl) break;
+        if (tag == 0x57 || tag == 0x5A || tag == 0x5F24) return true;
+        if (constructed && emv_has_card_identity_tlv(&d[i], len, depth + 1)) {
             return true;
         }
         i += len;
@@ -2835,14 +2972,25 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     bsp_delay_ms(10);
     static picc_14a_tag_t tag;
     memset(&tag, 0, sizeof(tag));
-    status = pcd_14a_reader_scan_auto(&tag);
-    if (status != STATUS_HF_TAG_OK) {
-        bsp_delay_ms(20);
+    status = STATUS_HF_TAG_NO;
+    /* Phone wallets/HCE payment applets may take longer to wake and expose an
+     * ISO-DEP target than plastic cards. Poll briefly instead of doing only two
+     * fast attempts so the GUI can start the scan before the phone is tapped. */
+    autotimer *p_scan_timer = bsp_obtain_timer(0);
+    while (NO_TIMEOUT_1MS(p_scan_timer, 3000)) {
         memset(&tag, 0, sizeof(tag));
         status = pcd_14a_reader_scan_auto(&tag);
-        if (status != STATUS_HF_TAG_OK) {
-            return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
+        if (status == STATUS_HF_TAG_OK) {
+            break;
         }
+        for (uint8_t i = 0; i < 30; i++) {
+            bsp_delay_ms(1);
+            bsp_wdt_feed();
+        }
+    }
+    bsp_return_timer(p_scan_timer);
+    if (status != STATUS_HF_TAG_OK) {
+        return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
     }
 
     /* After scan_auto completes RATS, give the RC522 time to settle.
@@ -2907,22 +3055,15 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     APPEND_PAIR(ppse_cmd, sizeof(ppse_cmd), ppse_resp, ppse_rlen);
     num_apdus++;
 
-    /* ---- Re-establish T=CL after PPSE ----------------------------
-     * The PPSE exchange leaves the RC522 in an unknown internal state.
-     * Rather than trying to clear it piecemeal, do a full reset:
-     * turn the field off briefly, rescan the card, re-run RATS.
-     * This guarantees a clean RC522 state before SELECT AID.
-     * blk resets to 0 because a new T=CL session starts after RATS. */
-    pcd_14a_reader_antenna_off();
-    bsp_delay_ms(10);
-    {
-        picc_14a_tag_t tag2;
-        pcd_14a_reader_reset();
-        pcd_14a_reader_antenna_on();
-        bsp_delay_ms(8);
-        if (pcd_14a_reader_scan_auto(&tag2) != STATUS_HF_TAG_OK) goto done;
-    }
-    blk = 0;   /* new T=CL session: block number restarts at 0 */
+    /* Keep the T=CL session alive after PPSE. Phone wallets commonly tear down
+     * their transient payment applet when the RF field drops, so a field cycle
+     * here loses SELECT AID/GPO. tcl_apdu_ already clears stale RxIrq before
+     * each exchange; just idle/flush the RC522 without resetting ISO-DEP block
+     * numbering. */
+    write_register_single(CommandReg, PCD_IDLE);
+    write_register_single(ComIrqReg, 0x7F);
+    set_register_mask(FIFOLevelReg, 0x80);
+    clear_register_mask(BitFramingReg, 0x80);
 
     /* ---- Extract first AID from PPSE ----------------------------- */
     uint8_t aid[16];
@@ -2954,33 +3095,24 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     if (!SEND_APDU(sel_cmd, sel_len, &sel_resp, &sel_rlen)) goto done;
     APPEND_PAIR(sel_cmd, sel_len, sel_resp, sel_rlen);
     num_apdus++;
+    if (do_txn && cdol1_len == 0) {
+        emv_find_cdol1(sel_resp, sel_rlen >= 2 ? sel_rlen - 2 : sel_rlen,
+                       cdol1, &cdol1_len, 0);
+    }
 
-    /* ---- Step 4: GPO — parse PDOL from SELECT AID FCI, fill zeros ------- */
-    /* PDOL is tag 9F38 in the FCI (sel_resp). Parse it to know how many
-     * bytes the card expects. Fill all fields with zeros (offline scan). */
-    uint16_t pdol_len = 0;
-    for (uint16_t pi = 0; pi + 2 < sel_rlen; pi++) {
-        /* 2-byte tag detection: first byte has bits[4:0] == 0x1F */
-        uint8_t ptag1 = sel_resp[pi];
-        uint8_t ptag2 = (((ptag1 & 0x1F) == 0x1F) && pi + 1 < sel_rlen) ? sel_resp[pi + 1] : 0;
-        uint16_t ftag = ((ptag1 & 0x1F) == 0x1F) ? (((uint16_t)ptag1 << 8) | ptag2) : ptag1;
-        uint8_t flen_off = (((ptag1 & 0x1F) == 0x1F)) ? 2 : 1;
-        if (pi + flen_off >= sel_rlen) break;
-        uint8_t flen = sel_resp[pi + flen_off];
-        if (ftag == 0x9F38) {
-            /* Sum DOL field lengths to get total PDOL data size */
-            uint16_t di = pi + flen_off + 1;
-            uint16_t dend = di + flen;
-            while (di < dend && di + 1 < sel_rlen) {
-                uint8_t dol_tl = ((sel_resp[di] & 0x1F) == 0x1F) ? 2 : 1;
-                if (di + dol_tl >= sel_rlen) break;
-                pdol_len += sel_resp[di + dol_tl];
-                di += dol_tl + 1;
-            }
-            break;
+    /* ---- Step 4: GPO — parse PDOL from SELECT AID FCI ------------------ */
+    static uint8_t pdol_def[64];
+    static uint8_t pdol_data[44];
+    uint8_t pdol_def_len = 0;
+    uint8_t pdol_len = 0;
+    if (emv_find_tlv_value(sel_resp, sel_rlen >= 2 ? sel_rlen - 2 : sel_rlen,
+                           0x9F38, pdol_def, &pdol_def_len,
+                           sizeof(pdol_def), 0)) {
+        pdol_len = emv_dol_value_len(pdol_def, pdol_def_len, sizeof(pdol_data));
+        if (pdol_len > 0) {
+            emv_fill_dol(pdol_def, pdol_def_len, pdol_data,
+                         sizeof(pdol_data), txn_amount);
         }
-        if (flen_off + flen < 255) pi += flen_off + flen - 1;
-        else break;
     }
     /* ---- Step 5: GPO -----------------------------------------------
      * Build GPO from parsed PDOL. pdol_len from FCI may be 0 if truncated.
@@ -3012,43 +3144,38 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     uint8_t gpo_len = 0;
     uint8_t *gpo_resp = NULL;
     uint16_t gpo_rlen = 0;
-    if (pdol_len > 44) pdol_len = 0;
-#define BUILD_GPO(pl) do { \
+#define BUILD_GPO(pl, src) do { \
         gpo_len = 0; \
         gpo_buf[gpo_len++]=0x80; gpo_buf[gpo_len++]=0xA8; \
         gpo_buf[gpo_len++]=0x00; gpo_buf[gpo_len++]=0x00; \
         gpo_buf[gpo_len++]=(uint8_t)((pl)+2); \
         gpo_buf[gpo_len++]=0x83; gpo_buf[gpo_len++]=(pl); \
-        memcpy(&gpo_buf[gpo_len], gpo_pdol_template, \
-               (pl) <= sizeof(gpo_pdol_template) ? (pl) : sizeof(gpo_pdol_template)); \
-        if ((pl) > sizeof(gpo_pdol_template)) \
-            memset(&gpo_buf[gpo_len + sizeof(gpo_pdol_template)], 0, \
-                   (pl) - sizeof(gpo_pdol_template)); \
+        memcpy(&gpo_buf[gpo_len], (src), (pl)); \
         gpo_len += (pl); \
         gpo_buf[gpo_len++]=0x00; \
     } while(0)
 #define GPO_OK(rp,rl) ((rl)>=2 && \
         ((rp)[0]==0x77||(rp)[0]==0x80|| \
          ((rp)[(rl)-2]==0x90&&(rp)[(rl)-1]==0x00)))
-    /* Attempt 1: use PDOL length from FCI (may be 0 if truncated) */
-    BUILD_GPO(pdol_len);
+    /* Attempt 1: use the actual PDOL tag order from FCI, as EMV terminals do. */
+    BUILD_GPO(pdol_len, pdol_len > 0 ? pdol_data : gpo_pdol_template);
     if (!SEND_APDU(gpo_buf, gpo_len, &gpo_resp, &gpo_rlen) ||
             !GPO_OK(gpo_resp, gpo_rlen)) {
         /* Attempt 2: try 4 bytes (TTQ only — some Visa/MC accept this) */
         if (pdol_len != 4) {
-            BUILD_GPO(4);
+            BUILD_GPO(4, gpo_pdol_template);
             if (SEND_APDU(gpo_buf, gpo_len, &gpo_resp, &gpo_rlen) &&
                     GPO_OK(gpo_resp, gpo_rlen)) goto gpo_done;
         }
         /* Attempt 3: try 29 bytes (common Mastercard/Visa PDOL size) */
         if (pdol_len != 29) {
-            BUILD_GPO(29);
+            BUILD_GPO(29, gpo_pdol_template);
             if (SEND_APDU(gpo_buf, gpo_len, &gpo_resp, &gpo_rlen) &&
                     GPO_OK(gpo_resp, gpo_rlen)) goto gpo_done;
         }
         /* Attempt 4: try 33 bytes (MC with Amount+Country+Currency fields) */
         if (pdol_len != 33) {
-            BUILD_GPO(33);
+            BUILD_GPO(33, gpo_pdol_template);
             if (SEND_APDU(gpo_buf, gpo_len, &gpo_resp, &gpo_rlen) &&
                     GPO_OK(gpo_resp, gpo_rlen)) goto gpo_done;
         }
@@ -3058,7 +3185,7 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
             for (uint8_t ei = 0; ei < sizeof(extra_pl); ei++) {
                 uint8_t pl = extra_pl[ei];
                 if (pl == pdol_len || pl == 4 || pl == 29 || pl == 33) continue;
-                BUILD_GPO(pl);
+                BUILD_GPO(pl, gpo_pdol_template);
                 if (SEND_APDU(gpo_buf, gpo_len, &gpo_resp, &gpo_rlen) &&
                         GPO_OK(gpo_resp, gpo_rlen)) goto gpo_done;
             }
@@ -3086,6 +3213,7 @@ gpo_done:
         afl_len = gpo_rlen - 6;
     }
     uint8_t records_read = 0;
+    bool found_identity_record = false;
 
     /* READ each record listed in the AFL (when the GPO provided one) */
     if (afl != NULL && afl_len > 0) {
@@ -3115,6 +3243,10 @@ gpo_done:
                 APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
                 num_apdus++;
                 records_read++;
+                if (!found_identity_record) {
+                    found_identity_record = emv_has_card_identity_tlv(
+                        rr_resp, rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen, 0);
+                }
                 if (do_txn && cdol1_len == 0) {
                     emv_find_cdol1(rr_resp, rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen,
                                    cdol1, &cdol1_len, 0);
@@ -3123,12 +3255,12 @@ gpo_done:
         }
     }
 
-    /* Fallback (nfc-frog style): if the AFL yielded no records — some cards
-     * omit or mis-report it in the GPO — brute-force READ RECORD across the low
-     * SFIs to capture the PAN record. Stop each SFI on the first error SW
-     * (6A83 record-not-found), and bound the total to keep the response sane. */
-    if (records_read == 0) {
-        for (uint8_t sfi = 1; sfi <= 8; sfi++) {
+    /* Fallback (nfc-frog style): if the AFL yielded no identity data — some
+     * cards omit or mis-report it in the GPO — brute-force READ RECORD across
+     * all valid EMV SFIs with a fast 16-record cap. Stop each SFI on the first
+     * error SW (6A83/6A82/...), and bound the total to keep the response sane. */
+    if (records_read == 0 || !found_identity_record) {
+        for (uint8_t sfi = 1; sfi <= 31; sfi++) {
             if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
             for (uint8_t r = 1; r <= 16; r++) {
                 if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
@@ -3142,6 +3274,10 @@ gpo_done:
                     APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
                     num_apdus++;
                     records_read++;
+                    if (!found_identity_record) {
+                        found_identity_record = emv_has_card_identity_tlv(
+                            rr_resp, rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen, 0);
+                    }
                     if (do_txn && cdol1_len == 0) {
                         emv_find_cdol1(rr_resp,
                                        rr_rlen >= 2 ? rr_rlen - 2 : rr_rlen,
@@ -3160,10 +3296,11 @@ gpo_done:
      * so nothing is authorised and no funds move. Best-effort: cards may return
      * an error SW without a full terminal profile — that's fine (still no
      * charge). Visa qVSDC cards already produce the cryptogram in the GPO. */
-    if (do_txn && cdol1_len > 0) {
+    if (do_txn) {
         static uint8_t gac_data[64];
-        uint8_t gac_dlen =
-            emv_fill_dol(cdol1, cdol1_len, gac_data, sizeof(gac_data), txn_amount);
+        uint8_t gac_dlen = cdol1_len > 0
+            ? emv_fill_dol(cdol1, cdol1_len, gac_data, sizeof(gac_data), txn_amount)
+            : 0;
         if (gac_dlen <= 55) {
             static uint8_t gac_cmd[80];
             uint8_t gc = 0;
@@ -3171,9 +3308,11 @@ gpo_done:
             gac_cmd[gc++] = 0xAE;      /* INS GENERATE AC */
             gac_cmd[gc++] = 0x80;      /* P1 = ARQC (online cryptogram) */
             gac_cmd[gc++] = 0x00;
-            gac_cmd[gc++] = gac_dlen;
-            memcpy(&gac_cmd[gc], gac_data, gac_dlen);
-            gc += gac_dlen;
+            if (gac_dlen > 0) {
+                gac_cmd[gc++] = gac_dlen;
+                memcpy(&gac_cmd[gc], gac_data, gac_dlen);
+                gc += gac_dlen;
+            }
             gac_cmd[gc++] = 0x00;
             uint8_t *gac_resp;
             uint16_t gac_rlen;
@@ -3342,8 +3481,16 @@ static data_frame_tx_t *cmd_processor_hf14a_4_debug_counters(uint16_t cmd, uint1
 // The device transmits nothing while scanning: it only collects advertisements
 // already broadcast by nearby devices. Available on both Ultra and Lite.
 // ---------------------------------------------------------------------------
+static bool cmd_ble_radio_is_on(void) {
+    uint8_t state[4];
+    return ble_radio_get(state) == NRF_SUCCESS && state[0] != 0;
+}
+
 static data_frame_tx_t *cmd_processor_ble_scan_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t active = (length >= 1) ? data[0] : 0; // 0 = passive (default), 1 = active
+    if (!cmd_ble_radio_is_on()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
     uint32_t err_code = ble_scan_start(active);
     return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
 }
@@ -3373,6 +3520,9 @@ static data_frame_tx_t *cmd_processor_ble_advertising_set(uint16_t cmd, uint16_t
     if (data[0] == 0) {
         advertising_stop();
     } else {
+        if (!cmd_ble_radio_is_on()) {
+            return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+        }
         advertising_start((length == 2) ? (data[1] != 0) : false);
     }
 
@@ -3389,18 +3539,25 @@ static data_frame_tx_t *cmd_processor_ble_link_probe(uint16_t cmd, uint16_t stat
     if (length > 1) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
+    if (!cmd_ble_radio_is_on()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
     uint8_t global_mode = (length == 1) ? (data[0] != 0) : 0;
     uint32_t err_code = ble_central_link_probe(global_mode);
     return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
 }
 
 // ---------------------------------------------------------------------------
-// Directed BLE GATT fuzzing harness commands (central role; see ble_central.c).
-// Point-to-point against ONE operator-specified target address; never broadcasts.
+// BLE GATT fuzzing harness commands (central role; see ble_central.c).
+// Per-call scope selectable (single target / scan-buffer-wide / environment-
+// wide broadcast) — see CLAUDE.md fork-specific exemption, operator-authorised.
 // ---------------------------------------------------------------------------
 static data_frame_tx_t *cmd_processor_ble_connect(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     if (length != 7) { // addr_type[1] + addr[6]
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (!cmd_ble_radio_is_on()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
     }
     uint32_t err_code = ble_central_connect(data[0], &data[1]);
     return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
@@ -3543,6 +3700,196 @@ static data_frame_tx_t *cmd_processor_ble_svc_get(uint16_t cmd, uint16_t status,
     return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
 }
 
+static data_frame_tx_t *cmd_processor_ble_device_info(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t err_code = ble_central_devinfo_start();
+    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_get_device_info(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[512]; // state + count + 11 fields * (4 + BLE_DEVINFO_VAL_MAX) < 512
+    uint16_t out_len = ble_central_copy_devinfo(out, sizeof(out));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
+}
+
+// ---------------------------------------------------------------------------
+// Own-radio identity / radio power (cybersecurity fork additions).
+// These mutate OUR OWN radio. Scope (single target / scan-buffer-wide /
+// environment-wide broadcast) is selectable at the host / GUI for every
+// stress / broadcast command in the 7000-block — see CLAUDE.md fork-specific
+// exemption.
+// ---------------------------------------------------------------------------
+static data_frame_tx_t *cmd_processor_ble_set_addr(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length < 1 || length > 7 || data[0] > 3) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    // mode 1 (static-random) requires exactly 6 address bytes following the mode byte.
+    if (data[0] == BLE_ADDR_MODE_RANDOM_STATIC && length != 7) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    const uint8_t *addr_le = (data[0] == BLE_ADDR_MODE_RANDOM_STATIC) ? &data[1] : NULL;
+    uint32_t err = ble_addr_set(data[0], addr_le);
+    if (err == NRF_ERROR_BUSY) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL); // link active
+    }
+    if (err != NRF_SUCCESS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_get_addr(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[1 + BLE_GAP_ADDR_LEN]; // addr_type + 6 bytes LE
+    uint32_t err = ble_addr_get(&out[0], &out[1]);
+    if (err != NRF_SUCCESS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(out), out);
+}
+
+static data_frame_tx_t *cmd_processor_ble_radio_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 1 || data[0] > 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t err = ble_radio_set(data[0]);
+    if (err != NRF_SUCCESS) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_radio_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t out[4]; // radio_on | advertising | scanning | central_link
+    uint32_t err = ble_radio_get(out);
+    if (err != NRF_SUCCESS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(out), out);
+}
+
+// ---------------------------------------------------------------------------
+// Stress / broadcast tools (cybersecurity fork — operator-authorised, see
+// CLAUDE.md fork-specific exemption). Scope is selected per call:
+//   0 = single target (already-connected central link)
+//   1 = scan-buffer-wide (every address the passive scanner has cached)
+//   2 = full environment-wide broadcast on the 2.4 GHz BLE spectrum
+//       (non-connectable advertising spam, max payload, min regulatory
+//       interval — every scanner / peer in range sees it)
+// Flood = rapid WRITE_CMD spam. Kick = repeated disconnect on each target.
+// ---------------------------------------------------------------------------
+static data_frame_tx_t *cmd_processor_ble_flood_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // scope[1] | value_handle[2 BE] | payload_size[1] | max_iter[2 BE] | interval_ms[2 BE]
+    if (length != 8 || data[0] > 2) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t  scope        = data[0];
+    uint16_t value_handle = ((uint16_t)data[1] << 8) | data[2];
+    uint8_t  payload_size = data[3];
+    uint16_t max_iter     = ((uint16_t)data[4] << 8) | data[5];
+    uint16_t interval_ms  = ((uint16_t)data[6] << 8) | data[7];
+    if (interval_ms < 1) interval_ms = 1; // floor
+    if (!cmd_ble_radio_is_on()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+
+    uint32_t err;
+    switch (scope) {
+    case 0: // single target — already-connected central link
+        err = ble_central_flood_start(value_handle, payload_size, max_iter, interval_ms);
+        break;
+    case 1: // scan-buffer-wide — iterate every cached address
+        err = ble_central_flood_scan_buffer(value_handle, payload_size, max_iter, interval_ms);
+        break;
+    case 2: // environment-wide broadcast — non-connectable adv spam
+        err = ble_adv_flood_start((uint8_t)value_handle, interval_ms);
+        break;
+    default:
+        err = NRF_ERROR_INVALID_PARAM;
+        break;
+    }
+
+    if (err == NRF_ERROR_INVALID_STATE || err == NRF_ERROR_BUSY ||
+            (scope == 2 && (err == NRF_ERROR_NO_MEM || err == NRF_ERROR_RESOURCES))) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    if (err != NRF_SUCCESS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_flood_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    ble_central_flood_stop();
+    ble_adv_flood_stop();
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_flood_count(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint32_t n = ble_central_flood_count();
+    uint8_t out[4];
+    out[0] = (n >> 24) & 0xFF;
+    out[1] = (n >> 16) & 0xFF;
+    out[2] = (n >>  8) & 0xFF;
+    out[3] = (n      ) & 0xFF;
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(out), out);
+}
+
+static data_frame_tx_t *cmd_processor_ble_kick(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // scope[1] | cycles[1]
+    if (length != 2 || data[1] == 0 || data[1] > 10 || data[0] > 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (data[0] == 0 && data[1] != 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (!cmd_ble_radio_is_on()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    uint32_t err;
+    if (data[0] == 0) {
+        err = ble_central_kick(data[1]);
+    } else {
+        err = ble_central_kick_scan_buffer(data[1]);
+    }
+    if (err == NRF_ERROR_INVALID_STATE || err == NRF_ERROR_BUSY) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    if (err != NRF_SUCCESS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_adv_flood_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // scope[1] | fill_byte[1] | interval_units[1]. scope must be 2 for the
+    // environment-wide broadcast contract in data_cmd.h.
+    if (length != 3 || data[0] != 2) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (!cmd_ble_radio_is_on()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    uint8_t fill = data[1];
+    uint8_t interval_units = data[2];
+    if (interval_units < 1 || interval_units > 102) { // 102 * 100 ms <= S140 10.24 s max
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t interval_ms = (uint16_t)interval_units * 100u; // operator-facing ms; 100ms = min legacy
+    uint32_t err = ble_adv_flood_start(fill, interval_ms);
+    if (err == NRF_ERROR_INVALID_STATE || err == NRF_ERROR_BUSY ||
+            err == NRF_ERROR_NO_MEM || err == NRF_ERROR_RESOURCES) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    if (err != NRF_SUCCESS) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_ble_adv_flood_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    ble_adv_flood_stop();
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
@@ -3614,6 +3961,19 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_DESC_GET,                 NULL,                        cmd_processor_ble_desc_get,                  NULL                   },
     {    DATA_CMD_BLE_SVC_DISCOVER,             NULL,                        cmd_processor_ble_svc_discover,              NULL                   },
     {    DATA_CMD_BLE_SVC_GET,                  NULL,                        cmd_processor_ble_svc_get,                   NULL                   },
+    {    DATA_CMD_BLE_DEVICE_INFO,              NULL,                        cmd_processor_ble_device_info,               NULL                   },
+    {    DATA_CMD_BLE_GET_DEVICE_INFO,          NULL,                        cmd_processor_ble_get_device_info,           NULL                   },
+
+    {    DATA_CMD_BLE_SET_ADDR,                 NULL,                        cmd_processor_ble_set_addr,                  NULL                   },
+    {    DATA_CMD_BLE_GET_ADDR,                 NULL,                        cmd_processor_ble_get_addr,                  NULL                   },
+    {    DATA_CMD_BLE_RADIO_SET,                NULL,                        cmd_processor_ble_radio_set,                 NULL                   },
+    {    DATA_CMD_BLE_RADIO_GET,                NULL,                        cmd_processor_ble_radio_get,                 NULL                   },
+    {    DATA_CMD_BLE_FLOOD_START,              NULL,                        cmd_processor_ble_flood_start,              NULL                   },
+    {    DATA_CMD_BLE_FLOOD_STOP,               NULL,                        cmd_processor_ble_flood_stop,               NULL                   },
+    {    DATA_CMD_BLE_FLOOD_COUNT,              NULL,                        cmd_processor_ble_flood_count,              NULL                   },
+    {    DATA_CMD_BLE_KICK,                     NULL,                        cmd_processor_ble_kick,                     NULL                   },
+    {    DATA_CMD_BLE_ADV_FLOOD_START,          NULL,                        cmd_processor_ble_adv_flood_start,          NULL                   },
+    {    DATA_CMD_BLE_ADV_FLOOD_STOP,           NULL,                        cmd_processor_ble_adv_flood_stop,           NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 

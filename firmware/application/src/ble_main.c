@@ -24,6 +24,7 @@
 #include "dataframe.h"
 #include "hw_connect.h"
 #include "settings.h"
+#include "rgb_marquee.h"
 
 #define NRF_LOG_MODULE_NAME ble_main
 #include "nrf_log.h"
@@ -239,6 +240,7 @@ typedef struct {
     uint8_t  addr[BLE_GAP_ADDR_LEN];        // device address as reported (LE byte order)
     uint8_t  addr_type;                     // BLE_GAP_ADDR_TYPE_*
     int8_t   rssi;                          // last observed RSSI (dBm)
+    bool     connectable;                   // seen in a connectable advertising event
     uint8_t  adv_data_len;                  // bytes valid in adv_data
     uint8_t  adv_data[BLE_SCAN_ADV_DATA_MAX];
 } ble_scan_record_t;
@@ -271,6 +273,7 @@ static void ble_scan_record_update(const ble_gap_evt_adv_report_t *report) {
                 memcmp(m_scan_records[i].addr, report->peer_addr.addr, BLE_GAP_ADDR_LEN) == 0) {
             // Known device: refresh RSSI and advertising payload.
             m_scan_records[i].rssi = report->rssi;
+            m_scan_records[i].connectable = m_scan_records[i].connectable || (report->type.connectable != 0);
             m_scan_records[i].adv_data_len = adv_len;
             memcpy(m_scan_records[i].adv_data, report->data.p_data, adv_len);
             return;
@@ -285,6 +288,7 @@ static void ble_scan_record_update(const ble_gap_evt_adv_report_t *report) {
     memcpy(rec->addr, report->peer_addr.addr, BLE_GAP_ADDR_LEN);
     rec->addr_type    = report->peer_addr.addr_type;
     rec->rssi         = report->rssi;
+    rec->connectable  = (report->type.connectable != 0);
     rec->adv_data_len = adv_len;
     memcpy(rec->adv_data, report->data.p_data, adv_len);
     m_scan_count++;
@@ -564,12 +568,16 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
         break;
 
         case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
+            if (p_ble_evt->evt.gap_evt.conn_handle != m_conn_handle ||
+                    m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+                break;
+            }
             // Pairing not supported? No, is supported now, hahahaha...
             // But... the pairing is enable?
             if (settings_get_ble_pairing_enable_first_load()) {
                 NRF_LOG_DEBUG("Pairing is enable, The BLE_GAP_EVT_SEC_PARAMS_REQUEST event is handled by the pairing manager.");
             } else {
-                err_code = sd_ble_gap_sec_params_reply(m_conn_handle, BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP, NULL, NULL);
+                err_code = sd_ble_gap_sec_params_reply(p_ble_evt->evt.gap_evt.conn_handle, BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP, NULL, NULL);
                 APP_ERROR_CHECK(err_code);
             }
             break;
@@ -583,8 +591,12 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
         break;
 
         case BLE_GATTS_EVT_SYS_ATTR_MISSING:
+            if (p_ble_evt->evt.gatts_evt.conn_handle != m_conn_handle ||
+                    m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+                break;
+            }
             // No system attributes have been stored.
-            err_code = sd_ble_gatts_sys_attr_set(m_conn_handle, NULL, 0, 0);
+            err_code = sd_ble_gatts_sys_attr_set(p_ble_evt->evt.gatts_evt.conn_handle, NULL, 0, 0);
             APP_ERROR_CHECK(err_code);
             break;
 
@@ -776,6 +788,10 @@ bool is_ble_advertising(void) {
     return g_is_ble_advertising;
 }
 
+bool is_ble_scanning(void) {
+    return m_scan_active;
+}
+
 /**@brief Function for handling Peer Manager events.
  *
  * @param[in] p_evt  Peer Manager event.
@@ -930,6 +946,277 @@ void create_battery_timer(void) {
     // Start battery timer
     err_code = app_timer_start(m_battery_timer_id, BATTERY_LEVEL_MEAS_INTERVAL, NULL);
     APP_ERROR_CHECK(err_code);
+}
+
+// ---------------------------------------------------------------------------
+// BLE identity & radio toggle (cybersecurity fork additions).
+//
+// Identity + radio power are settings on OUR radio (no scope selector —
+// they're inherently local). The environment-wide broadcast tools live in
+// the 7050-block + ble_central scan-buffer-wide kick/flood (CLAUDE.md
+// fork-specific exemption — operator-authorised).
+// ---------------------------------------------------------------------------
+static volatile bool g_ble_radio_on = true;
+
+// Original (factory) address cache, captured at first call. Format: the BLE
+// spec mandates bit14 of the high byte be 1 for a static-random address, so
+// we mask in 0xC000 over the FICR bytes (matches the pattern the firmware
+// already applies in cmd_processor_get_device_address).
+static bool     m_orig_addr_known = false;
+static uint8_t  m_orig_addr_type;                      // BLE_GAP_ADDR_TYPE_PUBLIC
+static uint8_t  m_orig_addr[BLE_GAP_ADDR_LEN];
+
+static void cache_original_address(void) {
+    if (m_orig_addr_known) {
+        return;
+    }
+    // S140 v7.2.0: sd_ble_gap_addr_get() takes a single ble_gap_addr_t* and
+    // returns both the address type and the 6 bytes in one struct.
+    ble_gap_addr_t addr = {0};
+    uint32_t err = sd_ble_gap_addr_get(&addr);
+    if (err == NRF_SUCCESS) {
+        m_orig_addr_type = addr.addr_type;
+        memcpy(m_orig_addr, addr.addr, BLE_GAP_ADDR_LEN);
+    } else {
+        // Fall back to the FICR value with the 0xC000 static-random bit pattern.
+        m_orig_addr[5] = (uint8_t)(NRF_FICR->DEVICEADDR[0]        & 0xFF);
+        m_orig_addr[4] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 8) & 0xFF);
+        m_orig_addr[3] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 16) & 0xFF);
+        m_orig_addr[2] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 24) & 0xFF);
+        m_orig_addr[1] = (uint8_t)((NRF_FICR->DEVICEADDR[1] >> 8) & 0xFF);
+        m_orig_addr[0] = (uint8_t)(((NRF_FICR->DEVICEADDR[1] >> 16) & 0x3F) | 0xC0); // top 2 bits = 11
+        m_orig_addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
+    }
+    m_orig_addr_known = true;
+}
+
+uint32_t ble_addr_set(uint8_t mode, const uint8_t *addr_le) {
+    cache_original_address();
+
+    // Refuse to change the address while a peripheral or central link is up —
+    // sd_ble_gap_addr_set() returns BUSY in that state, and silently swapping
+    // the identity under an active peer would only confuse things.
+    if (g_is_ble_connected || ble_central_is_connected() || ble_central_is_connecting()) {
+        return NRF_ERROR_BUSY;
+    }
+
+    ble_gap_addr_t addr;
+    memset(&addr, 0, sizeof(addr));
+
+    switch (mode) {
+    case BLE_ADDR_MODE_RESTORE_ORIGINAL:
+        memcpy(addr.addr, m_orig_addr, BLE_GAP_ADDR_LEN);
+        addr.addr_type = m_orig_addr_type;
+        break;
+
+    case BLE_ADDR_MODE_RANDOM_STATIC:
+        if (addr_le == NULL) {
+            return NRF_ERROR_INVALID_PARAM;
+        }
+        // BLE static-random: top 2 bits of the high byte must be 11 (0xC0).
+        memcpy(addr.addr, addr_le, BLE_GAP_ADDR_LEN);
+        addr.addr[0] = (uint8_t)((addr.addr[0] & 0x3F) | 0xC0);
+        addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
+        break;
+
+    case BLE_ADDR_MODE_RANDOM_PRIVATE:
+        addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_RESOLVABLE;
+        // Leave addr.addr all-zero: the SoftDevice picks the local part and
+        // resolves against our peer IRK (or the default all-zero IRK).
+        break;
+
+    case BLE_ADDR_MODE_RANDOM_NONRESOLV:
+        addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_NON_RESOLVABLE;
+        memset(addr.addr, 0, BLE_GAP_ADDR_LEN);
+        break;
+
+    default:
+        return NRF_ERROR_INVALID_PARAM;
+    }
+
+    uint32_t err = sd_ble_gap_addr_set(&addr);
+    if (err != NRF_SUCCESS) {
+        return err;
+    }
+
+    // If we were advertising, restart so the new address shows up in the
+    // advertising PDU (the SoftDevice bakes the address into the payload at
+    // sd_ble_gap_adv_start() time).
+    if (g_is_ble_advertising) {
+        advertising_stop();
+        advertising_start(false);
+    }
+    return NRF_SUCCESS;
+}
+
+uint32_t ble_addr_get(uint8_t *addr_type, uint8_t *addr_out) {
+    if (addr_type == NULL || addr_out == NULL) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    ble_gap_addr_t addr = {0};
+    uint32_t err = sd_ble_gap_addr_get(&addr);
+    if (err != NRF_SUCCESS) {
+        return err;
+    }
+    *addr_type = addr.addr_type;
+    memcpy(addr_out, addr.addr, BLE_GAP_ADDR_LEN);
+    return NRF_SUCCESS;
+}
+
+uint32_t ble_radio_set(uint8_t on) {
+    if (on) {
+        if (g_ble_radio_on) {
+            return NRF_SUCCESS;
+        }
+        g_ble_radio_on = true;
+        // Restore peripheral advertising if it was running before. We don't
+        // know the operator's pre-toggle intent (erase_bonds or not), so we
+        // pick the non-destructive restart.
+        if (!g_is_ble_advertising) {
+            advertising_start(false);
+        }
+        return NRF_SUCCESS;
+    }
+
+    // off: stop advertising, stop passive scan, drop central link if any.
+    ble_adv_flood_stop();
+    advertising_stop();
+    if (m_scan_active) {
+        ble_scan_stop();
+    }
+    if (ble_central_is_connected() || ble_central_is_connecting()) {
+        ble_central_disconnect();
+    }
+    g_ble_radio_on = false;
+    return NRF_SUCCESS;
+}
+
+uint32_t ble_radio_get(uint8_t *out) {
+    if (out == NULL) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    out[0] = g_ble_radio_on ? 1 : 0;
+    out[1] = g_is_ble_advertising ? 1 : 0;
+    out[2] = m_scan_active ? 1 : 0;
+    out[3] = ble_central_is_connected() ? 1 : 0;
+    return NRF_SUCCESS;
+}
+
+// ---- scan-buffer snapshot (used by scan-buffer-wide stress / kick) -------
+uint8_t ble_scan_copy_addresses(ble_scan_addr_t *out, uint8_t out_cap) {
+    if (out == NULL || out_cap == 0) {
+        return 0;
+    }
+
+    bool used[BLE_SCAN_MAX_DEVICES] = {0};
+    uint8_t n = 0;
+    while (n < out_cap) {
+        uint8_t best = 0xFF;
+        int8_t best_rssi = -128;
+
+        for (uint8_t i = 0; i < m_scan_count; i++) {
+            if (used[i] || !m_scan_records[i].connectable ||
+                    m_scan_records[i].addr_type == BLE_GAP_ADDR_TYPE_ANONYMOUS) {
+                continue;
+            }
+            if (best == 0xFF || m_scan_records[i].rssi > best_rssi) {
+                best = i;
+                best_rssi = m_scan_records[i].rssi;
+            }
+        }
+
+        if (best == 0xFF) {
+            break;
+        }
+
+        used[best] = true;
+        memcpy(out[n].addr, m_scan_records[best].addr, BLE_GAP_ADDR_LEN);
+        out[n].addr_type = m_scan_records[best].addr_type;
+        n++;
+    }
+    return n;
+}
+
+// ---- environment-wide broadcast (full 2.4 GHz BLE spectrum spam) --------
+#define BLE_ADV_FLOOD_MAX_INTERVAL_MS 10240u // S140 max adv interval: 0x4000 * 0.625 ms
+
+// State: idle=0, running=1.
+static volatile uint8_t m_adv_flood_state = 0;
+static uint8_t m_adv_flood_payload[31]; // legacy adv max = 31 bytes
+static uint16_t m_adv_flood_interval = 0; // units of 0.625 ms
+
+uint32_t ble_adv_flood_start(uint8_t fill_byte, uint16_t interval_ms) {
+    if (!g_ble_radio_on) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    // Clamp interval to regulatory minimum and reject values above the
+    // SoftDevice max before stopping normal advertising.
+    if (interval_ms < 100) interval_ms = 100;
+    if (interval_ms > BLE_ADV_FLOOD_MAX_INTERVAL_MS) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (m_adv_flood_state == 1) {
+        ble_adv_flood_stop();
+    }
+    // Stop normal peripheral advertising first so it doesn't fight the flood.
+    advertising_stop();
+
+    // Fill 31-byte legacy adv payload. AD structure:
+    // [len=2][type=0x01 (flags)][flags=0x06 (LE General Discoverable, BR/EDR off)]
+    // [len=0x1B][type=0xFF (manufacturer data)][26 bytes of fill]
+    m_adv_flood_payload[0] = 0x02;
+    m_adv_flood_payload[1] = 0x01;
+    m_adv_flood_payload[2] = 0x06;
+    m_adv_flood_payload[3] = 27;                // type byte + 26 manufacturer bytes
+    m_adv_flood_payload[4] = 0xFF;               // manufacturer specific
+    for (uint8_t i = 5; i < 31; i++) {
+        m_adv_flood_payload[i] = fill_byte;
+    }
+
+    m_adv_flood_interval = MSEC_TO_UNITS(interval_ms, UNIT_0_625_MS);
+
+    // S140 v7.2.0 ble_gap_adv_params_t layout: properties (with type),
+    // p_peer_addr, interval, duration, max_adv_evts, channel_mask[5],
+    // filter_policy, primary_phy, secondary_phy, set_id, scan_req_notification.
+    ble_gap_adv_params_t params = {0};
+    params.properties.type = BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
+    params.p_peer_addr     = NULL;
+    params.interval        = m_adv_flood_interval;
+    params.duration        = 0;        // forever
+    params.max_adv_evts    = 0;        // no event limit
+    params.filter_policy   = BLE_GAP_ADV_FP_ANY;
+    params.primary_phy     = BLE_GAP_PHY_1MBPS;
+    // channel_mask = 0 means "all primary channels enabled".
+
+    ble_gap_adv_data_t data = {
+        .adv_data = { .p_data = m_adv_flood_payload, .len = 31 },
+        .scan_rsp_data = { .p_data = NULL, .len = 0 },
+    };
+    // S140 in this SDK supports one advertising set. Reconfigure the normal
+    // advertising module's handle instead of allocating a second one.
+    uint32_t err = sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, &data, &params);
+    if (err != NRF_SUCCESS) {
+        return err;
+    }
+    err = sd_ble_gap_adv_start(m_advertising.adv_handle, BLE_CONN_CFG_TAG_DEFAULT);
+    if (err != NRF_SUCCESS) {
+        (void)sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, NULL, NULL);
+        return err;
+    }
+    m_adv_flood_state = 1;
+    rgb_marquee_set_ble_active_anim(true);
+    return NRF_SUCCESS;
+}
+
+uint32_t ble_adv_flood_stop(void) {
+    if (m_adv_flood_state == 0) {
+        return NRF_SUCCESS;
+    }
+    sd_ble_gap_adv_stop(m_advertising.adv_handle);
+    sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, NULL, NULL);
+    m_adv_flood_state = 0;
+    rgb_marquee_set_ble_active_anim(false);
+    return NRF_SUCCESS;
 }
 
 /**

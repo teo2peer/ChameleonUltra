@@ -2,11 +2,14 @@
 
 The ChameleonUltra's nRF52840 runs a BLE stack (Nordic SoftDevice **S140 v7.2.0**),
 and this firmware exposes a set of **BLE security-research tools** on top of it, in
-addition to the RFID/NFC features. They cover two jobs:
+addition to the RFID/NFC features. They cover three jobs:
 
 1. **Passive scanning** — listen for and inventory nearby BLE devices.
 2. **Directed GATT auditing** — connect to **one** device you specify and read /
    subscribe / fuzz its GATT attributes.
+3. **Stress / broadcast tooling** — operator-selected single-target,
+   scan-buffer-wide, or environment-wide BLE stress commands for authorised lab
+   use in this fork.
 
 They are reachable from the Python CLI (`ble` command group in
 `software/script/`) and from the Flutter GUI (*Ethical Hacking → Bluetooth (BLE)
@@ -14,8 +17,8 @@ They are reachable from the Python CLI (`ble` command group in
 
 ## Scope / design constraints
 
-These tools are deliberately **receive-only or point-to-point against a single
-operator-specified target**. This is enforced in the design, not just by policy:
+Every BLE stress command takes explicit scope. There is no implicit downgrade or
+upgrade between scopes:
 
 - The passive scanner uses the SoftDevice **observer** role with `active=0` by
   default — it transmits **nothing**, it only receives advertisements devices
@@ -25,10 +28,18 @@ operator-specified target**. This is enforced in the design, not just by policy:
 - The GATT tools (`connect`/`discover`/`read`/`subscribe`/`fuzz`/`ping`) operate
   over **one central connection to one address you provide**. Everything is
   scoped to that single connected target.
+- `scope=single` stress commands require that central target link to already be
+  connected. Single-target kick is one disconnect; repeated churn requires
+  `scope=buffer`, which reconnects between cycles.
+- `scope=buffer` stress commands use the latest passive-scan buffer, stop the
+  scanner, filter to connectable peers, attempt them strongest-RSSI first, and
+  skip peers that fail to connect instead of stalling the run.
+- `scope=broadcast` uses non-connectable advertising payloads and does not need a
+  central link or scan buffer.
 
-There is intentionally **no** broadcast/flood/jam capability, no "probe/attack all
-nearby devices" batch mode, and no port of crash-exploit suites. The directed
-fuzzer exercises a device you own/control; it is not a mass-disruption tool.
+The branch owner maintains this fork under the authorisation described in
+`CLAUDE.md`; do not propagate these stress/broadcast tools to upstream without
+that policy context.
 
 ## CLI reference (`ble …`)
 
@@ -39,6 +50,7 @@ fuzzer exercises a device you own/control; it is not a mass-disruption tool.
 | `ble status` | Show connection / discovery / fuzz state. |
 | `ble discover [--out <file.json>]` | Enumerate the target's GATT characteristics (handle, UUID + SIG name, properties), grouped under their primary services. |
 | `ble descriptors` | List all GATT descriptors of the connected target (handle + UUID + name). |
+| `ble info` | Read the connected target's standard device information — Generic Access name/appearance, Device Information Service (manufacturer, model, serial, hardware/firmware/software revision, system ID, PnP ID) and battery level — via read-only GATT reads. Run after `ble discover`. |
 | `ble read --handle <hex>` | Read a characteristic value from the target. |
 | `ble write --handle <hex> --data <hex>` | Write a value to a characteristic (write-with-response; shows the target's ATT status). |
 | `ble subscribe --handle <hex> [--cccd <hex>] [--indicate] [--off] [-t <sec>]` | Subscribe to notifications/indications and stream incoming values. The CCCD descriptor is auto-discovered (override with `--cccd`). |
@@ -46,6 +58,9 @@ fuzzer exercises a device you own/control; it is not a mass-disruption tool.
 | `ble ping` | One-shot BLE link liveness probe of the connected target (a single connection-parameter-update round-trip). |
 | `ble disconnect` | Disconnect from the target, freeing it to reconnect to its normal source. |
 | `ble advertise [on\|off\|toggle\|status] [--erase-bonds]` | Control the device's **own** advertising (discoverable state). |
+| `ble flood-ping --scope single\|buffer\|broadcast ...` | WRITE_CMD flood for single/buffer scopes, or non-connectable advertising spam for broadcast scope (`--fill`, `--interval-units 1..102`). Buffer scope uses the scan buffer and defaults an omitted count to a bounded per-peer run. |
+| `ble kick [cycles] --scope single\|buffer` | One disconnect for the current central link (`scope=single` requires `cycles=1`), or repeated connect/disconnect cycles for connectable peers in the scan buffer. |
+| `ble broadcast [--fill hex] [--interval-units 1..102] [--stop]` | Environment-wide non-connectable advertising broadcast. |
 
 Typical directed-audit session:
 ```
@@ -101,6 +116,10 @@ BLE commands occupy the **7000** block of the request/response command protocol
 | 7026 | Get effective ATT MTU |
 | 7027–7028 | Descriptor discover / get |
 | 7029–7030 | Primary-service discover / get |
+| 7031–7032 | Device info: read standard GAP/DIS/battery fields / get |
+| 7040–7043 | Own-radio address / radio power |
+| 7044–7047 | Stress: flood start/stop/count, kick |
+| 7050–7051 | Environment-wide advertising flood start/stop |
 
 There is no async push channel; continuous data (scan results, fuzz log,
 notifications) is buffered in firmware and paged out by index by the host.
@@ -111,7 +130,7 @@ notifications) is buffered in firmware and paged out by index by the host.
   pairing) **and** the passive observer scanner.
 - `ble_central.c` — the central-role harness (connect, primary-service /
   characteristic / descriptor discovery, CCCD lookup, read, write, subscribe,
-  link probe, and the directed fuzzer). MTU is negotiated by `nrf_ble_gatt`
+  link probe, the directed fuzzer, and scan-buffer-wide stress iteration). MTU is negotiated by `nrf_ble_gatt`
   (`nrf_ble_gatt_att_mtu_central_set` in `ble_main.c`'s `gatt_init`), so read /
   write / fuzz scale to the negotiated ATT MTU (up to ~244 bytes) instead of the
   23-byte default. Registers its own SoftDevice observer; the peripheral handler

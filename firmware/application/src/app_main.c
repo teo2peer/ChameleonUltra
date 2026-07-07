@@ -28,6 +28,7 @@ NRF_LOG_MODULE_REGISTER();
 
 #include "app_cmd.h"
 #include "ble_main.h"
+#include "ble_central.h"
 #include "bsp_delay.h"
 #include "bsp_time.h"
 #include "bsp_wdt.h"
@@ -857,6 +858,27 @@ static void btn_fn_toggle_reader_keys(void) {
     }
 }
 
+// Re-launch the BLE app so the host can reconnect after a stress / broadcast
+// run that left the radio in a non-default state. Drops any in-progress
+// central work + the environment-wide broadcast + the scan-buffer iterator,
+// then restarts normal connectable peripheral advertising.
+static void btn_fn_ble_restart(void) {
+    NRF_LOG_INFO("Button: BLE restart requested");
+    // 1. tear down any in-progress stress / broadcast work
+    ble_central_flood_stop();
+    ble_central_kick(1);                  // best-effort: drop any central link
+    ble_adv_flood_stop();                 // stop environment-wide adv spam
+    if (is_ble_scanning()) {
+        ble_scan_stop();
+    }
+    // 2. silent-mode radio off → on cycle resets the GAP peripheral state
+    ble_radio_set(0);
+    // 3. back to a normal connectable advertisement so the host can pair / connect
+    advertising_start(false);
+    ble_radio_set(1);
+    NRF_LOG_INFO("Button: BLE advertising restarted, ready for host reconnect");
+}
+
 static void run_button_function_by_settings(settings_button_function_t sbf) {
     switch (sbf) {
         case SettingsButtonCycleSlot:
@@ -944,21 +966,35 @@ extern bool g_usb_led_marquee_enable;
 static void button_press_process(void) {
     // Make sure that one of the AB buttons has a click event
     if (m_is_b_btn_release || m_is_a_btn_release) {
-        if (m_is_a_btn_release) {
-            if (!m_is_btn_long_press) {
-                run_button_function_by_settings(settings_get_button_press_config('a'));
-            } else {
-                run_button_function_by_settings(settings_get_long_button_press_config('a'));
-            }
+        // While a BLE attack / stress / broadcast is running, the BLE-active
+        // (blue, outside -> centre) animation is on. In that mode, button A
+        // OR button B — short or long press — cancels the in-progress attack
+        // and re-runs the BLE app so the host can reconnect. This overrides
+        // the configured button-press function on purpose: the operator wants
+        // an emergency exit that doesn't depend on settings.
+        if (rgb_marquee_is_ble_active_anim()) {
+            NRF_LOG_INFO("BLE-active button press: cancelling attack, restarting BLE app");
             m_is_a_btn_release = false;
-        }
-        if (m_is_b_btn_release) {
-            if (!m_is_btn_long_press) {
-                run_button_function_by_settings(settings_get_button_press_config('b'));
-            } else {
-                run_button_function_by_settings(settings_get_long_button_press_config('b'));
-            }
             m_is_b_btn_release = false;
+            m_is_btn_long_press = false;
+            btn_fn_ble_restart();
+        } else {
+            if (m_is_a_btn_release) {
+                if (!m_is_btn_long_press) {
+                    run_button_function_by_settings(settings_get_button_press_config('a'));
+                } else {
+                    run_button_function_by_settings(settings_get_long_button_press_config('a'));
+                }
+                m_is_a_btn_release = false;
+            }
+            if (m_is_b_btn_release) {
+                if (!m_is_btn_long_press) {
+                    run_button_function_by_settings(settings_get_button_press_config('b'));
+                } else {
+                    run_button_function_by_settings(settings_get_long_button_press_config('b'));
+                }
+                m_is_b_btn_release = false;
+            }
         }
         // Disable led marquee for usb at button pressed.
         g_usb_led_marquee_enable = false;
@@ -1070,11 +1106,15 @@ int main(void) {
         field_generator_rainbow_loop();
 #endif
 
-        // Reader-key capture / BLE-test animations take over the LEDs while
-        // armed; otherwise fall back to the normal USB-status marquee / slot
-        // indicator.
+        // Reader-key capture / BLE-test / BLE-active animations take over the LEDs
+        // while armed; otherwise fall back to the normal USB-status marquee /
+        // slot indicator. BLE-active (solid blue, outside -> centre) has
+        // priority over BLE-test so the operator can see a stress / broadcast
+        // run from across the room.
         if (rgb_marquee_is_reader_keys_anim()) {
             rgb_marquee_reader_keys_loop();
+        } else if (rgb_marquee_is_ble_active_anim()) {
+            rgb_marquee_ble_active_loop();
         } else if (rgb_marquee_is_ble_test_anim()) {
             rgb_marquee_ble_test_loop();
         } else if (!m_is_field_on) {

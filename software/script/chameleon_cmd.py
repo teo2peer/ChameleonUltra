@@ -188,7 +188,10 @@ class ChameleonCMD:
         :param erase_bonds: When enabling, optionally clear bonds first.
         """
         data = struct.pack('!BB', 1 if enabled else 0, 1 if erase_bonds else 0)
-        return self.device.send_cmd_sync(Command.BLE_ADVERTISING_SET, data)
+        resp = self.device.send_cmd_sync(Command.BLE_ADVERTISING_SET, data)
+        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+            resp.parsed = bool(resp.data[0])
+        return resp
 
     @expect_response(Status.SUCCESS)
     def ble_link_probe(self, global_mode: bool = False):
@@ -197,15 +200,186 @@ class ChameleonCMD:
             return self.device.send_cmd_sync(Command.BLE_LINK_PROBE, b"\x01")
         return self.device.send_cmd_sync(Command.BLE_LINK_PROBE)
 
+    # --- Own-radio identity / radio power (cybersecurity fork) -------------
+    # These mutate only OUR radio (local settings — no scope selector). The
+# environment-wide / scan-buffer-wide tools live further down in this file.
+
+    @expect_response(Status.SUCCESS)
+    def ble_set_addr(self, mode: int, addr: bytes = None):
+        """
+        Change the device's own BLE GAP address.
+
+        :param mode:
+            0 = restore the FICR-derived original address
+            1 = static-random from host (6 bytes LE, addr required)
+            2 = firmware-generated random private resolvable
+            3 = firmware-generated random private non-resolvable
+        :param addr: 6-byte address (LE) — required when mode == 1.
+        :raises SerialProtocolError: if a link is active (DEVICE_MODE_ERROR).
+        """
+        if mode == 1:
+            if addr is None or len(addr) != 6:
+                raise ValueError("mode 1 (static-random) requires a 6-byte addr")
+            data = struct.pack('!B', mode) + addr
+        elif mode in (0, 2, 3):
+            data = struct.pack('!B', mode)
+        else:
+            raise ValueError(f"unknown ble addr mode: {mode}")
+        return self.device.send_cmd_sync(Command.BLE_SET_ADDR, data)
+
+    @expect_response(Status.SUCCESS)
+    def ble_get_addr(self):
+        """
+        Read the device's currently-active BLE GAP address.
+
+        :returns: dict {'addr_type': int, 'addr': bytes (6, LE)}.
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_GET_ADDR)
+        if resp.status == Status.SUCCESS and len(resp.data) == 7:
+            resp.parsed = {
+                'addr_type': resp.data[0],
+                'addr': resp.data[1:7],
+            }
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def ble_radio_set(self, on: bool):
+        """
+        Turn the device's own BLE radio on/off. Off = stealth: stops
+        advertising + scan + drops any active central link. On resumes.
+        """
+        return self.device.send_cmd_sync(
+            Command.BLE_RADIO_SET, struct.pack('!B', 1 if on else 0))
+
+    @expect_response(Status.SUCCESS)
+    def ble_radio_get(self):
+        """
+        Snapshot of the device's own radio state.
+
+        :returns: dict {'on': bool, 'advertising': bool, 'scanning': bool,
+                        'central_link': bool}.
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_RADIO_GET)
+        if resp.status == Status.SUCCESS and len(resp.data) == 4:
+            resp.parsed = {
+                'on':           bool(resp.data[0]),
+                'advertising':  bool(resp.data[1]),
+                'scanning':     bool(resp.data[2]),
+                'central_link': bool(resp.data[3]),
+            }
+        return resp
+
+    # --- Stress / broadcast (cybersecurity fork, operator-authorised) ---------
+    # Per-call scope selectable:
+    #   0 = single target (already-connected central link / host-picked addr)
+    #   1 = scan-buffer-wide (every address cached by the passive scanner)
+    #   2 = full environment-wide broadcast on the 2.4 GHz BLE spectrum
+
+    @expect_response(Status.SUCCESS)
+    def ble_flood_start(self, value_handle: int, payload_size: int,
+                        max_iterations: int = 0, interval_ms: int = 5,
+                        scope: int = 0):
+        """
+        Rapid WRITE_CMD spam. Per-call scope selectable (see CLAUDE.md).
+
+        :param value_handle: characteristic value handle (used by scope 0/1).
+        :param payload_size: 1..BLE_FUZZ_PAYLOAD_MAX bytes per write.
+        :param max_iterations: 0 = until ble_flood_stop() (ignored on scope 2).
+        :param interval_ms: ms between ticks (floor 1; legacy adv regulatory
+                            floor of 100ms is enforced by the firmware on
+                            scope 2).
+        :param scope: 0=single target, 1=scan-buffer-wide, 2=environment-wide
+                      broadcast (non-connectable adv spam).
+        """
+        if scope not in (0, 1, 2):
+            raise ValueError("scope must be 0/1/2")
+        if scope in (0, 1):
+            if not 1 <= value_handle <= 0xFFFF:
+                raise ValueError("value_handle must be 1..0xffff")
+            if not 1 <= payload_size <= 20:
+                raise ValueError("payload_size must be 1..20")
+        else:
+            if not 0 <= value_handle <= 0xFF:
+                raise ValueError("broadcast fill byte must be 0..255")
+            if not 0 <= payload_size <= 0xFF:
+                raise ValueError("payload_size must be 0..255 for scope=2")
+        if not 0 <= max_iterations <= 0xFFFF:
+            raise ValueError("max_iterations must be 0..65535")
+        if not 1 <= interval_ms <= 0xFFFF:
+            raise ValueError("interval_ms must be 1..65535")
+        data = struct.pack('!BHBHH', scope,
+                           value_handle,
+                           payload_size,
+                           max_iterations,
+                           interval_ms)
+        return self.device.send_cmd_sync(Command.BLE_FLOOD_START, data)
+
+    @expect_response(Status.SUCCESS)
+    def ble_flood_stop(self):
+        # Stops both the WRITE_CMD flood AND the environment-wide adv flood.
+        return self.device.send_cmd_sync(Command.BLE_FLOOD_STOP)
+
+    @expect_response(Status.SUCCESS)
+    def ble_flood_count(self):
+        resp = self.device.send_cmd_sync(Command.BLE_FLOOD_COUNT)
+        if resp.status == Status.SUCCESS and len(resp.data) == 4:
+            n = (resp.data[0] << 24) | (resp.data[1] << 16) | \
+                (resp.data[2] <<  8) |  resp.data[3]
+            resp.parsed = n
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def ble_kick(self, cycles: int = 1, scope: int = 0):
+        """
+        Force-disconnect the selected link(s). Single-target scope supports one
+        disconnect; scan-buffer scope supports 1..10 cycles per peer.
+
+        :param cycles: 1..10 disconnect cycles.
+        :param scope: 0=single target (current central link),
+                      1=scan-buffer-wide (connect → kick → next).
+        """
+        if not 1 <= cycles <= 10:
+            raise ValueError("cycles must be 1..10")
+        if scope not in (0, 1):
+            raise ValueError("scope must be 0 or 1")
+        if scope == 0 and cycles != 1:
+            raise ValueError("scope=single supports exactly one disconnect cycle")
+        return self.device.send_cmd_sync(Command.BLE_KICK,
+                                        struct.pack('!BB', scope, cycles))
+
+    @expect_response(Status.SUCCESS)
+    def ble_adv_flood_start(self, fill_byte: int = 0x00, interval_units: int = 1):
+        """
+        Full environment-wide broadcast on the 2.4 GHz BLE spectrum —
+        non-connectable advertising spam, max payload, regulatory-minimum
+        interval (100ms). Every scanner / peer in range sees it.
+
+        :param fill_byte: byte that fills the 26 manufacturer-data bytes.
+        :param interval_units: 100ms multiples, 1..102.
+        """
+        if not 0 <= fill_byte <= 0xFF:
+            raise ValueError("fill_byte must be 0..255")
+        if not 1 <= interval_units <= 102:
+            raise ValueError("interval_units must be 1..102")
+        return self.device.send_cmd_sync(
+            Command.BLE_ADV_FLOOD_START,
+            struct.pack('!BBB', 2, fill_byte, interval_units))
+
+    @expect_response(Status.SUCCESS)
+    def ble_adv_flood_stop(self):
+        return self.device.send_cmd_sync(Command.BLE_ADV_FLOOD_STOP)
+
     # --- Directed BLE GATT fuzzing harness (central role) -------------------
-    # Point-to-point against ONE target the operator specifies by address.
+    # Point-to-point against ONE target the operator specifies by address or broadcast if selected.
 
     def ble_connect(self, addr: bytes, addr_type: int = 0):
         """
         Connect to a single BLE target.
 
         :param addr: 6-byte target address, little-endian (as the scanner reports)
-        :param addr_type: BLE GAP address type (0=public, 1=random). Default 0.
+        :param addr_type: BLE GAP address type (0=public, 1=random-static,
+                          2=random-private-resolvable,
+                          3=random-private-non-resolvable). Default 0.
         """
         data = struct.pack('!B', addr_type) + bytes(addr)
         return self.device.send_cmd_sync(Command.BLE_CONNECT, data)
@@ -303,11 +477,45 @@ class ChameleonCMD:
                                      'start': start, 'end': end})
         return out
 
+    def ble_devinfo_start(self):
+        """
+        Start reading the connected target's standard information characteristics
+        (GAP name/appearance, Device Information Service, battery). Read-only;
+        requires 'discover' to have run first. Async — poll ble_get_devinfo().
+        """
+        return self.device.send_cmd_sync(Command.BLE_DEVICE_INFO)
+
+    def ble_get_devinfo(self):
+        """
+        Fetch collected device-info: dict {state, items:[{uuid, status, data}]}.
+        state: 0 idle, 1 running, 2 done, 3 error. Wire: state[1] | count[1] then
+        per field uuid[2] | status[1] | len[1] | data[len] (big-endian). status:
+        0xFF = characteristic absent, else the ATT read status (0 = ok).
+        """
+        resp = self.device.send_cmd_sync(Command.BLE_GET_DEVICE_INFO)
+        out = {'state': 0, 'items': []}
+        if resp.status == Status.SUCCESS and len(resp.data) >= 2:
+            out['state'] = resp.data[0]
+            off = 2  # skip state + count
+            while off + 4 <= len(resp.data):
+                uuid, st, ln = struct.unpack_from('!HBB', resp.data, off)
+                off += 4
+                val = bytes(resp.data[off:off + ln])
+                off += ln
+                out['items'].append({'uuid': uuid, 'status': st, 'data': val})
+        return out
+
     def ble_fuzz_start(self, value_handle: int, max_iterations: int = 0, interval_ms: int = 50):
         """
         Start fuzzing: write mutated payloads to value_handle on the connected
         target, every interval_ms, up to max_iterations (0 = until stopped).
         """
+        if not 1 <= value_handle <= 0xFFFF:
+            raise ValueError("value_handle must be 1..0xffff")
+        if not 0 <= max_iterations <= 0xFFFF:
+            raise ValueError("max_iterations must be 0..65535")
+        if not 1 <= interval_ms <= 0xFFFF:
+            raise ValueError("interval_ms must be 1..65535")
         data = struct.pack('!HHH', value_handle, max_iterations, interval_ms)
         return self.device.send_cmd_sync(Command.BLE_FUZZ_START, data)
 
@@ -629,7 +837,7 @@ class ChameleonCMD:
         return self.device.send_cmd_sync(
             Command.HF14A_4_READER_APDU, bytes(apdu), timeout=3)
 
-    def hf14a_4_emv_scan(self):
+    def hf14a_4_emv_scan(self, amount: bytes = b''):
         """
         Full EMV card scan in a single firmware call.
 
@@ -643,7 +851,9 @@ class ChameleonCMD:
             for each APDU pair:
                 cmd_len(1) cmd(n) resp_len_le(2) resp(m)
         """
-        resp = self.device.send_cmd_sync(Command.HF14A_4_EMV_SCAN, b'', timeout=10)
+        if amount and len(amount) != 6:
+            raise ValueError("EMV amount must be 6-byte n12 BCD")
+        resp = self.device.send_cmd_sync(Command.HF14A_4_EMV_SCAN, bytes(amount), timeout=12)
         return resp
 
     def hf14a_4_desfire_scan(self):

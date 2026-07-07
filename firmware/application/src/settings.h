@@ -36,6 +36,11 @@ typedef enum {
     // Toggle reader-key (MFKey32) capture on the active MIFARE Classic slot:
     // arms auth logging and runs the center-out rainbow LED animation
     SettingsButtonReaderKeys = 6U,
+    // NOTE: button A OR button B always re-runs the BLE app when the BLE-active
+    // (blue, outside -> centre) LED animation is on — this is the emergency
+    // exit for any in-progress stress / broadcast / scan-buffer attack, and
+    // it overrides the configured button-press function. No enum entry needed;
+    // see button_press_process() in app_main.c.
 } settings_button_function_t;
 
 typedef struct ALIGN_U32 {

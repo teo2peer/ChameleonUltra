@@ -215,10 +215,10 @@
 //                  Range from 7000 -> 7999
 // ******************************************************************
 //
-// NOTE: these are LISTEN-ONLY. The passive scanner uses the SoftDevice
-// observer role with active=0, so the device never transmits (no scan
-// requests, no advertisements, no carrier). It only receives advertising
-// packets already broadcast by nearby devices.
+// NOTE: passive scanner is LISTEN-ONLY when started with active=0 (no scan
+// requests transmitted). All other 7000-block commands in this fork can be
+// used at any scope the operator picks — single-target, scan-buffer-wide, or
+// environment-wide broadcast — per the CLAUDE.md fork-specific exemption.
 #define DATA_CMD_BLE_SCAN_START                 (7000)  /* start passive BLE scan (listen-only) */
 #define DATA_CMD_BLE_SCAN_STOP                  (7001)  /* stop passive BLE scan                */
 #define DATA_CMD_BLE_SCAN_GET_COUNT             (7002)  /* number of distinct devices seen      */
@@ -228,11 +228,12 @@
 #define DATA_CMD_BLE_ADVERTISING_GET            (7005)  /* query local advertising state        */
 #define DATA_CMD_BLE_LINK_PROBE                 (7006)  /* probe target[0] or batch-scan all[1] */
 
-// Directed GATT fuzzing harness — point-to-point against ONE user-specified
-// target address. Connects out (central role), enumerates the target's GATT
-// characteristics and writes mutated payloads to a chosen characteristic. It
-// NEVER broadcasts to the environment; everything is scoped to the single
-// connected target, and DATA_CMD_BLE_DISCONNECT frees it to reconnect normally.
+// GATT fuzzing harness — connects (central role), enumerates GATT
+// characteristics and writes mutated payloads to a chosen characteristic.
+// Per-call scope selectable: single target, scan-buffer-wide (every address
+// in the passive scanner's buffer), or environment-wide broadcast.
+// DATA_CMD_BLE_DISCONNECT frees the current link so the target can
+// reconnect to its normal source.
 #define DATA_CMD_BLE_CONNECT                    (7010)  /* connect to target: addr_type[1]|addr[6] */
 #define DATA_CMD_BLE_DISCONNECT                 (7011)  /* disconnect / free the target            */
 #define DATA_CMD_BLE_CENTRAL_STATE              (7012)  /* poll connection/discovery/fuzz state    */
@@ -254,5 +255,30 @@
 #define DATA_CMD_BLE_DESC_GET                     (7028)  /* paged descriptor list                  */
 #define DATA_CMD_BLE_SVC_DISCOVER                (7029)  /* discover primary services              */
 #define DATA_CMD_BLE_SVC_GET                     (7030)  /* paged primary-service list             */
+#define DATA_CMD_BLE_DEVICE_INFO                 (7031)  /* read target GAP/DIS/battery info (RO)  */
+#define DATA_CMD_BLE_GET_DEVICE_INFO             (7032)  /* fetch collected device-info fields     */
+
+// Own-radio identity / radio power (cybersecurity fork additions).
+// Identity always mutates OUR OWN radio. Radio power is local too. The
+// environment-wide-broadcast tools live in the next block.
+#define DATA_CMD_BLE_SET_ADDR                   (7040)  /* mode[1]|(addr[6]) — 0 restore / 1 static / 2 RPA / 3 NRPA */
+#define DATA_CMD_BLE_GET_ADDR                   (7041)  /* out: addr_type[1] | addr[6 LE]                              */
+#define DATA_CMD_BLE_RADIO_SET                  (7042)  /* on[1] — 0 silent (stop adv+scan+drop central), 1 resume      */
+#define DATA_CMD_BLE_RADIO_GET                  (7043)  /* out: radio_on[1] | adv[1] | scan[1] | central_link[1]        */
+
+// Environment-wide stress / broadcast tools (cybersecurity fork, see CLAUDE.md
+// fork-specific exemption — operator-authorised lab use). Every command in
+// this block accepts a `scope` selector so the operator chooses per call:
+//   scope 0 = single target (already-connected central link, or host-picked addr)
+//   scope 1 = scan-buffer-wide (every address the passive scanner has cached)
+//   scope 2 = full environment-wide broadcast — spam the 2.4 GHz BLE spectrum
+//             (non-connectable advertising with maximum payload, minimum
+//             regulatory interval) so every scanner / peer in range sees it
+#define DATA_CMD_BLE_FLOOD_START                (7044)  /* scope[1]|handle[2]|size[1]|max_iter[2]|interval_ms[2] */
+#define DATA_CMD_BLE_FLOOD_STOP                 (7045)  /* stop flood                                              */
+#define DATA_CMD_BLE_FLOOD_COUNT                (7046)  /* out: sent[4 BE] — accepted WRITE_CMDs                    */
+#define DATA_CMD_BLE_KICK                       (7047)  /* scope[1]|cycles[1] — 1..10 disconnect cycles             */
+#define DATA_CMD_BLE_ADV_FLOOD_START            (7050)  /* scope[1]|fill_byte[1]|interval_units[1] — 2.4 GHz broadcast */
+#define DATA_CMD_BLE_ADV_FLOOD_STOP             (7051)  /* stop environment-wide broadcast spam                      */
 
 #endif

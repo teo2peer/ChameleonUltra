@@ -374,7 +374,7 @@ void append_mf1_auth_log_step1(bool isKeyB, bool isNested, uint8_t block, uint8_
         NRF_LOG_INFO("Mifare Classic auth log buffer ready");
     }
     // Non -first -time call, see if you record whether the detection log is over the upper limit of the size
-    if (m_auth_log.count > MF1_AUTH_LOG_MAX_SIZE) {
+    if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         // Skill this operation directly over the upper limit.
         NRF_LOG_INFO("Mifare Classic auth log buffer overflow");
         return;
@@ -396,7 +396,7 @@ void append_mf1_auth_log_step1(bool isKeyB, bool isNested, uint8_t block, uint8_
  */
 void append_mf1_auth_log_step2(uint8_t *nr, uint8_t *ar) {
     // Determine to the upper limit and skip this operation directly to avoid covering the previous records
-    if (m_auth_log.count > MF1_AUTH_LOG_MAX_SIZE) {
+    if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         return;
     }
     if (m_tag_information->config.detection_enable) {
@@ -414,7 +414,7 @@ void append_mf1_auth_log_step2(uint8_t *nr, uint8_t *ar) {
  */
 void append_mf1_auth_log_step3(bool is_auth_success) {
     // Determine to the upper limit and skip this operation directly to avoid covering the previous records
-    if (m_auth_log.count > MF1_AUTH_LOG_MAX_SIZE) {
+    if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         return;
     }
     if (m_tag_information->config.detection_enable) {

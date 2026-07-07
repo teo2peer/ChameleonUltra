@@ -38,6 +38,7 @@ static uint8_t rgb_marquee_usb_idle_color = RGB_RED;
 static uint8_t rgb_marquee_usb_open_step = 0;
 static bool m_reader_keys_anim_active = false;
 static bool m_ble_test_anim_active = false;
+static bool m_ble_active_anim_active = false;  // true while a BLE attack is running
 extern bool g_usb_led_marquee_enable;
 
 
@@ -797,5 +798,63 @@ void rgb_marquee_ble_test_loop(void) {
     if (++step > 3) {
         step = 0;
         color_index = (color_index + 1) % 6;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BLE-active animation: solid BLUE, outside -> centre, both sides.
+// Driven from the main loop while any BLE stress / broadcast / scan-buffer
+// attack is running. Pressing button A or B while this animation is active
+// cancels the attack and re-runs the BLE app (see app_main.c) — regardless
+// of the configured button-press function.
+// ---------------------------------------------------------------------------
+void rgb_marquee_set_ble_active_anim(bool enable) {
+    m_ble_active_anim_active = enable;
+    if (enable) {
+        // The other marquees (USB idle/open) must yield the PWM. ble_test and
+        // reader_keys anims are independent state machines — stop them too so
+        // we have a single source of truth ("BLE active" while an attack runs).
+        if (rgb_marquee_usb_idle_step != 0 || rgb_marquee_usb_open_step != 0) {
+            rgb_marquee_stop();
+        }
+    } else {
+        // Defer the visual reset to rgb_marquee_reset() so the caller can chain
+        // this with the "stop attack → restore adv" sequence.
+        rgb_marquee_reset();
+    }
+}
+
+bool rgb_marquee_is_ble_active_anim(void) {
+    return m_ble_active_anim_active;
+}
+
+void rgb_marquee_ble_active_loop(void) {
+    static uint8_t step = 0;        // 0..3 pairs lit, growing from the edges in
+    static uint32_t last_update = 0;
+
+    uint32_t now = app_timer_cnt_get();
+    if (app_timer_cnt_diff_compute(now, last_update) < APP_TIMER_TICKS(150)) {
+        return; // throttle to ~150 ms per frame
+    }
+    last_update = now;
+
+    uint32_t *led_pins = hw_get_led_array();
+
+    set_slot_light_color(RGB_BLUE);
+    for (uint8_t i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_clear(led_pins[i]);
+    }
+    // Light pairs from the edges (0,7) inward up to the current step.
+    for (uint8_t i = 0; i <= step; i++) {
+        if (i < RGB_LIST_NUM) {
+            nrf_gpio_pin_set(led_pins[i]);
+        }
+        if ((7 - i) < RGB_LIST_NUM) {
+            nrf_gpio_pin_set(led_pins[7 - i]);
+        }
+    }
+
+    if (++step > 3) {
+        step = 0;
     }
 }

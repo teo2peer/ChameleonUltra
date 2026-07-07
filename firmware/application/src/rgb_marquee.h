@@ -31,4 +31,15 @@ void rgb_marquee_ble_test_loop(void);
 void rgb_marquee_set_ble_test_anim(bool enable);
 bool rgb_marquee_is_ble_test_anim(void);
 
+// BLE-active animation: solid BLUE bar filling from the outer edges toward the
+// centre (outside -> center), used while ANY BLE attack / stress / broadcast
+// tool is running (flood, scan-buffer-wide kick / flood, environment-wide
+// 2.4 GHz broadcast, fuzz). Non-blocking; drive it from the main loop.
+// Pressing either physical button while this animation is active cancels the
+// in-progress attack and re-runs the BLE app so the host can reconnect —
+// regardless of the configured button-press function.
+void rgb_marquee_ble_active_loop(void);
+void rgb_marquee_set_ble_active_anim(bool enable);
+bool rgb_marquee_is_ble_active_anim(void);
+
 #endif

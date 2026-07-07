@@ -193,7 +193,8 @@ class Command(enum.IntEnum):
     BLE_ADVERTISING_GET = 7005
     BLE_LINK_PROBE = 7006
 
-    # BLE directed GATT fuzzing harness — point-to-point against ONE target
+    # BLE GATT fuzzing harness — scope selectable per call:
+    # single target / scan-buffer-wide / environment-wide broadcast.
     BLE_CONNECT = 7010
     BLE_DISCONNECT = 7011
     BLE_CENTRAL_STATE = 7012
@@ -215,6 +216,25 @@ class Command(enum.IntEnum):
     BLE_DESC_GET = 7028
     BLE_SVC_DISCOVER = 7029
     BLE_SVC_GET = 7030
+    BLE_DEVICE_INFO = 7031
+    BLE_GET_DEVICE_INFO = 7032
+
+    # BLE own-radio identity / radio power (cybersecurity fork additions).
+    # Identity + radio power are always local (mutate OUR radio).
+    BLE_SET_ADDR = 7040
+    BLE_GET_ADDR = 7041
+    BLE_RADIO_SET = 7042
+    BLE_RADIO_GET = 7043
+
+    # BLE stress / broadcast — per-call scope selectable:
+    #   single target / scan-buffer-wide / environment-wide broadcast on the
+    #   full 2.4 GHz BLE spectrum.
+    BLE_FLOOD_START    = 7044
+    BLE_FLOOD_STOP     = 7045
+    BLE_FLOOD_COUNT    = 7046
+    BLE_KICK           = 7047
+    BLE_ADV_FLOOD_START = 7050
+    BLE_ADV_FLOOD_STOP  = 7051
 
 
 @enum.unique
