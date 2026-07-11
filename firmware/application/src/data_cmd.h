@@ -104,8 +104,6 @@
 #define DATA_CMD_VIKING_SCAN                    (3004)
 #define DATA_CMD_VIKING_WRITE_TO_T55XX          (3005)
 #define DATA_CMD_ADC_GENERIC_READ               (3009)
-#define DATA_CMD_GENERIC_READ                   (3007)
-#define DATA_CMD_CORR_GENERIC_READ              (3008)
 #define DATA_CMD_IOPROX_SCAN                    (3010)
 #define DATA_CMD_IOPROX_WRITE_TO_T55XX          (3011)
 #define DATA_CMD_IOPROX_DECODE_RAW              (3012)
@@ -153,8 +151,6 @@
 #define DATA_CMD_MF0_NTAG_SET_COUNTER_DATA      (4028)
 #define DATA_CMD_MF0_NTAG_RESET_AUTH_CNT        (4029)
 #define DATA_CMD_MF0_NTAG_GET_PAGE_COUNT        (4030)
-#define DATA_CMD_MF0_NTAG_RESET_AUTH_CNT        (4029)
-#define DATA_CMD_MF0_NTAG_GET_PAGE_COUNT        (4030)
 #define DATA_CMD_MF0_NTAG_GET_WRITE_MODE        (4031)
 #define DATA_CMD_MF0_NTAG_SET_WRITE_MODE        (4032)
 #define DATA_CMD_MF0_NTAG_SET_DETECTION_ENABLE  (4033)
@@ -189,6 +185,10 @@
 #define DATA_CMD_HF14A_4_READER_APDU            (6004)  /* select+RATS+send APDU, keep field   */
 #define DATA_CMD_HF14A_4_EMV_SCAN               (6005)  /* full EMV scan in one call            */
 #define DATA_CMD_HF14A_4_DESFIRE_SCAN           (6006)  /* DESFire enumerate in one call        */
+#define DATA_CMD_HF14A_4_EMV_TRACE_START        (6007)  /* run versioned retained EMV trace     */
+#define DATA_CMD_HF14A_4_EMV_TRACE_META         (6008)  /* get retained EMV trace metadata      */
+#define DATA_CMD_HF14A_4_EMV_TRACE_GET          (6009)  /* page retained EMV trace records      */
+#define DATA_CMD_HF14A_4_DEBUG_COUNTERS         (6010)  /* T=CL debug counters (diagnostics)    */
 
 #define DATA_CMD_EM410X_SET_EMU_ID              (5000)
 #define DATA_CMD_EM410X_GET_EMU_ID              (5001)

@@ -42,10 +42,19 @@ static void uninit_viking_hw(void) {
 }
 
 bool viking_read(uint8_t *data, uint32_t timeout_ms) {
+    if (data == NULL) {
+        return false;
+    }
     void *codec = viking.alloc();
+    if (codec == NULL) {
+        return false;
+    }
     viking.decoder.start(codec, 0);
 
-    cb_init(&cb, VIKING_BUFFER_SIZE, sizeof(uint16_t));
+    if (!cb_init(&cb, VIKING_BUFFER_SIZE, sizeof(uint16_t))) {
+        viking.free(codec);
+        return false;
+    }
     init_viking_hw();
     start_lf_125khz_radio();
 

@@ -44,11 +44,13 @@ static uint16_t crc_table[256] = {
  * @param output The output buffer must be greater than or equal to two bytes
  *
  */
-void calc_14a_crc_lut(uint8_t *data, int length, uint8_t *output) {
-    //Take the clever, compulsory pointer type conversion
-    uint16_t *crc = (uint16_t *)output;
-    //Give the initial value of polynomial
-    *crc = 0x6363;
-    //Then start checking the table of each byte
-    while (length--) *crc = (*crc >> 8) ^ crc_table[(*crc & 0xFF) ^ *data++];
+void calc_14a_crc_lut(const uint8_t *data, size_t length, uint8_t *output) {
+    if (output == NULL || (data == NULL && length != 0)) return;
+
+    uint16_t crc = 0x6363;
+    while (length--) crc = (crc >> 8) ^ crc_table[(crc & 0xFF) ^ *data++];
+
+    /* output is frequently an unaligned byte field in a packed RF frame. */
+    output[0] = (uint8_t)crc;
+    output[1] = (uint8_t)(crc >> 8);
 }

@@ -40,9 +40,8 @@ typedef struct {
     bool     login_required;/* true if tag has RL bit set and login failed   */
 } em4x05_data_t;
 
-/* -----------------------------------------------------------------------
- * Public API
- * --------------------------------------------------------------------- */
+/* Quarantined until command/response framing is hardware verified.
+ * scan_em4x05 returns STATUS_NOT_IMPLEMENTED. */
 
 bool    em4x05_read(em4x05_data_t *out, uint32_t timeout_ms);
 uint8_t scan_em4x05(em4x05_data_t *out);

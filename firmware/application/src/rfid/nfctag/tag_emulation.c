@@ -52,11 +52,41 @@ bool is_tag_specific_type_valid(tag_specific_type_t tag_type) {
  */
 static uint8_t m_tag_data_buffer_lf[20];  // LF card data buffer
 static uint16_t m_tag_data_lf_crc;
-static tag_data_buffer_t m_tag_data_lf = {sizeof(m_tag_data_buffer_lf), m_tag_data_buffer_lf, &m_tag_data_lf_crc};
+static tag_data_buffer_t m_tag_data_lf = {
+    .length = sizeof(m_tag_data_buffer_lf),
+    .actual_length = 0,
+    .buffer = m_tag_data_buffer_lf,
+    .crc = &m_tag_data_lf_crc,
+};
 
 static uint8_t m_tag_data_buffer_hf[4500];  // HF card data buffer
 static uint16_t m_tag_data_hf_crc;
-static tag_data_buffer_t m_tag_data_hf = {sizeof(m_tag_data_buffer_hf), m_tag_data_buffer_hf, &m_tag_data_hf_crc};
+static tag_data_buffer_t m_tag_data_hf = {
+    .length = sizeof(m_tag_data_buffer_hf),
+    .actual_length = 0,
+    .buffer = m_tag_data_buffer_hf,
+    .crc = &m_tag_data_hf_crc,
+};
+
+typedef struct {
+    bool valid;
+    uint8_t slot;
+    tag_specific_type_t type;
+} loaded_tag_owner_t;
+
+static loaded_tag_owner_t m_loaded_hf = {0};
+static loaded_tag_owner_t m_loaded_lf = {0};
+
+static loaded_tag_owner_t *loaded_owner(tag_sense_type_t sense_type) {
+    if (sense_type == TAG_SENSE_HF) return &m_loaded_hf;
+    if (sense_type == TAG_SENSE_LF) return &m_loaded_lf;
+    return NULL;
+}
+
+static bool loaded_owner_matches(uint8_t slot, tag_specific_type_t type) {
+    loaded_tag_owner_t *owner = loaded_owner(get_sense_type_from_tag_type(type));
+    return owner != NULL && owner->valid && owner->slot == slot && owner->type == type;
+}
 
 /**
  * Eight card slots, each card slot has its own unique configuration
@@ -120,6 +150,18 @@ static tag_base_handler_map_t tag_base_map[] = {
 
 static void tag_emulation_load_config(void);
 static void tag_emulation_save_config(void);
+
+static bool slot_config_types_valid(const tag_slot_config_t *config) {
+    for (uint8_t i = 0; i < TAG_MAX_SLOT_NUM; i++) {
+        tag_specific_type_t hf = config->slots[i].tag_hf;
+        tag_specific_type_t lf = config->slots[i].tag_lf;
+        if ((hf != TAG_TYPE_UNDEFINED && get_sense_type_from_tag_type(hf) != TAG_SENSE_HF) ||
+                (lf != TAG_TYPE_UNDEFINED && get_sense_type_from_tag_type(lf) != TAG_SENSE_LF)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /**
  * get the data loader for the specific type of tag
@@ -202,13 +244,38 @@ bool tag_emulation_load_by_buffer(tag_specific_type_t tag_type, bool update_crc)
         return false;
     }
 
+    tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
+    loaded_tag_owner_t *owner = loaded_owner(sense_type);
+    uint8_t slot = tag_emulation_get_slot();
+    tag_specific_type_t configured_type = sense_type == TAG_SENSE_HF
+                                          ? slotConfig.slots[slot].tag_hf
+                                          : slotConfig.slots[slot].tag_lf;
+    if (owner == NULL || configured_type != tag_type ||
+            (update_crc && buffer->actual_length == 0)) {
+        return false;
+    }
+
+    owner->valid = false;
+    bool direct_load = buffer->actual_length == 0;
     int length = loader(tag_type, buffer);
-    if (length > 0 && update_crc) {
+    uint16_t stored_length = (uint16_t)((length + 3) & ~3);
+    if (length <= 0 || length > buffer->length ||
+            (!direct_load && buffer->actual_length != stored_length)) {
+        NRF_LOG_ERROR("Tag type %d record length invalid: %d, expected %d.",
+                      tag_type, buffer->actual_length, stored_length);
+        tag_emulation_sense_switch(sense_type, false);
+        return false;
+    }
+
+    owner->slot = slot;
+    owner->type = tag_type;
+    owner->valid = true;
+    buffer->actual_length = stored_length;
+    if (update_crc) {
         // afterReadingIsCompleted,WeCanSaveACrcOfTheCurrentDataWhenItIsStoredLater,ItCanBeUsedAsAReferenceForChangesComparison
         calc_14a_crc_lut(buffer->buffer, length, (uint8_t *)buffer->crc);
-        return true;
     }
-    return false;
+    return true;
 }
 
 /**
@@ -219,6 +286,7 @@ static void load_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
     if (tag_type == TAG_TYPE_UNDEFINED) {
         return;
     }
+    if (slot != tag_emulation_get_slot()) return;
 
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(tag_type);
     if (buffer == NULL) {
@@ -226,6 +294,10 @@ static void load_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
     }
 
     tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
+    loaded_tag_owner_t *owner = loaded_owner(sense_type);
+    if (owner != NULL) owner->valid = false;
+    buffer->actual_length = 0;
+    memset(buffer->buffer, 0, buffer->length);
 
     // get fds record for the card slot
     fds_slot_record_map_t map_info;
@@ -238,8 +310,10 @@ static void load_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
     bool ret = fds_read_sync(map_info.id, map_info.key, &length, buffer->buffer);
     if (false == ret) {
         NRF_LOG_INFO("tag slot data no exists.");
+        tag_emulation_sense_switch(sense_type, false);
         return;
     }
+    buffer->actual_length = length;
     ret = tag_emulation_load_by_buffer(tag_type, true);
     if (ret) {
         NRF_LOG_INFO("load tag data in slot %d, type %d done.", slot, tag_type);
@@ -252,6 +326,10 @@ static void load_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
 static void save_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
     // Maybe the card slot is not enabled to use the emulation of this type of label, and skip it directly to save this data
     if (tag_type == TAG_TYPE_UNDEFINED) {
+        return;
+    }
+    if (!loaded_owner_matches(slot, tag_type)) {
+        NRF_LOG_WARNING("Refusing to save stale slot %d type %d buffer.", slot, tag_type);
         return;
     }
 
@@ -340,6 +418,7 @@ void tag_emulation_save_data(void) {
  * @param tag_type Label
  */
 void tag_emulation_get_specific_types_by_slot(uint8_t slot, tag_slot_specific_type_t *tag_types) {
+    if (slot >= TAG_MAX_SLOT_NUM || tag_types == NULL) return;
     tag_types->tag_hf = slotConfig.slots[slot].tag_hf;
     tag_types->tag_lf = slotConfig.slots[slot].tag_lf;
 }
@@ -367,6 +446,8 @@ void tag_emulation_delete_data(uint8_t slot, tag_sense_type_t sense_type) {
     }
     // If the deleted card slot data is currently activated (being emulated), we also need to make dynamic shutdown
     if (slotConfig.active_slot == slot) {
+        loaded_tag_owner_t *owner = loaded_owner(sense_type);
+        if (owner != NULL) owner->valid = false;
         tag_emulation_sense_switch(sense_type, false);
     }
 }
@@ -380,7 +461,11 @@ bool tag_emulation_factory_data(uint8_t slot, tag_specific_type_t tag_type) {
     if (factory != NULL && factory(slot, tag_type)) {
         // If the current data card slot number currently set is the current activated card slot, then we need to update to the memory
         if (tag_emulation_get_slot() == slot) {
-            load_data_by_tag_type(slot, tag_type);
+            tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
+            tag_specific_type_t configured_type = sense_type == TAG_SENSE_HF
+                                                  ? slotConfig.slots[slot].tag_hf
+                                                  : slotConfig.slots[slot].tag_lf;
+            if (configured_type == tag_type) load_data_by_tag_type(slot, tag_type);
         }
         return true;
     }
@@ -394,12 +479,14 @@ bool tag_emulation_factory_data(uint8_t slot, tag_specific_type_t tag_type) {
 static void tag_emulation_sense_switch_all(bool enable) {
     uint8_t slot = tag_emulation_get_slot();
     // NRF_LOG_INFO("Slot %d tag type hf %d, lf %d", slot, slotConfig.slots[slot].tag_hf, slotConfig.slots[slot].tag_lf);
-    if (enable && (slotConfig.slots[slot].enabled_hf) && (slotConfig.slots[slot].tag_hf != TAG_TYPE_UNDEFINED)) {
+    if (enable && (slotConfig.slots[slot].enabled_hf) &&
+            loaded_owner_matches(slot, slotConfig.slots[slot].tag_hf)) {
         nfc_tag_14a_sense_switch(true);
     } else {
         nfc_tag_14a_sense_switch(false);
     }
-    if (enable && (slotConfig.slots[slot].enabled_lf) && (slotConfig.slots[slot].tag_lf != TAG_TYPE_UNDEFINED)) {
+    if (enable && (slotConfig.slots[slot].enabled_lf) &&
+            loaded_owner_matches(slot, slotConfig.slots[slot].tag_lf)) {
         lf_tag_125khz_sense_switch(true);
     } else {
         lf_tag_125khz_sense_switch(false);
@@ -420,7 +507,7 @@ void tag_emulation_sense_switch(tag_sense_type_t type, bool enable) {
             break;
         case TAG_SENSE_HF:
             if (enable && (slotConfig.slots[slot].enabled_hf) &&
-                    (slotConfig.slots[slot].tag_hf != TAG_TYPE_UNDEFINED)) {
+                    loaded_owner_matches(slot, slotConfig.slots[slot].tag_hf)) {
                 nfc_tag_14a_sense_switch(true);
             } else {
                 nfc_tag_14a_sense_switch(false);
@@ -428,7 +515,7 @@ void tag_emulation_sense_switch(tag_sense_type_t type, bool enable) {
             break;
         case TAG_SENSE_LF:
             if (enable && (slotConfig.slots[slot].enabled_lf) &&
-                    (slotConfig.slots[slot].tag_lf != TAG_TYPE_UNDEFINED)) {
+                    loaded_owner_matches(slot, slotConfig.slots[slot].tag_lf)) {
                 lf_tag_125khz_sense_switch(true);
             } else {
                 lf_tag_125khz_sense_switch(false);
@@ -500,10 +587,19 @@ static void tag_emulation_migrate_slot_config(void) {
  * Load the emulated card configuration data, note that loading is just a card slot configuration
  */
 static void tag_emulation_load_config(void) {
-    uint16_t length = sizeof(slotConfig);
+    tag_slot_config_t loaded = slotConfig;
+    uint16_t length = sizeof(loaded);
     // Read the card slot configuration data
-    bool ret = fds_read_sync(FDS_EMULATION_CONFIG_FILE_ID, FDS_EMULATION_CONFIG_RECORD_KEY, &length, (uint8_t *)&slotConfig);
+    bool ret = fds_read_sync(FDS_EMULATION_CONFIG_FILE_ID, FDS_EMULATION_CONFIG_RECORD_KEY, &length, (uint8_t *)&loaded);
     if (ret) {
+        bool current_size = loaded.version == TAG_SLOT_CONFIG_CURRENT_VERSION && length == sizeof(loaded);
+        bool legacy_size = loaded.version < TAG_SLOT_CONFIG_CURRENT_VERSION && length >= 36;
+        if ((!current_size && !legacy_size) || loaded.active_slot >= TAG_MAX_SLOT_NUM ||
+                (current_size && !slot_config_types_valid(&loaded))) {
+            NRF_LOG_ERROR("Invalid tag slot config record.");
+            return;
+        }
+        slotConfig = loaded;
         // After the reading is completed, we will save a BCC of the current configuration. When it is stored later, it can be used as a reference for the contrast between changes.
         calc_14a_crc_lut((uint8_t *)&slotConfig, sizeof(slotConfig), (uint8_t *)&m_slot_config_crc);
         NRF_LOG_INFO("Load tag slot config done.");
@@ -579,6 +675,7 @@ uint8_t tag_emulation_get_slot(void) {
  * Set the currently activated card slot index
  */
 void tag_emulation_set_slot(uint8_t index) {
+    if (index >= TAG_MAX_SLOT_NUM) return;
     slotConfig.active_slot = index;  // Re -set to the new switched card slot
     rgb_marquee_reset();             // force animation color refresh according to new slot
 }
@@ -587,6 +684,7 @@ void tag_emulation_set_slot(uint8_t index) {
  * Switch to the card slot of the specified index, this function will automatically complete the data loading
  */
 void tag_emulation_change_slot(uint8_t index, bool sense_disable) {
+    if (index >= TAG_MAX_SLOT_NUM) return;
     if (sense_disable) {
         // Turn off the analog card to avoid triggering the emulation when switching the card slot
         tag_emulation_sense_end();
@@ -605,6 +703,7 @@ void tag_emulation_change_slot(uint8_t index, bool sense_disable) {
  * Determine whether the specified card slot is enabled
  */
 bool is_slot_enabled(uint8_t slot, tag_sense_type_t sense_type) {
+    if (slot >= TAG_MAX_SLOT_NUM) return false;
     if (sense_type == TAG_SENSE_LF) {
         return slotConfig.slots[slot].enabled_lf;
     }
@@ -618,6 +717,7 @@ bool is_slot_enabled(uint8_t slot, tag_sense_type_t sense_type) {
  * Set whether the specified card slot is enabled
  */
 void tag_emulation_slot_set_enable(uint8_t slot, tag_sense_type_t sense_type, bool enable) {
+    if (slot >= TAG_MAX_SLOT_NUM) return;
     // Set the capacity of the corresponding card slot directly
     if (sense_type == TAG_SENSE_LF) {
         slotConfig.slots[slot].enabled_lf = enable;
@@ -664,6 +764,7 @@ uint8_t tag_emulation_slot_find_prev(uint8_t slot_now) {
  * Set the card specified by the specified card slot card slot card type card to the specified type
  */
 void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type) {
+    if (slot >= TAG_MAX_SLOT_NUM || !is_tag_specific_type_valid(tag_type)) return;
     tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
     NRF_LOG_INFO("sense type = %d", sense_type);
     switch (sense_type) {

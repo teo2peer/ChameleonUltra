@@ -68,6 +68,10 @@ void nfc_tag_14a_4_set_response(const uint8_t *data, uint16_t length);
 /* Reset handler */
 void nfc_tag_14a_4_reset_handler(void);
 
-#endif /* NFC_14A_4_H */
+/* RATS activation parameters supplied by the shared ISO14443-A layer. */
+void nfc_tag_14a_4_activate(uint8_t fsdi, uint8_t cid);
 
-void nfc_tag_14a_4_get_debug_counters(uint8_t *rx, uint8_t *tx, uint8_t *last_pcb, uint8_t *last_match);
+void nfc_tag_14a_4_get_debug_counters(uint8_t *rx, uint8_t *tx,
+                                      uint8_t *last_pcb, uint8_t *last_match);
+
+#endif /* NFC_14A_4_H */

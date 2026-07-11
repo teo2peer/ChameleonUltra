@@ -43,6 +43,8 @@
 # Debug files
 *.dSYM/
 *.su
+core
+core.*
 *.idb
 *.pdb
 
@@ -722,3 +724,7 @@ software/src/target_arch_detect.c
 ### Local build/flash artifacts (produced by build_ipa.sh / flash_firmware.sh) ###
 *.ipa
 firmware/objects/*.zip
+
+# DFU signing material must be supplied from outside the checkout.
+resource/dfu_key/*
+*.dfu-signing-key.pem

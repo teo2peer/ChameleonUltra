@@ -20,7 +20,9 @@ CURRENT_DEVICE_TYPE=lite ./build.sh       # build for the Lite board (default: u
 make -j -C firmware/application            # build just the application ELF/hex
 cd firmware && docker compose up --pull=always build-ultra   # containerized build (or build-lite); output in firmware/objects/
 ```
-Flash over DFU with `firmware/flash-dfu-app.sh` (app only) or `firmware/flash-dfu-full.sh` (bootloader+SD+app).
+Flash with `firmware/flash-dfu-full.sh` until the enlarged FDS-aware bootloader
+has been deployed. App-only packaging/flashing then requires the explicit
+`ALLOW_APP_ONLY_DFU=1` migration acknowledgement.
 
 **Host CLI** (Python ≥ 3.9; UV is the intended package manager, see `software/README.md`):
 ```bash
@@ -98,8 +100,8 @@ Firmware dispatch lives in `firmware/application/src/app_cmd.c`: the `m_data_cmd
 
 Tooling layered on top of the upstream project. Each area has a reference under `docs/` (`docs/README.md` indexes them):
 
-- **BLE audit** (commands 7000–7032, `docs/ble-audit.md`) — passive scanner + directed GATT client: connect, discover services/characteristics/descriptors, read, write, subscribe, device-info pull, MTU exchange, link-probe, and the directed fuzzer. Per-call scope is selectable: single target, scan-buffer-wide, or environment-wide broadcast (operator-authorised, see fork-specific exemption). Firmware in `ble_central.c`; CLI under `ble …`; GUI page `lib/gui/menu/hacking/ble_audit.dart`.
-- **HF reader additions** (`docs/hf-additions.md`) — `MF1_READ_BLOCKS` (2018, authenticate-once sector read; used by `hf mf dump`/autopwn), `HF14A_SCAN_KEEP` (2016) / `HF14A_AUTH_TRACE` (2017), `MF1_CHECK_KEYS_OF_SECTORS` (2012), `HF14A_4_DESFIRE_SCAN` (6006, one-call DESFire enum via `hf des enum`), and a richer `emv scan`.
+- **BLE audit** (commands 7000–7051, `docs/ble-audit.md`) — passive scanner + directed GATT client: connect, discover services/characteristics/descriptors, read, write, subscribe, device-info pull, MTU exchange, link-probe, and the directed fuzzer (7000–7032); plus own-radio identity/power control (7040–7043) and the operator-authorised stress/broadcast tooling (7044–7051, see fork-specific exemption). Per-call scope is selectable: single target, scan-buffer-wide, or environment-wide broadcast. Firmware in `ble_central.c`; CLI under `ble …`; GUI page `lib/gui/menu/hacking/ble_audit.dart`.
+- **HF reader additions** (`docs/hf-additions.md`) — `MF1_READ_BLOCKS` (2018, authenticate-once sector read; used by `hf mf dump`/autopwn), `HF14A_SCAN_KEEP` (2016) / `HF14A_AUTH_TRACE` (2017), `HF14A_4_DESFIRE_SCAN` (6006, one-call DESFire enum via `hf des enum`), and a richer `emv scan`. These build on the upstream `MF1_CHECK_KEYS_OF_SECTORS` (2012), which the fork's key-check flow uses but did not add.
 - **MIFARE Classic key-recovery optimizations** (`docs/autopwn-optimizations.md`) — live in the **GUI** engine `lib/helpers/mifare_classic/recovery.dart` (`MifareClassicRecovery`; orchestrates dictionary check → darkside/nested/hardnested/static/RF08S-backdoor → dump via the native FFI in `lib/recovery/`). The order-only ranking/intersection logic is factored into the pure, unit-tested `lib/helpers/mifare_classic/candidate_priority.dart` (`test/candidate_priority_test.dart`). All changes are **speed-/order-only and confirmed on-card** — they never mark a wrong key. When touching recovery, preserve that invariant and the per-step fallbacks.
 
 ## Conventions

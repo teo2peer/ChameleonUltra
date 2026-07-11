@@ -25,6 +25,9 @@ static circular_buffer cb;
 static void saadc_cb(nrf_saadc_value_t *vals, size_t size) {
     for (int i = 0; i < size; i++) {
         nrf_saadc_value_t val = vals[i];
+        if (val < 0) {
+            val = 0;
+        }
         if (!cb_push_back(&cb, &val)) {
             return;
         }
@@ -40,10 +43,19 @@ static void uninit_hidprox_hw(void) {
 }
 
 bool hidprox_read(uint8_t *data, uint8_t format_hint, uint32_t timeout_ms) {
+    if (data == NULL) {
+        return false;
+    }
     void *codec = hidprox.alloc();
+    if (codec == NULL) {
+        return false;
+    }
     hidprox.decoder.start(codec, format_hint);
 
-    cb_init(&cb, HIDPROX_BUFFER_SIZE, sizeof(uint16_t));
+    if (!cb_init(&cb, HIDPROX_BUFFER_SIZE, sizeof(uint16_t))) {
+        hidprox.free(codec);
+        return false;
+    }
     init_hidprox_hw();
     start_lf_125khz_radio();
 

@@ -34,7 +34,7 @@ static void saadc_cb(nrf_saadc_value_t *vals, size_t size) {
     for (size_t i = 0; i < size; i++) {
         // Check if we were disarmed mid-batch
         if (g_lf_active_gen != gen) return;
-        uint16_t v = (uint16_t)vals[i];
+        uint16_t v = vals[i] > 0 ? (uint16_t)vals[i] : 0;
         cb_push_back(&cb, &v);
     }
 }
@@ -85,10 +85,19 @@ bool ioprox_read(uint8_t *data, uint8_t format_hint, uint32_t timeout_ms) {
     uint16_t   val   = 0;
     bool       ok    = false;
 
+    if (data == NULL) {
+        return false;
+    }
     codec = ioprox.alloc();
+    if (codec == NULL) {
+        return false;
+    }
     ioprox.decoder.start(codec, format_hint);
 
-    cb_init(&cb, IOPROX_BUFFER_SIZE, sizeof(uint16_t));
+    if (!cb_init(&cb, IOPROX_BUFFER_SIZE, sizeof(uint16_t))) {
+        ioprox.free(codec);
+        return false;
+    }
     init_ioprox_hw();
 
     p_at = bsp_obtain_timer(0);

@@ -10,6 +10,7 @@
 #include "rc522.h"
 #include "bsp_delay.h"
 #include "bsp_time.h"
+#include "bsp_wdt.h"
 #include "app_status.h"
 #include "hex_utils.h"
 #include "crc_utils.h"
@@ -34,6 +35,17 @@ static bool m_reader_is_init = false;
 // Communication timeout
 static uint16_t g_com_timeout_ms = DEF_COM_TIMEOUT;
 static autotimer *g_timeout_auto_timer;
+static pcd_14a_trace_cb_t m_trace_callback;
+static bool m_trace_inside_bits;
+
+void pcd_14a_reader_trace_set(pcd_14a_trace_cb_t callback) {
+    m_trace_callback = callback;
+}
+
+void pcd_14a_reader_trace_clear(void) {
+    m_trace_callback = NULL;
+    m_trace_inside_bits = false;
+}
 
 // RC522 SPI
 #define SPI_INSTANCE  0 /**< SPI instance index. */
@@ -49,6 +61,22 @@ Default HF 14a config is set to:
 static hf14a_config_t hf14aconfig = { 0, 0, 0, 0 };
 
 #define ONCE_OPT __attribute__((optimize("O3")))
+#define RC522_SPI_WAIT_LIMIT 100000u
+
+static volatile bool m_spi_failed = false;
+
+static bool spi_wait_ready(void) {
+    uint32_t guard = RC522_SPI_WAIT_LIMIT;
+    while (NRF_SPI0->EVENTS_READY == 0 && guard-- != 0) {
+        __NOP();
+    }
+    if (NRF_SPI0->EVENTS_READY == 0) {
+        m_spi_failed = true;
+        return false;
+    }
+    NRF_SPI0->EVENTS_READY = 0;
+    return true;
+}
 
 /**
 * @brief  :Read register
@@ -56,18 +84,26 @@ static hf14a_config_t hf14aconfig = { 0, 0, 0, 0 };
 * @retval :Value in the register
 */
 uint8_t read_register_single(uint8_t Address) {
+    if (!m_reader_is_init) {
+        m_spi_failed = true;
+        return 0;
+    }
     RC522_DOSEL;
 
     Address = (uint8_t)(((Address << 1) & 0x7E) | 0x80);
 
     NRF_SPI0->TXD = Address;
-    while (NRF_SPI0->EVENTS_READY == 0);
-    NRF_SPI0->EVENTS_READY = 0;
+    if (!spi_wait_ready()) {
+        RC522_UNSEL;
+        return 0;
+    }
     (void)NRF_SPI0->RXD;
 
     NRF_SPI0->TXD = Address;
-    while (NRF_SPI0->EVENTS_READY == 0);
-    NRF_SPI0->EVENTS_READY = 0;
+    if (!spi_wait_ready()) {
+        RC522_UNSEL;
+        return 0;
+    }
     Address = NRF_SPI0->RXD;
 
     RC522_UNSEL;
@@ -76,23 +112,31 @@ uint8_t read_register_single(uint8_t Address) {
 }
 
 void read_register_buffer(uint8_t Address, uint8_t *pInBuffer, uint8_t len) {
+    if (len == 0) return;
+    if (!m_reader_is_init || pInBuffer == NULL) {
+        m_spi_failed = true;
+        return;
+    }
     RC522_DOSEL;
 
     Address = (((Address << 1) & 0x7E) | 0x80);
 
     NRF_SPI0->TXD = Address;
-    while (NRF_SPI0->EVENTS_READY == 0);    // Waiting for transmission ends
-    NRF_SPI0->EVENTS_READY = 0;
+    if (!spi_wait_ready()) {
+        RC522_UNSEL;
+        return;
+    }
     (void)NRF_SPI0->RXD;    //Read once and give a level
 
-    uint8_t i = 0;
-    do {
+    for (uint8_t i = 0; i < len; i++) {
         //Then start receiving data
         NRF_SPI0->TXD = Address;
-        while (NRF_SPI0->EVENTS_READY == 0);    //Waiting for transmission
-        NRF_SPI0->EVENTS_READY = 0;
+        if (!spi_wait_ready()) {
+            RC522_UNSEL;
+            return;
+        }
         pInBuffer[i] = NRF_SPI0->RXD;    // Read once and give a level
-    } while (++i < len);
+    }
 
     RC522_UNSEL;
 }
@@ -103,43 +147,59 @@ void read_register_buffer(uint8_t Address, uint8_t *pInBuffer, uint8_t len) {
 *           value: The value to be written
 */
 void ONCE_OPT write_register_single(uint8_t Address, uint8_t value) {
+    if (!m_reader_is_init) {
+        m_spi_failed = true;
+        return;
+    }
     RC522_DOSEL;
 
     Address = ((Address << 1) & 0x7E);
 
     // First pass the address first pass the address
     NRF_SPI0->TXD = Address;
-    while (NRF_SPI0->EVENTS_READY == 0);
-    NRF_SPI0->EVENTS_READY = 0;
+    if (!spi_wait_ready()) {
+        RC522_UNSEL;
+        return;
+    }
     (void)NRF_SPI0->RXD;
 
     //  Passing address
     NRF_SPI0->TXD = value;
-    while (NRF_SPI0->EVENTS_READY == 0);
-    NRF_SPI0->EVENTS_READY = 0;
+    if (!spi_wait_ready()) {
+        RC522_UNSEL;
+        return;
+    }
     (void)NRF_SPI0->RXD;
 
     RC522_UNSEL;
 }
 
 void write_register_buffer(uint8_t Address, uint8_t *values, uint8_t len) {
+    if (len == 0) return;
+    if (!m_reader_is_init || values == NULL) {
+        m_spi_failed = true;
+        return;
+    }
     RC522_DOSEL;
 
     Address = ((Address << 1) & 0x7E);
 
     NRF_SPI0->TXD = Address;
-    while (NRF_SPI0->EVENTS_READY == 0);
-    NRF_SPI0->EVENTS_READY = 0;
+    if (!spi_wait_ready()) {
+        RC522_UNSEL;
+        return;
+    }
     (void)NRF_SPI0->RXD;
 
-    uint8_t i = 0;
-    do {
+    for (uint8_t i = 0; i < len; i++) {
         // Passing address
         NRF_SPI0->TXD = values[i];
-        while (NRF_SPI0->EVENTS_READY == 0);
-        NRF_SPI0->EVENTS_READY = 0;
+        if (!spi_wait_ready()) {
+            RC522_UNSEL;
+            return;
+        }
         (void)NRF_SPI0->RXD;
-    } while (++i < len);
+    }
 
     RC522_UNSEL;
 }
@@ -273,6 +333,18 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
     uint8_t pcd_err_val = 0;
     uint8_t not_timeout = 0;
 
+    if ((Command != PCD_AUTHENT && Command != PCD_TRANSCEIVE) ||
+            pIn == NULL || InLenByte == 0 || InLenByte > DEF_FIFO_LENGTH ||
+            (pOut != NULL && pOutLenBit == NULL)) {
+        return STATUS_PAR_ERR;
+    }
+    if (pOutLenBit != NULL) *pOutLenBit = 0;
+    m_spi_failed = false;
+
+    if (!m_trace_inside_bits && m_trace_callback != NULL && pIn != NULL && InLenByte > 0u) {
+        m_trace_callback(true, pIn, (uint16_t)InLenByte * 8u, STATUS_HF_TAG_OK);
+    }
+
     switch (Command) {
         case PCD_AUTHENT:                       //  MiFare certification
             waitFor = 0x10;                     //  Query the free interrupt logo when the certification card is waiting
@@ -288,26 +360,21 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
     set_register_mask(FIFOLevelReg,     0x80);          //  Write an empty order
 
     write_register_buffer(FIFODataReg, pIn, InLenByte); // Write data into FIFODATA
+    if (m_spi_failed) return STATUS_HF_ERR_STAT;
     write_register_single(CommandReg, Command);             // Write command
 
     if (Command == PCD_TRANSCEIVE) {
         set_register_mask(BitFramingReg, 0x80);     // StartSend places to start the data to send this bit and send and receive commands when it is valid
     }
 
-    if (pOut == NULL) {
-        // If the developer does not need to receive data, then return directly after the sending!
-        while ((read_register_single(Status2Reg) & 0x07) == 0x03);
-        return STATUS_HF_TAG_OK;
-    }
-    // Reset the length of the received data
-    *pOutLenBit         = 0;
-
     bsp_set_timer(g_timeout_auto_timer, 0);         // Before starting the operation, return to zero over time counting
 
     do {
         n = read_register_single(ComIrqReg);                // Read the communication interrupt register to determine whether the current IO task is completed!
+        bsp_wdt_feed();
         not_timeout = NO_TIMEOUT_1MS(g_timeout_auto_timer, g_com_timeout_ms);
     } while (not_timeout && (!(n & waitFor)));  // Exit conditions: timeout interruption, interrupt with empty command commands
+    if (m_spi_failed) not_timeout = 0;
     // NRF_LOG_INFO("N = %02x\n", n);
 
     if (Command == PCD_TRANSCEIVE) {
@@ -348,19 +415,27 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
             // Occasionally occur
             // NRF_LOG_INFO("COM OK\n");
             if (Command == PCD_TRANSCEIVE) {
+                if (pOut == NULL) {
+                    status = STATUS_HF_TAG_OK;
+                } else {
                 n = read_register_single(FIFOLevelReg);                             // Read the number of bytes saved in FIFO
-                if (n == 0) { n = 1; }
+                if (n > DEF_FIFO_LENGTH) {
+                    status = STATUS_HF_ERR_STAT;
+                    n = 0;
+                } else {
+                    status = STATUS_HF_TAG_OK;
+                }
 
                 lastBits = read_register_single(Control522Reg) & 0x07;          // Finally receive the validity of the byte
 
-                if (lastBits) { *pOutLenBit = (n - 1) * 8 + lastBits; } // N -byte number minus 1 (last byte)+ the number of bits of the last bit The total number of data readings read
+                if (lastBits && n > 0) { *pOutLenBit = (n - 1) * 8 + lastBits; } // N -byte number minus 1 (last byte)+ the number of bits of the last bit The total number of data readings read
                 else { *pOutLenBit = n * 8; }                           // Finally received the entire bytes received by the byte valid
 
-                if (*pOutLenBit <= maxOutLenBit) {
+                if (status != STATUS_HF_ERR_STAT && *pOutLenBit <= maxOutLenBit) {
                     // Read all the data in FIFO
-                    read_register_buffer(FIFODataReg, pOut, n);
+                    if (n > 0) read_register_buffer(FIFODataReg, pOut, n);
                     // Transmission instructions can be considered success when reading normal data!
-                    status = STATUS_HF_TAG_OK;
+                    status = m_spi_failed ? STATUS_HF_ERR_STAT : STATUS_HF_TAG_OK;
                 } else {
                     NRF_LOG_INFO("pcd_14a_reader_bytes_transfer receive response overflow: %d, max = %d\n", *pOutLenBit, maxOutLenBit);
                     // We can't pass the problem with problems, which is meaningless for the time being
@@ -368,13 +443,14 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
                     // Since there is a problem with the data, let's notify the upper layer and inform me
                     status = STATUS_HF_ERR_STAT;
                 }
+                }
             } else {
                 // Non -transmitted instructions, the execution is completed without errors and considered success!
                 status = STATUS_HF_TAG_OK;
             }
         }
     } else {
-        status = STATUS_HF_TAG_NO;
+        status = m_spi_failed ? STATUS_HF_ERR_STAT : STATUS_HF_TAG_NO;
         // NRF_LOG_INFO("Tag lost(timeout).\n");
     }
 
@@ -385,6 +461,10 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
         clear_register_mask(Status2Reg, 0x08);
     }
 
+    if (!m_trace_inside_bits && m_trace_callback != NULL && pOutLenBit != NULL) {
+        m_trace_callback(false, *pOutLenBit > 0u ? pOut : NULL,
+                         *pOutLenBit, status);
+    }
     // NRF_LOG_INFO("Com status: %d\n", status);
     return status;
 }
@@ -405,42 +485,50 @@ uint8_t pcd_14a_reader_bits_transfer(uint8_t *pTx, uint16_t  szTxBits, uint8_t *
     static uint8_t buffer[DEF_FIFO_LENGTH];
     uint8_t status      = 0,
             modulus     = 0,
-            i           = 0,
             dataLen     = 0;
 
-    buffer[0] = pTx[0];
-    if (szTxBits > 8) {
-        // Determine that you need to be merged and you can check the data stream
-        if (pTxPar != NULL) {
-            // Several bytes need a few bites, so it will
-            // Data of BIT with more bytes of the number of bytes
-            modulus = dataLen = szTxBits / 8;
-            buffer[1] = (pTxPar[0] | (pTx[1] << 1));
-            for (i = 2; i < dataLen; i++) {
-                // add the remaining prev byte and parity
-                buffer[i] = ((pTxPar[i - 1] << (i - 1)) | (pTx[ i - 1] >> (9 - i)));
-                // add next byte and push i bits
-                buffer[i] |= (pTx[i] << i);
+    if (pTx == NULL || pRx == NULL || pRxLenBit == NULL || szTxBits == 0 ||
+            szRxLenBitMax == 0 || szRxLenBitMax > U8ARR_BIT_LEN(buffer)) {
+        return STATUS_PAR_ERR;
+    }
+    uint16_t tx_bytes = (szTxBits + 7u) / 8u;
+    uint16_t framed_bytes = tx_bytes + (pTxPar != NULL ? (tx_bytes + 7u) / 8u : 0u);
+    if (tx_bytes > DEF_FIFO_LENGTH || framed_bytes > sizeof(buffer)) {
+        return STATUS_PAR_ERR;
+    }
+    *pRxLenBit = 0;
+
+    memset(buffer, 0, sizeof(buffer));
+    if (pTxPar != NULL) {
+        if ((szTxBits & 7u) != 0) return STATUS_PAR_ERR;
+        uint16_t byte_count = szTxBits / 8u;
+        uint16_t framed_bits = byte_count * 9u;
+        dataLen = (uint8_t)((framed_bits + 7u) / 8u);
+        modulus = (uint8_t)(framed_bits & 7u);
+        for (uint16_t byte = 0; byte < byte_count; byte++) {
+            uint16_t dst = byte * 9u;
+            for (uint8_t bit = 0; bit < 8u; bit++) {
+                if ((pTx[byte] >> bit) & 1u) {
+                    buffer[(dst + bit) / 8u] |= 1u << ((dst + bit) & 7u);
+                }
             }
-            // add remainder of last byte + end parity
-            buffer[dataLen] = ((pTxPar[dataLen - 1] << (i - 1)) | (pTx[dataLen - 1] >> (9 - i)));
-            dataLen += 1;
-        } else {
-            modulus = szTxBits % 8;
-            dataLen = modulus > 0 ? (szTxBits / 8 + 1) : (szTxBits / 8);
-            // No need to merge the coupling school inspection, it is treated as the outside that has been done here.
-            for (i = 1; i < dataLen; i++) {
-                buffer[i] = pTx[i];
+            if (pTxPar[byte] & 1u) {
+                buffer[(dst + 8u) / 8u] |= 1u << ((dst + 8u) & 7u);
             }
         }
     } else {
-        dataLen = 1;
-        modulus = szTxBits;
+        modulus = (uint8_t)(szTxBits & 7u);
+        dataLen = (uint8_t)((szTxBits + 7u) / 8u);
+        memcpy(buffer, pTx, dataLen);
     }
 
     set_register_mask(BitFramingReg, modulus);  // Set the last byte transmission n bit
     set_register_mask(MfRxReg, 0x10);  // Need to close the puppet school test to enable
 
+    if (m_trace_callback != NULL && pTx != NULL && szTxBits > 0u) {
+        m_trace_callback(true, pTx, szTxBits, STATUS_HF_TAG_OK);
+    }
+    m_trace_inside_bits = true;
     status = pcd_14a_reader_bytes_transfer(
                  PCD_TRANSCEIVE,
                  buffer,
@@ -449,6 +537,7 @@ uint8_t pcd_14a_reader_bits_transfer(uint8_t *pTx, uint16_t  szTxBits, uint8_t *
                  pRxLenBit,              // The length of the received data, note that it is the length of the special stream
                  U8ARR_BIT_LEN(buffer)   // The upper limit of the data that can be collected
              );
+    m_trace_inside_bits = false;
 
     clear_register_mask(BitFramingReg, modulus);
     clear_register_mask(MfRxReg, 0x10);  // Enable Qiqi school inspection
@@ -456,37 +545,39 @@ uint8_t pcd_14a_reader_bits_transfer(uint8_t *pTx, uint16_t  szTxBits, uint8_t *
     // Simply judge the length of data transmission
     if (status != STATUS_HF_TAG_OK) {
         // NRF_LOG_INFO("pcd_14a_reader_bytes_transfer error status: %d\n", status);
+        if (m_trace_callback != NULL) m_trace_callback(false, NULL, 0, status);
         return status;
     }
 
-    pRx[0] = buffer[0];
-    modulus = 0;
-    if (*pRxLenBit > 8) {
-        // Take the remaining, wait for the statistical number of bytes
-        modulus  = *pRxLenBit % 8;
-        // Take the number of bytes, wait for the packaging
-        dataLen  = *pRxLenBit / 8 + (modulus > 0);
-        // Take the Special Number, this is the length of the final data
-        *pRxLenBit = *pRxLenBit - modulus;
-
-        // Determine whether the data decoding will overflow
-        if (*pRxLenBit > szRxLenBitMax) {
-            NRF_LOG_INFO("pcd_14a_reader_bits_transfer decode parity data overflow: %d, max = %d\n", *pRxLenBit, szRxLenBitMax);
-            // There must be an overflow here, and the length of the data that is valid is reset to avoid misjudgment from external calls.
+    uint16_t raw_bits = *pRxLenBit;
+    if (raw_bits <= 8u) {
+        pRx[0] = buffer[0];
+    } else {
+        uint16_t complete_groups = raw_bits / 9u;
+        uint16_t trailing_bits = raw_bits % 9u;
+        uint16_t decoded_bits = complete_groups * 8u +
+                                (trailing_bits > 8u ? 8u : trailing_bits);
+        if (decoded_bits > szRxLenBitMax) {
             *pRxLenBit = 0;
             return STATUS_HF_ERR_STAT;
         }
-
-        // The process of the separation and dissection process of the unprecedented verification and the data
-        for (i = 1; i < dataLen - 1; i++) {
-            if (pRxPar != NULL) {
-                pRxPar[i - 1] = (buffer[i] & (1 << (i - 1))) >> (i - 1);
+        memset(pRx, 0, (decoded_bits + 7u) / 8u);
+        for (uint16_t bit = 0; bit < decoded_bits; bit++) {
+            uint16_t src = (bit / 8u) * 9u + (bit & 7u);
+            if ((buffer[src / 8u] >> (src & 7u)) & 1u) {
+                pRx[bit / 8u] |= 1u << (bit & 7u);
             }
-            pRx[i] = (buffer[i] >> i) | (buffer[i + 1] << (8 - i));
         }
         if (pRxPar != NULL) {
-            pRxPar[i - 1] = (buffer[i] & (1 << (i - 1))) >> (i - 1);
+            for (uint16_t byte = 0; byte < complete_groups; byte++) {
+                uint16_t src = byte * 9u + 8u;
+                pRxPar[byte] = (buffer[src / 8u] >> (src & 7u)) & 1u;
+            }
         }
+        *pRxLenBit = decoded_bits;
+    }
+    if (m_trace_callback != NULL && pRx != NULL && *pRxLenBit > 0u) {
+        m_trace_callback(false, pRx, *pRxLenBit, STATUS_HF_TAG_OK);
     }
     return STATUS_HF_TAG_OK;
 }
@@ -510,6 +601,14 @@ uint8_t pcd_14a_reader_bytes_transfer_flags(uint8_t Command, uint8_t *pIn, uint8
     uint8_t pcd_err_val = 0;
     uint8_t not_timeout = 0;
 
+    if ((Command != PCD_AUTHENT && Command != PCD_TRANSCEIVE) ||
+            pIn == NULL || InLenByte == 0 || InLenByte > DEF_FIFO_LENGTH ||
+            (pOut != NULL && pOutLenBit == NULL)) {
+        return STATUS_PAR_ERR;
+    }
+    if (pOutLenBit != NULL) *pOutLenBit = 0;
+    m_spi_failed = false;
+
     switch (Command) {
         case PCD_AUTHENT:                       //  MiFare certification
             waitFor = 0x10;                     //  Query the free interrupt logo when the certification card is waiting
@@ -525,19 +624,12 @@ uint8_t pcd_14a_reader_bytes_transfer_flags(uint8_t Command, uint8_t *pIn, uint8
     set_register_mask(FIFOLevelReg,     0x80);          //  Write an empty order
 
     write_register_buffer(FIFODataReg, pIn, InLenByte); // Write data into FIFODATA
+    if (m_spi_failed) return STATUS_HF_ERR_STAT;
     write_register_single(CommandReg, Command);             // Write command
 
     if (Command == PCD_TRANSCEIVE) {
         set_register_mask(BitFramingReg, 0x80);     // StartSend places to start the data to send this bit and send and receive commands when it is valid
     }
-
-    if (pOut == NULL) {
-        // If the developer does not need to receive data, then return directly after the sending!
-        while ((read_register_single(Status2Reg) & 0x07) == 0x03);
-        return STATUS_HF_TAG_OK;
-    }
-    // Reset the length of the received data
-    *pOutLenBit         = 0;
 
     bsp_set_timer(g_timeout_auto_timer, 0);         // Before starting the operation, return to zero over time counting
 
@@ -545,6 +637,7 @@ uint8_t pcd_14a_reader_bytes_transfer_flags(uint8_t Command, uint8_t *pIn, uint8
         n = read_register_single(ComIrqReg);                // Read the communication interrupt register to determine whether the current IO task is completed!
         not_timeout = NO_TIMEOUT_1MS(g_timeout_auto_timer, g_com_timeout_ms);
     } while (not_timeout && (!(n & waitFor)));  // Exit conditions: timeout interruption, interrupt with empty command commands
+    if (m_spi_failed) not_timeout = 0;
     // NRF_LOG_INFO("N = %02x\n", n);
 
     if (Command == PCD_TRANSCEIVE) {
@@ -585,19 +678,27 @@ uint8_t pcd_14a_reader_bytes_transfer_flags(uint8_t Command, uint8_t *pIn, uint8
             // Occasionally occur
             // NRF_LOG_INFO("COM OK\n");
             if (Command == PCD_TRANSCEIVE) {
+                if (pOut == NULL) {
+                    status = STATUS_HF_TAG_OK;
+                } else {
                 n = read_register_single(FIFOLevelReg);                             // Read the number of bytes saved in FIFO
-                if (n == 0) { n = 1; }
+                if (n > DEF_FIFO_LENGTH) {
+                    status = STATUS_HF_ERR_STAT;
+                    n = 0;
+                } else {
+                    status = STATUS_HF_TAG_OK;
+                }
 
                 lastBits = read_register_single(Control522Reg) & 0x07;          // Finally receive the validity of the byte
 
-                if (lastBits) { *pOutLenBit = (n - 1) * 8 + lastBits; } // N -byte number minus 1 (last byte)+ the number of bits of the last bit The total number of data readings read
+                if (lastBits && n > 0) { *pOutLenBit = (n - 1) * 8 + lastBits; } // N -byte number minus 1 (last byte)+ the number of bits of the last bit The total number of data readings read
                 else { *pOutLenBit = n * 8; }                           // Finally received the entire bytes received by the byte valid
 
-                if (*pOutLenBit <= maxOutLenBit) {
+                if (status != STATUS_HF_ERR_STAT && *pOutLenBit <= maxOutLenBit) {
                     // Read all the data in FIFO
-                    read_register_buffer(FIFODataReg, pOut, n);
+                    if (n > 0) read_register_buffer(FIFODataReg, pOut, n);
                     // Transmission instructions can be considered success when reading normal data!
-                    status = STATUS_HF_TAG_OK;
+                    status = m_spi_failed ? STATUS_HF_ERR_STAT : STATUS_HF_TAG_OK;
                 } else {
                     NRF_LOG_INFO("pcd_14a_reader_bytes_transfer receive response overflow: %d, max = %d\n", *pOutLenBit, maxOutLenBit);
                     // We can't pass the problem with problems, which is meaningless for the time being
@@ -605,13 +706,14 @@ uint8_t pcd_14a_reader_bytes_transfer_flags(uint8_t Command, uint8_t *pIn, uint8
                     // Since there is a problem with the data, let's notify the upper layer and inform me
                     status = STATUS_HF_ERR_STAT;
                 }
+                }
             } else {
                 // Non -transmitted instructions, the execution is completed without errors and considered success!
                 status = STATUS_HF_TAG_OK;
             }
         }
     } else {
-        status = STATUS_HF_TAG_NO;
+        status = m_spi_failed ? STATUS_HF_ERR_STAT : STATUS_HF_TAG_NO;
         // NRF_LOG_INFO("Tag lost(timeout).\n");
     }
 
@@ -636,6 +738,11 @@ uint8_t pcd_14a_reader_fast_select(picc_14a_tag_t *tag) {
     uint8_t status = STATUS_HF_TAG_OK;
     uint8_t cascade_level = 0;
     uint16_t dat_len;
+
+    if (tag == NULL || tag->cascade == 0 || tag->cascade > 3 ||
+            tag->uid_len > sizeof(tag->uid)) {
+        return STATUS_PAR_ERR;
+    }
 
     // Wakeup
     if (pcd_14a_reader_atqa_request(dat_buff, NULL, U8ARR_BIT_LEN(dat_buff)) != STATUS_HF_TAG_OK) {
@@ -663,7 +770,10 @@ uint8_t pcd_14a_reader_fast_select(picc_14a_tag_t *tag) {
         crc_14a_append(dat_buff, 7);                                      // calculate and add CRC
         status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, dat_buff, sizeof(dat_buff), dat_buff, &dat_len, U8ARR_BIT_LEN(dat_buff));
         // Receive the SAK
-        if (status != STATUS_HF_TAG_OK || !dat_len) {
+        uint8_t sak_crc[2];
+        crc_14a_calculate(dat_buff, 1, sak_crc);
+        if (status != STATUS_HF_TAG_OK || dat_len != 24 ||
+                dat_buff[1] != sak_crc[0] || dat_buff[2] != sak_crc[1]) {
             // printf("SAK Err: %d, %d\r\n", status, dat_len);
             return STATUS_HF_TAG_NO;
         }
@@ -725,6 +835,8 @@ uint8_t pcd_14a_reader_scan_once(picc_14a_tag_t *tag) {
             // So do not solve the collision for the time being, but directly inform the user that the user guarantees that there is only one card in the field
             NRF_LOG_INFO("Err at tag collision.\n");
             return status;
+        } else if (len != 40) {
+            return STATUS_HF_ERR_STAT;
         } else {  // no collision, use the response to SELECT_ALL as current uid
             memcpy(uid_resp, resp, 5); // UID + original BCC
         }
@@ -754,7 +866,10 @@ uint8_t pcd_14a_reader_scan_once(picc_14a_tag_t *tag) {
 
         // send 9x 70 Choose a card
         status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, sel_uid, sizeof(sel_uid), resp, &len, U8ARR_BIT_LEN(resp));
-        if (status != STATUS_HF_TAG_OK) {
+        uint8_t sak_crc[2];
+        crc_14a_calculate(resp, 1, sak_crc);
+        if (status != STATUS_HF_TAG_OK || len != 24 ||
+                resp[1] != sak_crc[0] || resp[2] != sak_crc[1]) {
             NRF_LOG_INFO("Err at sak receive.\n");
             return STATUS_HF_ERR_STAT;
         }
@@ -1265,6 +1380,12 @@ void pcd_14a_reader_fast_halt_tag(void) {
 void pcd_14a_reader_calc_crc(uint8_t *pbtData, size_t szLen, uint8_t *pbtCrc) {
     uint8_t i, n;
 
+    if (pbtCrc == NULL) return;
+    pbtCrc[0] = 0;
+    pbtCrc[1] = 0;
+    if (pbtData == NULL || szLen == 0 || szLen > DEF_FIFO_LENGTH) return;
+    m_spi_failed = false;
+
     // Reset state machine
     clear_register_mask(Status1Reg, 0x20);
     write_register_single(CommandReg, PCD_IDLE);
@@ -1280,6 +1401,8 @@ void pcd_14a_reader_calc_crc(uint8_t *pbtData, size_t szLen, uint8_t *pbtCrc) {
         n = read_register_single(Status1Reg);
         i--;
     } while ((i != 0) && !(n & 0x20));
+
+    if (m_spi_failed || !(n & 0x20)) return;
 
     // Get the final calculated CRC data
     pbtCrc[0] = read_register_single(CRCResultRegL);
@@ -1359,6 +1482,7 @@ uint8_t cascade_to_cmd(uint8_t cascade) {
 *
 */
 uint8_t *get_4byte_tag_uid(picc_14a_tag_t *tag, uint8_t *pUid) {
+    if (tag == NULL) return NULL;
     uint8_t *p_TmpUid = NULL;
     switch (tag->cascade) {
         case 1:
@@ -1373,7 +1497,7 @@ uint8_t *get_4byte_tag_uid(picc_14a_tag_t *tag, uint8_t *pUid) {
             p_TmpUid = tag->uid + 6;
             break;
     }
-    if (pUid != NULL) {
+    if (pUid != NULL && p_TmpUid != NULL) {
         memcpy(pUid, p_TmpUid, 4);
     }
     return p_TmpUid;
@@ -1391,7 +1515,7 @@ uint8_t *get_4byte_tag_uid(picc_14a_tag_t *tag, uint8_t *pUid) {
 uint32_t get_u32_tag_uid(picc_14a_tag_t *tag) {
     uint8_t uid_buf[4] = { 0x00 };
     // Directly call the encapsulated function copy the target value
-    get_4byte_tag_uid(tag, uid_buf);
+    if (get_4byte_tag_uid(tag, uid_buf) == NULL) return 0;
     return bytes_to_num(uid_buf, 4);
 }
 
@@ -1463,6 +1587,12 @@ inline void pcd_14a_reader_crc_computer(uint8_t use522CalcCRC) {
 */
 uint8_t pcd_14a_reader_raw_cmd(bool openRFField,  bool waitResp, bool appendCrc, bool autoSelect, bool keepField, bool checkCrc, uint16_t waitRespTimeout,
                                uint16_t szDataSendBits, uint8_t *pDataSend, uint8_t *pDataRecv, uint16_t *pszDataRecv, uint16_t szDataRecvBitMax) {
+    if (pszDataRecv == NULL || (szDataSendBits != 0 && pDataSend == NULL) ||
+            (waitResp && (pDataRecv == NULL || szDataRecvBitMax == 0)) ||
+            szDataSendBits > DEF_FIFO_LENGTH * 8u) {
+        return STATUS_PAR_ERR;
+    }
+
     // Status code, default is OK.
     uint8_t status = STATUS_HF_TAG_OK;
     // Reset recv length.

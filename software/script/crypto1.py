@@ -57,7 +57,7 @@ class Crypto1:
         self.lfsr48 = new_lfsr48
 
     @property
-    def key(self) -> bytearray:
+    def key(self) -> str:
         tmp, key = self.lfsr48, bytearray(6)
         for i in range(6):
             key[i] = tmp & 0xFF

@@ -17,17 +17,18 @@ NRF_LOG_MODULE_REGISTER();
 
 /*
  * Circular buffer for SAADC samples.
- * Increased from 128 to 512 to reduce overrun risk during USB transfer.
- * The main loop drains it as fast as possible into the output buffer.
+ * One SAADC completion contains 2048 samples. The queue must hold complete
+ * callback batches or every callback creates a discontinuity.
  */
-#define CIRCULAR_BUFFER_SIZE (512)
+#define CIRCULAR_BUFFER_SIZE (6144)
 static circular_buffer cb;
+static nrf_saadc_value_t m_sample_storage[CIRCULAR_BUFFER_SIZE + 1];
 
 static void saadc_cb(nrf_saadc_value_t *vals, size_t size) {
     for (int i = 0; i < size; i++) {
         nrf_saadc_value_t val = vals[i];
         if (!cb_push_back(&cb, &val)) {
-            return;  /* buffer full — oldest samples dropped */
+            return;
         }
     }
 }
@@ -41,9 +42,14 @@ static void uninit_saadc_hw(void) {
 }
 
 bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_t *outlen) {
+    if (data == NULL || outlen == NULL || maxlen == 0) {
+        return false;
+    }
     *outlen = 0;
-
-    cb_init(&cb, CIRCULAR_BUFFER_SIZE, sizeof(uint16_t));
+    if (!cb_init_static(&cb, m_sample_storage, CIRCULAR_BUFFER_SIZE,
+                        sizeof(nrf_saadc_value_t))) {
+        return false;
+    }
     init_saadc_hw();
     start_lf_125khz_radio();
 
@@ -54,10 +60,10 @@ bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_
 
     autotimer *p_at = bsp_obtain_timer(0);
     while (NO_TIMEOUT_1MS(p_at, timeout_ms) && *outlen < maxlen) {
-        uint16_t val = 0;
+        nrf_saadc_value_t val = 0;
         while (cb_pop_front(&cb, &val) && *outlen < maxlen) {
-            val = val >> 5;  /* 14-bit ADC → 9-bit, then >>5 gives 8-bit */
-            data[*outlen] = val > 0xff ? 0xff : (uint8_t)val;
+            int32_t scaled = val > 0 ? ((int32_t)val >> 5) : 0;
+            data[*outlen] = scaled > 0xff ? 0xff : (uint8_t)scaled;
             ++(*outlen);
         }
         bsp_wdt_feed();  /* prevent watchdog reset during long captures */
@@ -66,7 +72,8 @@ bool raw_read_to_buffer(uint8_t *data, size_t maxlen, uint32_t timeout_ms, size_
     bsp_return_timer(p_at);
     stop_lf_125khz_radio();
     uninit_saadc_hw();
+    bool complete = cb_dropped(&cb) == 0;
     cb_free(&cb);
 
-    return true;
+    return complete;
 }

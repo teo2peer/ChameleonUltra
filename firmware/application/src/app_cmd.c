@@ -4,12 +4,12 @@
 #include "usb_main.h"
 #include "rfid_main.h"
 #include "ble_main.h"
-#include "ble_central.h"
 #include "rgb_marquee.h"
 #include "syssleep.h"
 #include "hex_utils.h"
 #include "data_cmd.h"
 #include "app_cmd.h"
+#include "app_cmd_ble.h"
 #include "app_status.h"
 #include "tag_persistence.h"
 #include "nrf_pwr_mgmt.h"
@@ -21,6 +21,8 @@
 #include "lf_reader_generic.h"
 #include "lf_em4x05_data.h"
 #include "rc522.h"
+#include "iso_dep_reader.h"
+#include "emv_trace.h"
 #include "mf1_crapto1.h"
 #include "parity.h"
 #endif
@@ -45,6 +47,36 @@ static void change_slot_auto(uint8_t slot_new) {
     device_mode_t mode = get_device_mode();
     tag_emulation_change_slot(slot_new, mode != DEVICE_MODE_READER);
     apply_slot_change(slot_now, slot_new);
+}
+
+typedef struct {
+    uint8_t uid_len;
+    uint16_t uid_offset;
+    uint16_t atqa_offset;
+    uint16_t sak_offset;
+    uint16_t ats_offset;
+    uint8_t ats_len;
+} cmd_hf14a_anticoll_t;
+
+static bool cmd_parse_hf14a_anticoll(uint16_t length, const uint8_t *data,
+                                     cmd_hf14a_anticoll_t *parsed) {
+    if (length < 5u || data == NULL || !is_valid_uid_size(data[0])) return false;
+
+    uint8_t uid_len = data[0];
+    uint16_t ats_len_offset = 1u + uid_len + 2u + 1u;
+    if (ats_len_offset >= length) return false;
+
+    uint8_t ats_len = data[ats_len_offset];
+    uint16_t expected = ats_len_offset + 1u + ats_len;
+    if (length != expected) return false;
+
+    parsed->uid_len = uid_len;
+    parsed->uid_offset = 1u;
+    parsed->atqa_offset = 1u + uid_len;
+    parsed->sak_offset = parsed->atqa_offset + 2u;
+    parsed->ats_offset = ats_len_offset + 1u;
+    parsed->ats_len = ats_len;
+    return true;
 }
 
 static data_frame_tx_t *cmd_processor_get_app_version(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -95,6 +127,9 @@ static data_frame_tx_t *cmd_processor_get_device_mode(uint16_t cmd, uint16_t sta
 }
 
 static data_frame_tx_t *cmd_processor_enter_bootloader(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     // restart to boot
 #define BOOTLOADER_DFU_GPREGRET_MASK            (0xB0)
 #define BOOTLOADER_DFU_START_BIT_MASK           (0x01)
@@ -134,11 +169,13 @@ static data_frame_tx_t *cmd_processor_get_device_address(uint16_t cmd, uint16_t 
 }
 
 static data_frame_tx_t *cmd_processor_save_settings(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     status = settings_save_config();
     return data_frame_make(cmd, status, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_reset_settings(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     settings_init_config();
     status = settings_save_config();
     return data_frame_make(cmd, status, 0, NULL);
@@ -248,7 +285,7 @@ static data_frame_tx_t *cmd_processor_hf14a_scan(uint16_t cmd, uint16_t status, 
     }
     // uidlen[1]|uid[uidlen]|atqa[2]|sak[1]|atslen[1]|ats[atslen]
     // dynamic length, so no struct
-    uint8_t payload[1 + sizeof(taginfo.uid) + sizeof(taginfo.atqa) + sizeof(taginfo.sak) + 1 + 254];
+    uint8_t payload[1 + sizeof(taginfo.uid) + sizeof(taginfo.atqa) + sizeof(taginfo.sak) + 1 + sizeof(taginfo.ats)];
     uint16_t offset = 0;
     payload[offset++] = taginfo.uid_len;
     memcpy(&payload[offset], taginfo.uid, taginfo.uid_len);
@@ -371,17 +408,28 @@ static data_frame_tx_t *cmd_processor_mf1_enc_nested_acquire(uint16_t cmd, uint1
     }
 
     payload_t *payload = (payload_t *)data;
+    if (payload->sector_count == 0u || payload->sector_count > 40u ||
+            payload->starting_sector >= payload->sector_count) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
 
     uint64_t ui64Key = bytes_to_num(payload->key, 6);
-    uint8_t sector_data[40][sizeof(mf1_static_nonce_sector_t)];
+    uint8_t sector_data[40][sizeof(mf1_static_nonce_sector_t)] = {0};
     uint8_t sectors_acquired = 0;
     uint32_t cuid = 0;
 
     status = mf1_static_encrypted_nonces_acquire(ui64Key, payload->sector_count, payload->starting_sector, sector_data, &sectors_acquired, &cuid);
 
-    uint8_t response_data[sizeof(uint32_t) + sectors_acquired * sizeof(mf1_static_nonce_sector_t)];
+    if (sectors_acquired > (uint8_t)(40u - payload->starting_sector)) {
+        return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+    }
+
+    uint8_t response_data[sizeof(uint32_t) + 40u * sizeof(mf1_static_nonce_sector_t)] = {0};
     num_to_bytes(cuid, 4, response_data);
-    memcpy(response_data + sizeof(uint32_t), sector_data, sectors_acquired * sizeof(mf1_static_nonce_sector_t));
+    for (uint8_t i = 0; i < sectors_acquired; i++) {
+        memcpy(response_data + sizeof(uint32_t) + i * sizeof(mf1_static_nonce_sector_t),
+               sector_data[payload->starting_sector + i], sizeof(mf1_static_nonce_sector_t));
+    }
 
     return data_frame_make(cmd, status, sectors_acquired * sizeof(mf1_static_nonce_sector_t) + sizeof(uint32_t), response_data);
 }
@@ -403,14 +451,15 @@ static data_frame_tx_t *cmd_processor_mf1_auth_one_key_block(uint16_t cmd, uint1
 }
 
 static data_frame_tx_t *cmd_processor_mf1_check_keys_of_sectors(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length < 16 || (length - 10) % 6 != 0) {
+    uint8_t key_count;
+    if (!cmd_parse_count_u8(length, 10u, sizeof(mf1_key_t), &key_count)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
     // init
     mf1_toolbox_check_keys_of_sectors_in_t in = {
         .mask = *(mf1_toolbox_check_keys_of_sectors_mask_t *) &data[0],
-        .keys_len = (length - 10) / 6,
+        .keys_len = key_count,
         .keys = (mf1_key_t *) &data[10]
     };
     mf1_toolbox_check_keys_of_sectors_out_t out;
@@ -520,6 +569,14 @@ static data_frame_tx_t *cmd_processor_mf1_read_blocks(uint16_t cmd, uint16_t sta
     if (payload->count == 0 || payload->count > 16) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
+    uint16_t end_block = (uint16_t)payload->block + payload->count - 1u;
+    uint8_t start_sector = payload->block < 128u ? payload->block / 4u :
+                           32u + (payload->block - 128u) / 16u;
+    uint8_t end_sector = end_block < 128u ? end_block / 4u :
+                         32u + (end_block - 128u) / 16u;
+    if (end_block >= NFC_TAG_MF1_BLOCK_MAX || start_sector != end_sector) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     status = auth_key_use_522_hw(payload->block, payload->type, payload->key);
     if (status != STATUS_HF_TAG_OK) {
         return data_frame_make(cmd, status, 0, NULL);
@@ -560,6 +617,7 @@ static data_frame_tx_t *cmd_processor_mf1_write_one_block(uint16_t cmd, uint16_t
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
 static data_frame_tx_t *cmd_processor_hf14a_set_field_on(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     device_mode_t mode = get_device_mode();
     if (mode != DEVICE_MODE_READER) {
         return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
@@ -573,6 +631,7 @@ static data_frame_tx_t *cmd_processor_hf14a_set_field_on(uint16_t cmd, uint16_t 
 }
 
 static data_frame_tx_t *cmd_processor_hf14a_set_field_off(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     device_mode_t mode = get_device_mode();
     if (mode != DEVICE_MODE_READER) {
         return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
@@ -591,49 +650,41 @@ static data_frame_tx_t *cmd_processor_hf14a_raw(uint16_t cmd, uint16_t status, u
     uint8_t resp[DEF_FIFO_LENGTH] = { 0x00 };
     uint16_t resp_length = 0;
 
-    typedef struct {
-        struct { // LSB -> MSB
-            uint8_t reserved : 2;
-
-            uint8_t check_response_crc : 1;
-            uint8_t keep_rf_field : 1;
-            uint8_t auto_select : 1;
-            uint8_t append_crc : 1;
-            uint8_t wait_response : 1;
-            uint8_t activate_rf_field : 1;
-        } options;
-
-        // U16NTOHS
-        uint16_t resp_timeout;
-        uint16_t data_bitlength;
-
-        uint8_t data_buffer[0]; // We can have a lot of data or no data. struct just to compute offsets with min options.
-    } PACKED payload_t;
-    payload_t *payload = (payload_t *)data;
-    if (length < sizeof(payload_t)) {
+    enum { RAW_HEADER_LENGTH = 5 };
+    if (length < RAW_HEADER_LENGTH || data == NULL || (data[0] & 0x03u) != 0u) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
-    NRF_LOG_INFO("activate_rf_field  = %d", payload->options.activate_rf_field);
-    NRF_LOG_INFO("wait_response      = %d", payload->options.wait_response);
-    NRF_LOG_INFO("append_crc         = %d", payload->options.append_crc);
-    NRF_LOG_INFO("auto_select        = %d", payload->options.auto_select);
-    NRF_LOG_INFO("keep_rf_field      = %d", payload->options.keep_rf_field);
-    NRF_LOG_INFO("check_response_crc = %d", payload->options.check_response_crc);
-    NRF_LOG_INFO("reserved           = %d", payload->options.reserved);
+    uint8_t options = data[0];
+    bool check_response_crc = (options & 0x04u) != 0u;
+    bool keep_rf_field = (options & 0x08u) != 0u;
+    bool auto_select = (options & 0x10u) != 0u;
+    bool append_crc = (options & 0x20u) != 0u;
+    bool wait_response = (options & 0x40u) != 0u;
+    bool activate_rf_field = (options & 0x80u) != 0u;
+    uint16_t resp_timeout = cmd_read_u16be(&data[1]);
+    uint16_t data_bitlength = cmd_read_u16be(&data[3]);
+    uint16_t data_bytes = (data_bitlength + 7u) / 8u;
+    uint16_t max_data_bytes = DEF_FIFO_LENGTH - (append_crc ? DEF_CRC_LENGTH : 0u);
+    if (data_bytes > max_data_bytes || length != RAW_HEADER_LENGTH + data_bytes ||
+            (append_crc && (data_bitlength == 0u || (data_bitlength & 7u) != 0u))) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    uint8_t tx[DEF_FIFO_LENGTH] = {0};
+    if (data_bytes > 0u) memcpy(tx, &data[RAW_HEADER_LENGTH], data_bytes);
+
+    NRF_LOG_INFO("activate_rf_field  = %d", activate_rf_field);
+    NRF_LOG_INFO("wait_response      = %d", wait_response);
+    NRF_LOG_INFO("append_crc         = %d", append_crc);
+    NRF_LOG_INFO("auto_select        = %d", auto_select);
+    NRF_LOG_INFO("keep_rf_field      = %d", keep_rf_field);
+    NRF_LOG_INFO("check_response_crc = %d", check_response_crc);
 
     status = pcd_14a_reader_raw_cmd(
-                 payload->options.activate_rf_field,
-                 payload->options.wait_response,
-                 payload->options.append_crc,
-                 payload->options.auto_select,
-                 payload->options.keep_rf_field,
-                 payload->options.check_response_crc,
-
-                 U16NTOHS(payload->resp_timeout),
-
-                 U16NTOHS(payload->data_bitlength),
-                 payload->data_buffer,
+                 activate_rf_field, wait_response, append_crc, auto_select,
+                 keep_rf_field, check_response_crc, resp_timeout,
+                 data_bitlength, tx,
 
                  resp,
                  &resp_length,
@@ -688,7 +739,9 @@ static data_frame_tx_t *cmd_processor_mf1_manipulate_value_block(uint16_t cmd, u
     }
 
     // value block operation
-    status = pcd_14a_reader_mf1_manipulate_value_block(payload->operator, payload->src_block, (int32_t) U32NTOHL(payload->operand));
+    int32_t operand = (int32_t)cmd_read_u32be(&data[offsetof(payload_t, operand)]);
+    status = pcd_14a_reader_mf1_manipulate_value_block(payload->operator,
+                                                       payload->src_block, operand);
     if (status != STATUS_HF_TAG_OK) {
         return data_frame_make(cmd, status, 0, NULL);
     }
@@ -730,11 +783,14 @@ static data_frame_tx_t *cmd_processor_em410x_write_to_t55xx(uint16_t cmd, uint16
         uint8_t old_keys[4]; // we can have more than one... struct just to compute offsets with min 1 key
     } PACKED payload_t;
     payload_t *payload = (payload_t *)data;
-    if (length < sizeof(payload_t) || (length - offsetof(payload_t, old_keys)) % sizeof(payload->old_keys) != 0) {
+    uint8_t old_key_count;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, old_keys),
+                            sizeof(payload->old_keys), &old_key_count)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
-    status = write_em410x_to_t55xx(payload->id, payload->new_key, payload->old_keys, (length - offsetof(payload_t, old_keys)) / sizeof(payload->old_keys));
+    status = write_em410x_to_t55xx(payload->id, payload->new_key,
+                                   payload->old_keys, old_key_count);
     return data_frame_make(cmd, status, 0, NULL);
 }
 
@@ -745,11 +801,14 @@ static data_frame_tx_t *cmd_processor_em410x_electra_write_to_t55xx(uint16_t cmd
         uint8_t old_keys[4]; // we can have more than one... struct just to compute offsets with min 1 key
     } PACKED payload_t;
     payload_t *payload = (payload_t *)data;
-    if (length < sizeof(payload_t) || (length - offsetof(payload_t, old_keys)) % sizeof(payload->old_keys) != 0) {
+    uint8_t old_key_count;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, old_keys),
+                            sizeof(payload->old_keys), &old_key_count)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
-    status = write_em410x_electra_to_t55xx(payload->id, payload->new_key, payload->old_keys, (length - offsetof(payload_t, old_keys)) / sizeof(payload->old_keys));
+    status = write_em410x_electra_to_t55xx(payload->id, payload->new_key,
+                                           payload->old_keys, old_key_count);
     return data_frame_make(cmd, status, 0, NULL);
 }
 
@@ -760,7 +819,9 @@ static data_frame_tx_t *cmd_processor_hidprox_write_to_t55xx(uint16_t cmd, uint1
         uint8_t new_keys[4]; // we can have more than one... struct just to compute offsets with min 1 key
     } PACKED payload_t;
     payload_t *payload = (payload_t *)data;
-    if (length < sizeof(payload_t) || (length - offsetof(payload_t, new_keys)) % sizeof(payload->new_keys) != 0) {
+    uint8_t new_key_count;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, new_keys),
+                            sizeof(payload->new_keys), &new_key_count)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
@@ -770,13 +831,18 @@ static data_frame_tx_t *cmd_processor_hidprox_write_to_t55xx(uint16_t cmd, uint1
     cn = (cn << 32) | (bytes_to_num(payload->id + 6, 4));
     uint32_t il = payload->id[10];
     uint32_t oem = bytes_to_num(payload->id + 11, 2);
-    status = write_hidprox_to_t55xx(format, fc, cn, il, oem, payload->old_key, payload->new_keys, (length - offsetof(payload_t, new_keys)) / sizeof(payload->new_keys));
+    status = write_hidprox_to_t55xx(format, fc, cn, il, oem,
+                                    payload->old_key, payload->new_keys, new_key_count);
     return data_frame_make(cmd, status, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_hidprox_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length > 1u || (length == 1u && data == NULL)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     uint8_t card_data[16] = {0x00};
-    status = scan_hidprox(card_data, data[0]);
+    uint8_t format_hint = length == 1u ? data[0] : 0u;
+    status = scan_hidprox(card_data, format_hint);
     if (status != STATUS_LF_TAG_OK) {
         return data_frame_make(cmd, status, 0, NULL);
     }
@@ -803,13 +869,11 @@ static data_frame_tx_t *cmd_processor_ioprox_write_to_t55xx(uint16_t cmd, uint16
 
     payload_t *payload = (payload_t *)data;
 
-    // Validate packet length
-    if (length < sizeof(payload_t) ||
-            (length - offsetof(payload_t, old_keys)) % sizeof(payload->old_keys) != 0) {
+    uint8_t old_cnt;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, old_keys),
+                            sizeof(payload->old_keys), &old_cnt)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-
-    uint8_t old_cnt = (length - offsetof(payload_t, old_keys)) / sizeof(payload->old_keys);
 
     // Pass card_data (including raw8 at index 4-11) directly to the T55xx writer.
     status = write_ioprox_to_t55xx(
@@ -889,11 +953,14 @@ static data_frame_tx_t *cmd_processor_viking_write_to_t55xx(uint16_t cmd, uint16
         uint8_t old_keys[4]; // we can have more than one... struct just to compute offsets with min 1 key
     } PACKED payload_t;
     payload_t *payload = (payload_t *)data;
-    if (length < sizeof(payload_t) || (length - offsetof(payload_t, old_keys)) % sizeof(payload->old_keys) != 0) {
+    uint8_t old_key_count;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, old_keys),
+                            sizeof(payload->old_keys), &old_key_count)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
-    status = write_viking_to_t55xx(payload->id, payload->new_key, payload->old_keys, (length - offsetof(payload_t, old_keys)) / sizeof(payload->old_keys));
+    status = write_viking_to_t55xx(payload->id, payload->new_key,
+                                   payload->old_keys, old_key_count);
     return data_frame_make(cmd, status, 0, NULL);
 }
 
@@ -905,10 +972,13 @@ static data_frame_tx_t *cmd_processor_pac_write_to_t55xx(uint16_t cmd, uint16_t 
         uint8_t old_keys[4];
     } PACKED payload_t;
     payload_t *payload = (payload_t *)data;
-    if (length < sizeof(payload_t) || (length - offsetof(payload_t, old_keys)) % sizeof(payload->old_keys) != 0) {
+    uint8_t old_key_count;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, old_keys),
+                            sizeof(payload->old_keys), &old_key_count)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    status = write_pac_to_t55xx(payload->id, payload->new_key, payload->old_keys, (length - offsetof(payload_t, old_keys)) / sizeof(payload->old_keys));
+    status = write_pac_to_t55xx(payload->id, payload->new_key,
+                               payload->old_keys, old_key_count);
     return data_frame_make(cmd, status, 0, NULL);
 }
 
@@ -928,10 +998,13 @@ static data_frame_tx_t *cmd_processor_jablotron_write_to_t55xx(uint16_t cmd, uin
         uint8_t old_keys[4];
     } PACKED payload_t;
     payload_t *payload = (payload_t *)data;
-    if (length < sizeof(payload_t) || (length - offsetof(payload_t, old_keys)) % sizeof(payload->old_keys) != 0) {
+    uint8_t old_key_count;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, old_keys),
+                            sizeof(payload->old_keys), &old_key_count)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    status = write_jablotron_to_t55xx(payload->id, payload->new_key, payload->old_keys, (length - offsetof(payload_t, old_keys)) / sizeof(payload->old_keys));
+    status = write_jablotron_to_t55xx(payload->id, payload->new_key,
+                                      payload->old_keys, old_key_count);
     return data_frame_make(cmd, status, 0, NULL);
 }
 
@@ -944,13 +1017,17 @@ static data_frame_tx_t *cmd_processor_lf_t55xx_write(uint16_t cmd, uint16_t stat
         uint8_t page1;    /* 1 = target page 1, 0 = page 0 */
     } PACKED payload_t;
 
-    if (length < sizeof(payload_t)) {
+    if (!cmd_payload_exact(length, data, sizeof(payload_t))) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
     payload_t *p = (payload_t *)data;
 
-    bool    page1     = (bool)p->page1;
+    bool page1;
+    bool use_pwd;
+    if (!cmd_parse_bool(p->page1, &page1) || !cmd_parse_bool(p->use_pwd, &use_pwd)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     uint8_t max_block = page1 ? 3u : 7u;
 
     if (p->block > max_block) {
@@ -959,7 +1036,6 @@ static data_frame_tx_t *cmd_processor_lf_t55xx_write(uint16_t cmd, uint16_t stat
 
     uint32_t word    = bytes_to_num(p->word, 4);
     uint32_t passwd  = bytes_to_num(p->pwd,  4);
-    bool     use_pwd = (bool)p->use_pwd;
 
     status = lf_t55xx_write_block(p->block, word, passwd, use_pwd, page1);
     return data_frame_make(cmd, status, 0, NULL);
@@ -1085,6 +1161,7 @@ static data_frame_tx_t *cmd_processor_set_slot_enable(uint16_t cmd, uint16_t sta
 }
 
 static data_frame_tx_t *cmd_processor_slot_data_config_save(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     tag_emulation_save();
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
@@ -1111,6 +1188,7 @@ static data_frame_tx_t *cmd_processor_get_slot_info(uint16_t cmd, uint16_t statu
 }
 
 static data_frame_tx_t *cmd_processor_wipe_fds(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     bool success = fds_wipe();
     status = success ? STATUS_SUCCESS : STATUS_FLASH_WRITE_FAIL;
     delayed_reset(50);
@@ -1128,16 +1206,41 @@ static bool get_active_em410x_type(tag_specific_type_t *tag_type_out, uint16_t *
     return false;
 }
 
+static data_frame_tx_t *set_lf_emulator_id(uint16_t cmd, tag_specific_type_t tag_type,
+                                            uint16_t expected_length, uint16_t length,
+                                            const uint8_t *data) {
+    tag_slot_specific_type_t tag_types;
+    tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
+    if (tag_types.tag_lf != tag_type) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    if (!cmd_payload_exact(length, data, expected_length)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    tag_data_buffer_t *buffer = get_buffer_by_tag_type(tag_type);
+    if (buffer == NULL || buffer->buffer == NULL || buffer->length > 20u ||
+            expected_length > buffer->length) {
+        return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
+    }
+    uint8_t previous[20];
+    memcpy(previous, buffer->buffer, buffer->length);
+    memcpy(buffer->buffer, data, expected_length);
+    if (!tag_emulation_load_by_buffer(tag_type, false)) {
+        memcpy(buffer->buffer, previous, buffer->length);
+        (void)tag_emulation_load_by_buffer(tag_type, false);
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 static data_frame_tx_t *cmd_processor_em410x_set_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     tag_specific_type_t tag_type;
     uint16_t id_size;
     if (!get_active_em410x_type(&tag_type, &id_size) || length != id_size) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(tag_type);
-    memcpy(buffer->buffer, data, id_size);
-    tag_emulation_load_by_buffer(tag_type, false);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    return set_lf_emulator_id(cmd, tag_type, id_size, length, data);
 }
 
 static data_frame_tx_t *cmd_processor_em410x_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1155,13 +1258,8 @@ static data_frame_tx_t *cmd_processor_em410x_get_emu_id(uint16_t cmd, uint16_t s
 }
 
 static data_frame_tx_t *cmd_processor_hidprox_set_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != LF_HIDPROX_TAG_ID_SIZE) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_HID_PROX);
-    memcpy(buffer->buffer, data, LF_HIDPROX_TAG_ID_SIZE);
-    tag_emulation_load_by_buffer(TAG_TYPE_HID_PROX, false);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    return set_lf_emulator_id(cmd, TAG_TYPE_HID_PROX, LF_HIDPROX_TAG_ID_SIZE,
+                              length, data);
 }
 
 static data_frame_tx_t *cmd_processor_hidprox_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1175,23 +1273,13 @@ static data_frame_tx_t *cmd_processor_hidprox_get_emu_id(uint16_t cmd, uint16_t 
 }
 
 static data_frame_tx_t *cmd_processor_ioprox_set_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != LF_IOPROX_TAG_ID_SIZE) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_IOPROX);
-    memcpy(buffer->buffer, data, LF_IOPROX_TAG_ID_SIZE);
-    tag_emulation_load_by_buffer(TAG_TYPE_IOPROX, false);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    return set_lf_emulator_id(cmd, TAG_TYPE_IOPROX, LF_IOPROX_TAG_ID_SIZE,
+                              length, data);
 }
 
 static data_frame_tx_t *cmd_processor_idteck_set_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != LF_IDTECK_TAG_ID_SIZE) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_IDTECK);
-    memcpy(buffer->buffer, data, LF_IDTECK_TAG_ID_SIZE);
-    tag_emulation_load_by_buffer(TAG_TYPE_IDTECK, false);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    return set_lf_emulator_id(cmd, TAG_TYPE_IDTECK, LF_IDTECK_TAG_ID_SIZE,
+                              length, data);
 }
 
 static data_frame_tx_t *cmd_processor_idteck_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1217,12 +1305,12 @@ static data_frame_tx_t *cmd_processor_idteck_write_to_t55xx(uint16_t cmd, uint16
 
     payload_t *payload = (payload_t *)data;
 
-    if (length < sizeof(payload_t) ||
-        (length - offsetof(payload_t, old_keys)) % sizeof(payload->old_keys) != 0) {
+    uint8_t old_cnt;
+    if (!cmd_parse_count_u8(length, offsetof(payload_t, old_keys),
+                            sizeof(payload->old_keys), &old_cnt)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
-    uint8_t old_cnt = (length - offsetof(payload_t, old_keys)) / sizeof(payload->old_keys);
     status = write_idteck_to_t55xx(payload->card_data, payload->new_key, payload->old_keys, old_cnt);
     return data_frame_make(cmd, status, 0, NULL);
 }
@@ -1239,13 +1327,8 @@ static data_frame_tx_t *cmd_processor_ioprox_get_emu_id(uint16_t cmd, uint16_t s
 }
 
 static data_frame_tx_t *cmd_processor_viking_set_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != LF_VIKING_TAG_ID_SIZE) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_VIKING);
-    memcpy(buffer->buffer, data, LF_VIKING_TAG_ID_SIZE);
-    tag_emulation_load_by_buffer(TAG_TYPE_VIKING, false);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    return set_lf_emulator_id(cmd, TAG_TYPE_VIKING, LF_VIKING_TAG_ID_SIZE,
+                              length, data);
 }
 
 static data_frame_tx_t *cmd_processor_viking_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1259,13 +1342,8 @@ static data_frame_tx_t *cmd_processor_viking_get_emu_id(uint16_t cmd, uint16_t s
 }
 
 static data_frame_tx_t *cmd_processor_pac_set_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != LF_PAC_TAG_ID_SIZE) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_PAC);
-    memcpy(buffer->buffer, data, LF_PAC_TAG_ID_SIZE);
-    tag_emulation_load_by_buffer(TAG_TYPE_PAC, false);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    return set_lf_emulator_id(cmd, TAG_TYPE_PAC, LF_PAC_TAG_ID_SIZE,
+                              length, data);
 }
 
 static data_frame_tx_t *cmd_processor_pac_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1279,13 +1357,8 @@ static data_frame_tx_t *cmd_processor_pac_get_emu_id(uint16_t cmd, uint16_t stat
 }
 
 static data_frame_tx_t *cmd_processor_jablotron_set_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != LF_JABLOTRON_TAG_ID_SIZE) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_JABLOTRON);
-    memcpy(buffer->buffer, data, LF_JABLOTRON_TAG_ID_SIZE);
-    tag_emulation_load_by_buffer(TAG_TYPE_JABLOTRON, false);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    return set_lf_emulator_id(cmd, TAG_TYPE_JABLOTRON, LF_JABLOTRON_TAG_ID_SIZE,
+                              length, data);
 }
 
 static data_frame_tx_t *cmd_processor_jablotron_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1338,10 +1411,20 @@ static data_frame_tx_t *cmd_processor_hf14a_get_anti_coll_data(uint16_t cmd, uin
     nfc_tag_14a_coll_res_reference_t *info = get_coll_res_data(false);
 
     if (info == NULL) return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    if (info->size == NULL || info->uid == NULL || info->atqa == NULL ||
+            info->sak == NULL || info->ats == NULL ||
+            !is_valid_uid_size(*info->size)) {
+        return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+    }
 
     // uidlen[1]|uid[uidlen]|atqa[2]|sak[1]|atslen[1]|ats[atslen]
     // dynamic length, so no struct
-    uint8_t payload[1 + *info->size + 2 + 1 + 1 + 254];
+    uint8_t payload[1 + 10 + 2 + 1 + 1 + sizeof(info->ats->data)];
+    uint16_t payload_length = 1u + (uint16_t)*info->size + 2u + 1u + 1u +
+                              info->ats->length;
+    if (payload_length > sizeof(payload)) {
+        return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+    }
     uint16_t offset = 0;
     payload[offset++] = *info->size;
     memcpy(&payload[offset], info->uid, *info->size);
@@ -1397,7 +1480,7 @@ static data_frame_tx_t *cmd_processor_mf1_get_detection_log(uint16_t cmd, uint16
     if (length != 4 || count == 0xFFFFFFFF) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    index = U32NTOHL(*(uint32_t *)data);
+    index = cmd_read_u32be(data);
     // NRF_LOG_INFO("index = %d", index);
     if (index >= count) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
@@ -1408,7 +1491,8 @@ static data_frame_tx_t *cmd_processor_mf1_get_detection_log(uint16_t cmd, uint16
 }
 
 static data_frame_tx_t *cmd_processor_mf1_write_emu_block_data(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length == 0 || (((length - 1) % NFC_TAG_MF1_DATA_SIZE) != 0)) {
+    if (length < 1u + NFC_TAG_MF1_DATA_SIZE ||
+            (((length - 1u) % NFC_TAG_MF1_DATA_SIZE) != 0u)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     uint8_t block_index = data[0];
@@ -1461,11 +1545,13 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_write_emu_page_data(uint16_t cmd,
     int pages_count = data[1];
     int byte_length = (int)pages_count * NFC_TAG_MF0_NTAG_DATA_SIZE;
 
-    if (pages_count == 0) return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    if (pages_count == 0) {
+        return data_frame_make(cmd, length == 2u ? STATUS_SUCCESS : STATUS_PAR_ERR, 0, NULL);
+    }
     else if (
         (page_index >= ((int)nr_pages))
         || (pages_count > (((int)nr_pages) - page_index))
-        || (((int)length - 2) < byte_length)
+        || (((int)length - 2) != byte_length)
     ) {
         byte = nr_pages;
         return data_frame_make(cmd, STATUS_PAR_ERR, 1, &byte);
@@ -1540,7 +1626,7 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_get_version_data(uint16_t cmd, ui
 }
 
 static data_frame_tx_t *cmd_processor_mf0_ntag_set_version_data(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 8) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    if (length != NFC_TAG_MF0_NTAG_VER_SIZE) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
 
     uint8_t *version_data = nfc_tag_mf0_ntag_get_version_data();
     if (version_data == NULL) return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
@@ -1573,7 +1659,8 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_get_counter_data(uint16_t cmd, ui
     uint8_t *counter_data = nfc_tag_mf0_ntag_get_counter_data_by_index(index);
     if (counter_data == NULL) return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
 
-    bool tearing = (counter_data[MF0_NTAG_AUTHLIM_OFF_IN_CTR] & MF0_NTAG_AUTHLIM_MASK_IN_CTR) != 0;
+    bool tearing = (counter_data[MF0_NTAG_AUTHLIM_OFF_IN_CTR] &
+                    MF0_NTAG_TEARING_MASK_IN_AUTHLIM) != 0;
 
     uint8_t response[4];
     memcpy(response, counter_data, 3);
@@ -1601,6 +1688,7 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_set_counter_data(uint16_t cmd, ui
 }
 
 static data_frame_tx_t *cmd_processor_mf0_ntag_reset_auth_cnt(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     // all tags with counters support auth
     uint8_t *counter_data = nfc_tag_mf0_ntag_get_counter_data_by_index(0);
     if (counter_data == NULL) return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
@@ -1614,32 +1702,29 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_reset_auth_cnt(uint16_t cmd, uint
 static data_frame_tx_t *cmd_processor_hf14a_set_anti_coll_data(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     // uidlen[1]|uid[uidlen]|atqa[2]|sak[1]|atslen[1]|ats[atslen]
     // dynamic length, so no struct
-    if ((length < 1) || \
-            (!is_valid_uid_size(data[0])) || \
-            (length < 1 + data[0] + 2 + 1 + 1) || \
-            (length < 1 + data[0] + 2 + 1 + 1 + data[1 + data[0] + 2 + 1])) {
+    cmd_hf14a_anticoll_t parsed;
+    if (!cmd_parse_hf14a_anticoll(length, data, &parsed)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     nfc_tag_14a_coll_res_reference_t *info = get_coll_res_data(true);
+    if (info == NULL || info->size == NULL || info->uid == NULL ||
+            info->atqa == NULL || info->sak == NULL || info->ats == NULL) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
 
-    uint16_t offset = 0;
-    *(info->size) = (nfc_tag_14a_uid_size)data[offset];
-    offset++;
-    memcpy(info->uid, &data[offset], *(info->size));
-    offset += *(info->size);
-    memcpy(info->atqa, &data[offset], 2);
-    offset += 2;
-    info->sak[0] = data[offset];
-    offset ++;
-    info->ats->length = data[offset];
-    offset ++;
-    memcpy(info->ats->data, &data[offset], info->ats->length);
-    offset += info->ats->length;
+    *(info->size) = (nfc_tag_14a_uid_size)parsed.uid_len;
+    memcpy(info->uid, &data[parsed.uid_offset], parsed.uid_len);
+    memcpy(info->atqa, &data[parsed.atqa_offset], 2);
+    info->sak[0] = data[parsed.sak_offset];
+    info->ats->length = parsed.ats_len;
+    memcpy(info->ats->data, &data[parsed.ats_offset], parsed.ats_len);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
+#define TAG_NICK_MAX_LENGTH 32u
+
 static data_frame_tx_t *cmd_processor_set_slot_tag_nick(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length < 3 || length > 34) {
+    if (length < 2u || length > 2u + TAG_NICK_MAX_LENGTH || data == NULL) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     uint8_t slot = data[0];
@@ -1650,7 +1735,7 @@ static data_frame_tx_t *cmd_processor_set_slot_tag_nick(uint16_t cmd, uint16_t s
     }
     get_fds_map_by_slot_sense_type_for_nick(slot, sense_type, &map_info);
 
-    uint8_t buffer[36];
+    uint8_t buffer[36] = {0};
     buffer[0] = length - 2;
     memcpy(buffer + 1, data + 2, buffer[0]);
 
@@ -1667,7 +1752,7 @@ static data_frame_tx_t *cmd_processor_get_slot_tag_nick(uint16_t cmd, uint16_t s
     }
     uint8_t slot = data[0];
     uint8_t sense_type = data[1];
-    uint8_t buffer[36];
+    uint8_t buffer[36] = {0};
     fds_slot_record_map_t map_info;
 
     if (slot >= TAG_MAX_SLOT_NUM || (sense_type != TAG_SENSE_HF && sense_type != TAG_SENSE_LF)) {
@@ -1676,24 +1761,26 @@ static data_frame_tx_t *cmd_processor_get_slot_tag_nick(uint16_t cmd, uint16_t s
     get_fds_map_by_slot_sense_type_for_nick(slot, sense_type, &map_info);
     uint16_t buffer_length = sizeof(buffer);
     bool ret = fds_read_sync(map_info.id, map_info.key, &buffer_length, buffer);
-    if (!ret) {
+    if (!ret || buffer_length < 1u || buffer[0] > TAG_NICK_MAX_LENGTH ||
+            buffer[0] > buffer_length - 1u) {
         return data_frame_make(cmd, STATUS_FLASH_READ_FAIL, 0, NULL);
     }
     return data_frame_make(cmd, STATUS_SUCCESS, buffer[0], &buffer[1]);
 }
 
 static data_frame_tx_t *cmd_processor_get_all_slot_nicks(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t response_buffer[TAG_MAX_SLOT_NUM * 2 * 37]; // Max possible size: 8 slots * 2 sense types * (1 byte length + 36 bytes nick)
+    uint8_t response_buffer[TAG_MAX_SLOT_NUM * 2 * (1 + TAG_NICK_MAX_LENGTH)];
     uint16_t response_length = 0;
 
     for (uint8_t slot = 0; slot < TAG_MAX_SLOT_NUM; slot++) {
-        uint8_t hf_buffer[36];
+        uint8_t hf_buffer[36] = {0};
         fds_slot_record_map_t hf_map_info;
         get_fds_map_by_slot_sense_type_for_nick(slot, TAG_SENSE_HF, &hf_map_info);
         uint16_t hf_buffer_length = sizeof(hf_buffer);
         bool hf_ret = fds_read_sync(hf_map_info.id, hf_map_info.key, &hf_buffer_length, hf_buffer);
 
-        if (hf_ret && hf_buffer_length > 0) {
+        if (hf_ret && hf_buffer_length > 0u && hf_buffer[0] <= TAG_NICK_MAX_LENGTH &&
+                hf_buffer[0] <= hf_buffer_length - 1u) {
             response_buffer[response_length++] = hf_buffer[0];
             for (uint8_t i = 1; i <= hf_buffer[0] && i < hf_buffer_length; i++) {
                 response_buffer[response_length++] = hf_buffer[i];
@@ -1702,13 +1789,14 @@ static data_frame_tx_t *cmd_processor_get_all_slot_nicks(uint16_t cmd, uint16_t 
             response_buffer[response_length++] = 0;
         }
 
-        uint8_t lf_buffer[36];
+        uint8_t lf_buffer[36] = {0};
         fds_slot_record_map_t lf_map_info;
         get_fds_map_by_slot_sense_type_for_nick(slot, TAG_SENSE_LF, &lf_map_info);
         uint16_t lf_buffer_length = sizeof(lf_buffer);
         bool lf_ret = fds_read_sync(lf_map_info.id, lf_map_info.key, &lf_buffer_length, lf_buffer);
 
-        if (lf_ret && lf_buffer_length > 0) {
+        if (lf_ret && lf_buffer_length > 0u && lf_buffer[0] <= TAG_NICK_MAX_LENGTH &&
+                lf_buffer[0] <= lf_buffer_length - 1u) {
             response_buffer[response_length++] = lf_buffer[0];
             for (uint8_t i = 1; i <= lf_buffer[0] && i < lf_buffer_length; i++) {
                 response_buffer[response_length++] = lf_buffer[i];
@@ -1886,6 +1974,7 @@ static data_frame_tx_t *cmd_processor_set_ble_connect_key(uint16_t cmd, uint16_t
 }
 
 static data_frame_tx_t *cmd_processor_delete_all_ble_bonds(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     advertising_stop();
     delete_bonds_all();
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
@@ -1944,7 +2033,9 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_get_uid_mode(uint16_t cmd, uint16
 }
 
 static data_frame_tx_t *cmd_processor_mf0_ntag_set_uid_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 1 || !nfc_tag_mf0_ntag_set_uid_mode(data[0] != 0)) {
+    bool enabled;
+    if (!cmd_payload_exact(length, data, 1u) || !cmd_parse_bool(data[0], &enabled) ||
+            !nfc_tag_mf0_ntag_set_uid_mode(enabled)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
@@ -1967,7 +2058,7 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_set_detection_enable(uint16_t cmd
     if (length != 1 || data[0] > 1) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    nfc_tag_mf0_ntag_detection_log_clear();
+    if (data[0] != 0u) nfc_tag_mf0_ntag_detection_log_clear();
     nfc_tag_mf0_ntag_set_detection_enable(data[0]);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
@@ -1994,7 +2085,7 @@ static data_frame_tx_t *cmd_processor_mf0_ntag_get_detection_log(uint16_t cmd, u
     if (length != 4 || count == 0xFFFFFFFF) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    index = U32NTOHL(*(uint32_t *)data);
+    index = cmd_read_u32be(data);
     if (index >= count) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
@@ -2045,7 +2136,9 @@ static data_frame_tx_t *cmd_processor_lf_sniff(uint16_t cmd, uint16_t status, ui
 
     static uint8_t sniff_buf[LF_SNIFF_MAX_SAMPLES];
     size_t outlen = 0;
-    raw_read_to_buffer(sniff_buf, LF_SNIFF_MAX_SAMPLES, timeout_ms, &outlen);
+    if (!raw_read_to_buffer(sniff_buf, LF_SNIFF_MAX_SAMPLES, timeout_ms, &outlen)) {
+        return data_frame_make(cmd, STATUS_MEM_ERR, 0, NULL);
+    }
 
     if (outlen == 0) {
         return data_frame_make(cmd, STATUS_LF_TAG_NO_FOUND, 0, NULL);
@@ -2406,6 +2499,7 @@ static data_frame_tx_t *cmd_processor_hf14a_sniff(uint16_t cmd, uint16_t status,
  * Returns STATUS_SUCCESS + APDU bytes if one is pending, STATUS_HF_TAG_NO otherwise.
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_apdu_recv(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     static uint8_t apdu_buf[NFC_14A_4_MAX_APDU];
     uint16_t apdu_len = 0;
     extern bool nfc_tag_14a_4_get_pending_apdu(uint8_t *buf, uint16_t *length);
@@ -2421,9 +2515,9 @@ static data_frame_tx_t *cmd_processor_hf14a_4_apdu_recv(uint16_t cmd, uint16_t s
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_apdu_send(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     extern void nfc_tag_14a_4_set_response(const uint8_t *data, uint16_t length);
-    if (length < 2) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    uint16_t resp_len = ((uint16_t)data[0] << 8) | data[1];
-    if (resp_len > NFC_14A_4_MAX_APDU || length < 2 + resp_len)
+    if (length < 2u || data == NULL) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    uint16_t resp_len = cmd_read_u16be(data);
+    if (resp_len > NFC_14A_4_MAX_APDU || length != 2u + resp_len)
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     nfc_tag_14a_4_set_response(&data[2], resp_len);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
@@ -2434,25 +2528,21 @@ static data_frame_tx_t *cmd_processor_hf14a_4_apdu_send(uint16_t cmd, uint16_t s
  * payload: uid_len(1) uid(n) atqa(2) sak(1) ats_len(1) ats(m)
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_set_anti_coll(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length < 1 || !is_valid_uid_size(data[0]) ||
-            length < 1 + data[0] + 2 + 1 + 1 ||
-            length < 1 + data[0] + 2 + 1 + 1 + data[1 + data[0] + 2 + 1]) {
+    cmd_hf14a_anticoll_t parsed;
+    if (!cmd_parse_hf14a_anticoll(length, data, &parsed)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     nfc_tag_14a_coll_res_reference_t *info = get_coll_res_data(true);
-    if (info == NULL) return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
-    uint16_t offset = 0;
-    *(info->size) = (nfc_tag_14a_uid_size)data[offset];
-    offset++;
-    memcpy(info->uid,  &data[offset], *(info->size));
-    offset += *(info->size);
-    memcpy(info->atqa, &data[offset], 2);
-    offset += 2;
-    info->sak[0]      = data[offset];
-    offset++;
-    info->ats->length = data[offset];
-    offset++;
-    memcpy(info->ats->data, &data[offset], info->ats->length);
+    if (info == NULL || info->size == NULL || info->uid == NULL ||
+            info->atqa == NULL || info->sak == NULL || info->ats == NULL) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    *(info->size) = (nfc_tag_14a_uid_size)parsed.uid_len;
+    memcpy(info->uid, &data[parsed.uid_offset], parsed.uid_len);
+    memcpy(info->atqa, &data[parsed.atqa_offset], 2);
+    info->sak[0] = data[parsed.sak_offset];
+    info->ats->length = parsed.ats_len;
+    memcpy(info->ats->data, &data[parsed.ats_offset], parsed.ats_len);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
@@ -2462,16 +2552,23 @@ static data_frame_tx_t *cmd_processor_hf14a_4_set_anti_coll(uint16_t cmd, uint16
  * If cmd_len==0, clears all static responses.
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_static_resp(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length == 0) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    if (length == 0u || data == NULL) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     uint8_t cmd_len = data[0];
     if (cmd_len == 0) {
+        if (length != 1u) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
         nfc_tag_14a_4_clear_static_responses();
         return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
     }
-    if (length < (uint16_t)(1 + cmd_len + 2)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    if (cmd_len > NFC_14A_4_MAX_STATIC_CMD_LEN ||
+            length < 1u + (uint16_t)cmd_len + 2u) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     /* resp_len is 2 bytes big-endian to support responses > 255 bytes */
-    uint16_t resp_len = ((uint16_t)data[1 + cmd_len] << 8) | data[2 + cmd_len];
-    if (length < (uint16_t)(1 + cmd_len + 2 + resp_len)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    uint16_t resp_len = cmd_read_u16be(&data[1u + cmd_len]);
+    uint32_t expected = 1u + (uint32_t)cmd_len + 2u + resp_len;
+    if (resp_len > NFC_14A_4_MAX_LARGE_RESP_LEN || expected != length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     nfc_tag_14a_4_add_static_response(&data[1], cmd_len, &data[3 + cmd_len], resp_len);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
@@ -2487,7 +2584,7 @@ static data_frame_tx_t *cmd_processor_hf14a_scan_keep(uint16_t cmd, uint16_t sta
     if (status != STATUS_HF_TAG_OK) {
         return data_frame_make(cmd, status, 0, NULL);
     }
-    uint8_t payload[1 + sizeof(taginfo.uid) + sizeof(taginfo.atqa) + sizeof(taginfo.sak) + 1 + 254];
+    uint8_t payload[1 + sizeof(taginfo.uid) + sizeof(taginfo.atqa) + sizeof(taginfo.sak) + 1 + sizeof(taginfo.ats)];
     uint16_t offset = 0;
     payload[offset++] = taginfo.uid_len;
     memcpy(&payload[offset], taginfo.uid, taginfo.uid_len);
@@ -2513,14 +2610,10 @@ static data_frame_tx_t *cmd_processor_hf14a_scan_keep(uint16_t cmd, uint16_t sta
  * returns: raw APDU response bytes (PCB stripped)
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length == 0 || length > 61) {
+    if (length == 0 || length > 512) {
+        pcd_14a_reader_antenna_off();
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-
-    uint8_t resp_buf[64];    /* RC522 FIFO per chain block */
-    uint8_t resp_chain[512]; /* reassembled chained response */
-    uint16_t resp_chain_len = 0;
-    uint16_t resp_bits = 0;
 
     /* Step 1: cycle field briefly to return card to IDLE state, then
      * do full select + RATS via scan_auto. This is needed because the card
@@ -2537,189 +2630,59 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
     status = pcd_14a_reader_scan_auto(&taginfo);
     if (status != STATUS_HF_TAG_OK) {
         pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+        pcd_14a_reader_antenna_off();
         uint8_t dbg[2] = {0x01, status};
         return data_frame_make(cmd, STATUS_HF_TAG_NO, 2, dbg);
+    }
+    if ((taginfo.sak & 0x20u) == 0u || taginfo.ats_len < 2u) {
+        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+        pcd_14a_reader_antenna_off();
+        return data_frame_make(cmd, STATUS_HF_ERR_ATS, 0, NULL);
     }
     NRF_LOG_INFO("14A4_READER_APDU: scan_auto OK sak=%02x ats_len=%d",
                  taginfo.sak, taginfo.ats_len);
 
-    /* Step 3: wrap APDU in I-block (PCB=0x02) and send */
-    uint8_t frame_buf[64];
-    frame_buf[0] = 0x02;  /* PCB: I-block, block_num=0, no CID, no NAD */
-    memcpy(&frame_buf[1], data, length);
-    crc_14a_append(frame_buf, length + 1);
-    uint8_t frame_len = length + 1 + 2;
-
-    NRF_LOG_INFO("14A4_READER_APDU: sending I-block, frame_len=%d", frame_len);
-
-    pcd_14a_reader_timeout_set(600);
-    resp_bits = 0;
-    status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE,
-                                           frame_buf, frame_len, resp_buf, &resp_bits, U8ARR_BIT_LEN(resp_buf));
+    static uint8_t resp_chain[ISO_DEP_READER_MAX_APDU_RESPONSE];
+    iso_dep_reader_t reader;
+    iso_dep_result_t exchange;
+    iso_dep_reader_init(&reader, &taginfo);
+    bool ok = iso_dep_reader_transceive(&reader, data, length,
+                                        resp_chain, sizeof(resp_chain), &exchange);
     pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
-
-    NRF_LOG_INFO("14A4_READER_APDU: APDU transfer status=%d resp_bits=%d", status, resp_bits);
-
-    if (status != STATUS_HF_TAG_OK || resp_bits < 8) {
-        uint8_t dbg[6] = {0x03, status, (uint8_t)frame_len,
-                          frame_buf[0], frame_buf[1], frame_buf[2]
-                         };
-        return data_frame_make(cmd, STATUS_HF_TAG_NO, 6, dbg);
+    if (!ok) {
+        pcd_14a_reader_antenna_off();
+        uint16_t out_status = exchange.error == ISO_DEP_ERR_CRC ?
+                              STATUS_HF_ERR_CRC : STATUS_HF_ERR_STAT;
+        uint8_t dbg[3] = {(uint8_t)exchange.error, exchange.rf_status,
+                          exchange.wtx_count};
+        return data_frame_make(cmd, out_status, sizeof(dbg), dbg);
     }
-
-    uint8_t resp_bytes = resp_bits / 8;
-    if (resp_bytes < 3) {
-        uint8_t dbg[2] = {0x04, resp_bytes};
-        return data_frame_make(cmd, STATUS_HF_ERR_CRC, 2, dbg);
-    }
-
-    /* Verify first block CRC and begin chaining reassembly */
-    uint8_t crc_calc[2];
-    crc_14a_calculate(resp_buf, resp_bytes - 2, crc_calc);
-    if (resp_buf[resp_bytes - 2] != crc_calc[0] || resp_buf[resp_bytes - 1] != crc_calc[1]) {
-        return data_frame_make(cmd, STATUS_HF_ERR_CRC, resp_bytes, resp_buf);
-    }
-
-    /* Copy data portion (strip PCB + CRC), then handle chaining */
-    uint8_t blk_num = 0;
-    uint8_t resp_pcb = resp_buf[0];
-    uint8_t dlen = resp_bytes - 3; /* subtract PCB(1) + CRC(2) */
-    if (dlen > 0 && resp_chain_len + dlen < sizeof(resp_chain)) {
-        memcpy(&resp_chain[resp_chain_len], &resp_buf[1], dlen);
-        resp_chain_len += dlen;
-    }
-    blk_num ^= 1;
-
-    /* ISO14443-4 chaining: PCB bit5 (0x20) set means more blocks follow */
-    while (resp_pcb & 0x20) {
-        uint8_t rack = 0xA2 | (resp_pcb & 0x01); /* R(ACK) block_num matches received I-block */
-        uint8_t rack_frame[3];
-        rack_frame[0] = rack;
-        crc_14a_append(rack_frame, 1);
-        resp_bits = 0;
-        pcd_14a_reader_timeout_set(600);
-        status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE,
-                                               rack_frame, 3, resp_buf, &resp_bits, U8ARR_BIT_LEN(resp_buf));
-        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
-        if (status != STATUS_HF_TAG_OK || resp_bits < 24) break;
-        resp_bytes = resp_bits / 8;
-        crc_14a_calculate(resp_buf, resp_bytes - 2, crc_calc);
-        if (resp_buf[resp_bytes - 2] != crc_calc[0] || resp_buf[resp_bytes - 1] != crc_calc[1]) break;
-        resp_pcb = resp_buf[0];
-        dlen = resp_bytes - 3;
-        if (dlen > 0 && resp_chain_len + dlen < sizeof(resp_chain)) {
-            memcpy(&resp_chain[resp_chain_len], &resp_buf[1], dlen);
-            resp_chain_len += dlen;
-        }
-        blk_num ^= 1;
-    }
-
-    return data_frame_make(cmd, STATUS_HF_TAG_OK, resp_chain_len, resp_chain);
+    return data_frame_make(cmd, STATUS_HF_TAG_OK,
+                           exchange.response_len, resp_chain);
 }
 
 /* -----------------------------------------------------------------------
  * tcl_apdu_: ISO 14443-4 APDU helper used by cmd_processor_hf14a_4_emv_scan.
  * Sends one I-block, receives full response handling card-side chaining.
  * ----------------------------------------------------------------------- */
+static iso_dep_reader_t m_tcl_reader;
+
 static bool tcl_apdu_(
     const uint8_t *apdu, uint8_t apdu_sz,
     uint8_t **rdata_ptr, uint16_t *rlen_ptr,
     uint8_t *abuf, uint8_t *rbuf, uint8_t *chain_buf,
     uint16_t *rbits_p, uint8_t *blk_p) {
-    /* Build I-block: PCB + APDU + CRC */
-    abuf[0] = 0x02 | (*blk_p & 0x01);
-    memcpy(&abuf[1], apdu, apdu_sz);
-    crc_14a_append(abuf, apdu_sz + 1);
-    uint8_t frame_len = apdu_sz + 3;   /* PCB + APDU + CRC */
-
-    /* Clear stale RxIRq before transmit.
-     * bytes_transfer only clears ComIrqReg bit7 (Set1).
-     * RxIRq (bit4) stays set from the previous receive and causes the
-     * wait-loop to exit instantly, returning garbage from FIFO. */
-    write_register_single(ComIrqReg, 0x7F);
-    pcd_14a_reader_timeout_set(600);
-    uint16_t rbits = 0;
-    uint8_t st = pcd_14a_reader_bytes_transfer(
-                     PCD_TRANSCEIVE, abuf, frame_len, rbuf, &rbits, 270u * 8u);
-    if (st != STATUS_HF_TAG_OK || rbits < 24u) return false;
-
-    uint16_t rb = rbits / 8u;
-    uint8_t crc[2];
-    crc_14a_calculate(rbuf, rb - 2u, crc);
-    if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) return false;
-
-    *blk_p ^= 1;
-    uint8_t  resp_pcb  = rbuf[0];
-    uint16_t chain_len = 0;
-    uint8_t  dlen      = (uint8_t)(rb - 3u);
-    if (dlen > 0 && dlen < 512u) {
-        memcpy(chain_buf, &rbuf[1], dlen);
-        chain_len = dlen;
-    }
-
-    /* Handle card-side chaining ---------------------------------------- */
-    uint16_t chain_rbits = 0;   /* hoisted: used in both WTX and R(ACK) paths */
-    uint8_t  chain_st    = STATUS_HF_TAG_OK;
-    while (resp_pcb & 0x20u) {
-        if ((resp_pcb & 0xC0u) != 0x00u) {
-            /* S-block: handle S(WTX), reject others.
-             * Some Visa/MC cards send WTX (PCB=0xF2) before their FCI,
-             * requesting more processing time. We must echo it back.
-             * The WTXM byte was spuriously added to chain_buf — undo it. */
-            if ((resp_pcb & 0xF0u) == 0xF0u) {
-                chain_len -= dlen;       /* remove spurious WTXM byte(s) */
-                uint8_t wtx_r[4];
-                wtx_r[0] = resp_pcb;    /* mirror the S(WTX) PCB */
-                wtx_r[1] = rbuf[1];     /* WTXM from last received frame */
-                crc_14a_append(wtx_r, 2);
-                write_register_single(ComIrqReg, 0x7F);
-                pcd_14a_reader_timeout_set(600);
-                chain_rbits = 0;
-                chain_st = pcd_14a_reader_bytes_transfer(
-                               PCD_TRANSCEIVE, wtx_r, 4, rbuf, &chain_rbits, 270u * 8u);
-                if (chain_st != STATUS_HF_TAG_OK || chain_rbits < 24u) break;
-                rb = chain_rbits / 8u;
-                crc_14a_calculate(rbuf, rb - 2u, crc);
-                if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
-                resp_pcb = rbuf[0];
-                dlen = (uint8_t)(rb - 3u);
-                if (dlen > 0u && chain_len + dlen < 512u) {
-                    memcpy(&chain_buf[chain_len], &rbuf[1], dlen);
-                    chain_len += dlen;
-                }
-                continue; /* re-check while with new resp_pcb */
-            }
-            break; /* other S-blocks (DESELECT etc.): stop */
-        }
-
-        /* R(ACK) block_num must match the received I-block's block_num */
-        uint8_t rf[3];
-        rf[0] = 0xA2u | (resp_pcb & 0x01u);
-        crc_14a_append(rf, 1);
-
-        /* Use bytes_transfer for chain R(ACK) — clear stale RxIRq first */
-        write_register_single(ComIrqReg, 0x7F);
-        pcd_14a_reader_timeout_set(600);
-        chain_rbits = 0;
-        chain_st = pcd_14a_reader_bytes_transfer(
-                       PCD_TRANSCEIVE, rf, 3, rbuf, &chain_rbits, 270u * 8u);
-        if (chain_st != STATUS_HF_TAG_OK || chain_rbits < 24u) break;
-        rb = chain_rbits / 8u;   /* bytes_transfer returns BIT count */
-
-        crc_14a_calculate(rbuf, rb - 2u, crc);
-        if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
-
-        resp_pcb = rbuf[0];
-        dlen = (uint8_t)(rb - 3u);
-        if (dlen > 0u && chain_len + dlen < 512u) {
-            memcpy(&chain_buf[chain_len], &rbuf[1], dlen);
-            chain_len += dlen;
-        }
-    }
-
+    (void)abuf;
+    (void)rbuf;
+    (void)rbits_p;
+    iso_dep_result_t result;
+    bool ok = iso_dep_reader_transceive(&m_tcl_reader, apdu, apdu_sz,
+                                        chain_buf, ISO_DEP_READER_MAX_APDU_RESPONSE,
+                                        &result);
+    *blk_p = m_tcl_reader.block_num;
     *rdata_ptr = chain_buf;
-    *rlen_ptr  = chain_len;
-    return chain_len > 0u;
+    *rlen_ptr = result.response_len;
+    return ok;
 }
 
 /* Fill an EMV DOL (Data Object List: repeated tag+length) with simulated
@@ -2941,6 +2904,9 @@ static bool emv_has_card_identity_tlv(const uint8_t *d, uint16_t dl,
  * some APDUs fail — num_apdus reflects how many completed).
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 0u && length != 6u) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     static uint8_t out[NETDATA_MAX_DATA_LENGTH];
     uint16_t out_len = 0;
 
@@ -2957,7 +2923,19 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
 
 
     /* Append a cmd+resp pair to out buffer */
-#define APPEND_PAIR(cmd_ptr, cmd_sz, resp_ptr, resp_sz) do {         if (out_len + 1 + (cmd_sz) + 2 + (resp_sz) < NETDATA_MAX_DATA_LENGTH) {             out[out_len++] = (uint8_t)(cmd_sz);             memcpy(&out[out_len], (cmd_ptr), (cmd_sz)); out_len += (cmd_sz);             out[out_len++] = (uint8_t)((resp_sz) & 0xFF);             out[out_len++] = (uint8_t)((resp_sz) >> 8);             memcpy(&out[out_len], (resp_ptr), (resp_sz)); out_len += (resp_sz);         }     } while(0)
+#define APPEND_PAIR(cmd_ptr, cmd_sz, resp_ptr, resp_sz) do { \
+        uint32_t _pair_len = 1u + (uint32_t)(cmd_sz) + 2u + (uint32_t)(resp_sz); \
+        if (num_apdus != UINT8_MAX && out_len + _pair_len <= NETDATA_MAX_DATA_LENGTH) { \
+            out[out_len++] = (uint8_t)(cmd_sz); \
+            memcpy(&out[out_len], (cmd_ptr), (cmd_sz)); \
+            out_len += (cmd_sz); \
+            out[out_len++] = (uint8_t)((resp_sz) & 0xFF); \
+            out[out_len++] = (uint8_t)((resp_sz) >> 8); \
+            memcpy(&out[out_len], (resp_ptr), (resp_sz)); \
+            out_len += (resp_sz); \
+            num_apdus++; \
+        } \
+    } while (0)
 
     /* Offline transaction simulation: if a 6-byte amount (n12 BCD) is supplied,
      * inject it into the GPO PDOL and issue GENERATE AC after the records.
@@ -2992,6 +2970,10 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     if (status != STATUS_HF_TAG_OK) {
         return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
     }
+    if ((tag.sak & 0x20u) == 0u || tag.ats_len < 2u) {
+        return data_frame_make(cmd, STATUS_HF_ERR_ATS, 0, NULL);
+    }
+    iso_dep_reader_init(&m_tcl_reader, &tag);
 
     /* After scan_auto completes RATS, give the RC522 time to settle.
      * The hf14a_scan_keep + hf14a_raw path works because the USB round-trip
@@ -3053,7 +3035,6 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
         }
     }
     APPEND_PAIR(ppse_cmd, sizeof(ppse_cmd), ppse_resp, ppse_rlen);
-    num_apdus++;
 
     /* Keep the T=CL session alive after PPSE. Phone wallets commonly tear down
      * their transient payment applet when the RF field drops, so a field cycle
@@ -3094,7 +3075,6 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
     uint16_t sel_rlen;
     if (!SEND_APDU(sel_cmd, sel_len, &sel_resp, &sel_rlen)) goto done;
     APPEND_PAIR(sel_cmd, sel_len, sel_resp, sel_rlen);
-    num_apdus++;
     if (do_txn && cdol1_len == 0) {
         emv_find_cdol1(sel_resp, sel_rlen >= 2 ? sel_rlen - 2 : sel_rlen,
                        cdol1, &cdol1_len, 0);
@@ -3155,8 +3135,8 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
         gpo_buf[gpo_len++]=0x00; \
     } while(0)
 #define GPO_OK(rp,rl) ((rl)>=2 && \
-        ((rp)[0]==0x77||(rp)[0]==0x80|| \
-         ((rp)[(rl)-2]==0x90&&(rp)[(rl)-1]==0x00)))
+        (rp)[(rl)-2]==0x90 && (rp)[(rl)-1]==0x00 && \
+        ((rp)[0]==0x77||(rp)[0]==0x80))
     /* Attempt 1: use the actual PDOL tag order from FCI, as EMV terminals do. */
     BUILD_GPO(pdol_len, pdol_len > 0 ? pdol_data : gpo_pdol_template);
     if (!SEND_APDU(gpo_buf, gpo_len, &gpo_resp, &gpo_rlen) ||
@@ -3196,41 +3176,36 @@ gpo_done:
 #undef BUILD_GPO
 #undef GPO_OK
     APPEND_PAIR(gpo_buf, gpo_len, gpo_resp, gpo_rlen);
-    num_apdus++;
-    uint8_t *afl = NULL;
+    static uint8_t afl_buf[32];
+    uint8_t *afl = afl_buf;
     uint8_t afl_len = 0;
     if (gpo_rlen > 0 && gpo_resp[0] == 0x77) {
-        /* Format 2: find tag 94 (uint16_t i: a uint8_t wraps on >256B responses) */
-        for (uint16_t i = 2; i + 1 < gpo_rlen;) {
-            uint8_t t = gpo_resp[i];
-            uint8_t l = gpo_resp[i + 1];
-            if (t == 0x94) { afl = &gpo_resp[i + 2]; afl_len = l; break; }
-            i += 2 + l;
-        }
+        uint16_t body_len = gpo_rlen >= 2u ? gpo_rlen - 2u : 0u;
+        (void)emv_find_tlv_value(gpo_resp, body_len, 0x94,
+                                 afl_buf, &afl_len, sizeof(afl_buf), 0);
     } else if (gpo_rlen > 6 && gpo_resp[0] == 0x80) {
         /* Format 1: tag 80, len, AIP(2), AFL(...), SW(2) => AFL starts at [4]. */
-        afl = &gpo_resp[4];
-        afl_len = gpo_rlen - 6;
+        uint16_t available = gpo_rlen - 6u;
+        afl_len = (uint8_t)(available > sizeof(afl_buf) ? sizeof(afl_buf) : available);
+        memcpy(afl_buf, &gpo_resp[4], afl_len);
     }
+    if ((afl_len & 3u) != 0u) afl_len = 0;
     uint8_t records_read = 0;
     bool found_identity_record = false;
 
     /* READ each record listed in the AFL (when the GPO provided one) */
-    if (afl != NULL && afl_len > 0) {
-        /* Copy AFL to local buffer before READ RECORDs.
-         * afl points into chain_buf which is overwritten by each SEND_APDU call. */
-        static uint8_t afl_buf[32];  /* max 8 AFL entries × 4 bytes */
-        if (afl_len > sizeof(afl_buf)) afl_len = (uint8_t)sizeof(afl_buf);
-        memcpy(afl_buf, afl, afl_len);
-        afl = afl_buf;
-
+    if (afl_len > 0) {
         for (uint8_t a = 0; a + 3 < afl_len; a += 4) {
             uint8_t sfi    = (afl[a] >> 3) & 0x1F;
             uint8_t rec_s  = afl[a + 1];
             uint8_t rec_e  = afl[a + 2];
-            if (sfi == 0 || rec_s > rec_e) continue;
+            uint8_t oda_count = afl[a + 3];
+            if ((afl[a] & 0x07u) != 0u || sfi == 0 || sfi > 30u ||
+                    rec_s == 0u || rec_s > rec_e ||
+                    oda_count > (uint8_t)(rec_e - rec_s + 1u)) continue;
             /* `unsigned` r: a uint8_t would wrap forever when rec_e == 0xFF. */
             for (unsigned r = rec_s; r <= rec_e; r++) {
+                bsp_wdt_feed();
                 if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
                 uint8_t rr_cmd[5] = {0x00, 0xB2, (uint8_t)r, (uint8_t)((sfi << 3) | 4), 0x00};
                 uint8_t *rr_resp;
@@ -3241,7 +3216,6 @@ gpo_done:
                     continue;
                 }
                 APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
-                num_apdus++;
                 records_read++;
                 if (!found_identity_record) {
                     found_identity_record = emv_has_card_identity_tlv(
@@ -3260,7 +3234,8 @@ gpo_done:
      * all valid EMV SFIs with a fast 16-record cap. Stop each SFI on the first
      * error SW (6A83/6A82/...), and bound the total to keep the response sane. */
     if (records_read == 0 || !found_identity_record) {
-        for (uint8_t sfi = 1; sfi <= 31; sfi++) {
+        for (uint8_t sfi = 1; sfi <= 30; sfi++) {
+            bsp_wdt_feed();
             if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
             for (uint8_t r = 1; r <= 16; r++) {
                 if (out_len >= NETDATA_MAX_DATA_LENGTH - 300) break;
@@ -3272,7 +3247,6 @@ gpo_done:
                 if (rr_rlen >= 2 && rr_resp[rr_rlen - 2] == 0x90 &&
                         rr_resp[rr_rlen - 1] == 0x00) {
                     APPEND_PAIR(rr_cmd, 5, rr_resp, rr_rlen);
-                    num_apdus++;
                     records_read++;
                     if (!found_identity_record) {
                         found_identity_record = emv_has_card_identity_tlv(
@@ -3296,35 +3270,34 @@ gpo_done:
      * so nothing is authorised and no funds move. Best-effort: cards may return
      * an error SW without a full terminal profile — that's fine (still no
      * charge). Visa qVSDC cards already produce the cryptogram in the GPO. */
-    if (do_txn) {
+    if (do_txn && cdol1_len > 0u) {
         static uint8_t gac_data[64];
-        uint8_t gac_dlen = cdol1_len > 0
-            ? emv_fill_dol(cdol1, cdol1_len, gac_data, sizeof(gac_data), txn_amount)
-            : 0;
-        if (gac_dlen <= 55) {
+        uint8_t expected_dlen = emv_dol_value_len(cdol1, cdol1_len, sizeof(gac_data));
+        uint8_t gac_dlen = emv_fill_dol(cdol1, cdol1_len, gac_data,
+                                        sizeof(gac_data), txn_amount);
+        if (gac_dlen > 0u && gac_dlen == expected_dlen && gac_dlen <= 55u) {
             static uint8_t gac_cmd[80];
             uint8_t gc = 0;
             gac_cmd[gc++] = 0x80;      /* CLA */
             gac_cmd[gc++] = 0xAE;      /* INS GENERATE AC */
             gac_cmd[gc++] = 0x80;      /* P1 = ARQC (online cryptogram) */
             gac_cmd[gc++] = 0x00;
-            if (gac_dlen > 0) {
-                gac_cmd[gc++] = gac_dlen;
-                memcpy(&gac_cmd[gc], gac_data, gac_dlen);
-                gc += gac_dlen;
-            }
+            gac_cmd[gc++] = gac_dlen;
+            memcpy(&gac_cmd[gc], gac_data, gac_dlen);
+            gc += gac_dlen;
             gac_cmd[gc++] = 0x00;
             uint8_t *gac_resp;
             uint16_t gac_rlen;
             if (SEND_APDU(gac_cmd, gc, &gac_resp, &gac_rlen)) {
                 APPEND_PAIR(gac_cmd, gc, gac_resp, gac_rlen);
-                num_apdus++;
             }
         }
     }
 
 done:
+    iso_dep_reader_deselect(&m_tcl_reader);
     pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+    pcd_14a_reader_antenna_off();
     out[num_apdus_offset] = num_apdus;
     /* Return HF_TAG_OK even with 0 APDUs so Python can see tag info */
     return data_frame_make(cmd, STATUS_HF_TAG_OK, out_len, out);
@@ -3340,6 +3313,9 @@ done:
  * Reuses the static tcl_apdu_ helper and the SEND_APDU/APPEND_PAIR macros.
  */
 static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 0u) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
     static uint8_t out[NETDATA_MAX_DATA_LENGTH];
     uint16_t out_len = 0;
     static uint8_t  abuf[64];
@@ -3360,6 +3336,10 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
             return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
         }
     }
+    if ((tag.sak & 0x20u) == 0u || tag.ats_len < 2u) {
+        return data_frame_make(cmd, STATUS_HF_ERR_ATS, 0, NULL);
+    }
+    iso_dep_reader_init(&m_tcl_reader, &tag);
     bsp_delay_ms(5);
 
     /* Clear RC522 stale state after RATS (see emv_scan for rationale) */
@@ -3395,13 +3375,11 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
     static const uint8_t getver[] = {0x90, 0x60, 0x00, 0x00, 0x00};
     if (SEND_APDU(getver, sizeof(getver), &r, &rl)) {
         APPEND_PAIR(getver, sizeof(getver), r, rl);
-        num_apdus++;
         static const uint8_t getmore[] = {0x90, 0xAF, 0x00, 0x00, 0x00};
         uint8_t guard = 0;
         while (rl >= 2 && r[rl - 2] == 0x91 && r[rl - 1] == 0xAF && guard++ < 4) {
             if (!SEND_APDU(getmore, sizeof(getmore), &r, &rl)) break;
             APPEND_PAIR(getmore, sizeof(getmore), r, rl);
-            num_apdus++;
         }
     }
 
@@ -3409,7 +3387,6 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
     static const uint8_t getfree[] = {0x90, 0x6E, 0x00, 0x00, 0x00};
     if (SEND_APDU(getfree, sizeof(getfree), &r, &rl)) {
         APPEND_PAIR(getfree, sizeof(getfree), r, rl);
-        num_apdus++;
     }
 
     /* GetApplicationIDs (0x6A) — response is N*3 bytes of AIDs + SW */
@@ -3418,7 +3395,6 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
     uint8_t aids_count = 0;
     if (SEND_APDU(getaids, sizeof(getaids), &r, &rl)) {
         APPEND_PAIR(getaids, sizeof(getaids), r, rl);
-        num_apdus++;
         if (rl >= 2) {
             uint16_t adata = rl - 2;
             for (uint16_t i = 0; i + 3 <= adata && aids_count < 8; i += 3) {
@@ -3438,15 +3414,12 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
                              aids[a * 3], aids[a * 3 + 1], aids[a * 3 + 2], 0x00};
         if (!SEND_APDU(selapp, sizeof(selapp), &r, &rl)) continue;
         APPEND_PAIR(selapp, sizeof(selapp), r, rl);
-        num_apdus++;
         /* GetKeySettings (0x45): settings byte + key count */
         if (SEND_APDU(getks, sizeof(getks), &r, &rl)) {
             APPEND_PAIR(getks, sizeof(getks), r, rl);
-            num_apdus++;
         }
         if (SEND_APDU(getfiles, sizeof(getfiles), &r, &rl)) {
             APPEND_PAIR(getfiles, sizeof(getfiles), r, rl);
-            num_apdus++;
             /* Copy file IDs before further SEND_APDU overwrites the chain buf. */
             uint8_t fids[32];
             uint8_t fcount = (rl >= 2) ? (uint8_t)(rl - 2) : 0;
@@ -3458,13 +3431,14 @@ static data_frame_tx_t *cmd_processor_hf14a_4_desfire_scan(uint16_t cmd, uint16_
                 uint8_t gfs[7] = {0x90, 0xF5, 0x00, 0x00, 0x01, fids[f], 0x00};
                 if (SEND_APDU(gfs, sizeof(gfs), &r, &rl)) {
                     APPEND_PAIR(gfs, sizeof(gfs), r, rl);
-                    num_apdus++;
                 }
             }
         }
     }
 
+    iso_dep_reader_deselect(&m_tcl_reader);
     pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+    pcd_14a_reader_antenna_off();
     out[num_apdus_offset] = num_apdus;
     return data_frame_make(cmd, STATUS_HF_TAG_OK, out_len, out);
 }
@@ -3474,421 +3448,34 @@ static data_frame_tx_t *cmd_processor_hf14a_4_debug_counters(uint16_t cmd, uint1
     nfc_tag_14a_4_get_debug_counters(&buf[0], &buf[1], &buf[2], &buf[3]);
     return data_frame_make(cmd, STATUS_SUCCESS, 4, buf);
 }
+
+/* Shared because command dispatch is serialized and data_frame_make copies it. */
+static uint8_t m_emv_trace_response[NETDATA_MAX_DATA_LENGTH];
+
+static data_frame_tx_t *cmd_processor_hf14a_4_emv_trace_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint16_t response_status = STATUS_SUCCESS;
+    uint16_t response_len = emv_trace_start(data, length, m_emv_trace_response,
+                                            sizeof(m_emv_trace_response),
+                                            &response_status);
+    return data_frame_make(cmd, response_status, response_len, m_emv_trace_response);
+}
+
+static data_frame_tx_t *cmd_processor_hf14a_4_emv_trace_meta(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint16_t response_status = STATUS_SUCCESS;
+    uint16_t response_len = emv_trace_meta(data, length, m_emv_trace_response,
+                                           sizeof(m_emv_trace_response),
+                                           &response_status);
+    return data_frame_make(cmd, response_status, response_len, m_emv_trace_response);
+}
+
+static data_frame_tx_t *cmd_processor_hf14a_4_emv_trace_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint16_t response_status = STATUS_SUCCESS;
+    uint16_t response_len = emv_trace_get(data, length, m_emv_trace_response,
+                                          sizeof(m_emv_trace_response),
+                                          &response_status);
+    return data_frame_make(cmd, response_status, response_len, m_emv_trace_response);
+}
 #endif
-
-// ---------------------------------------------------------------------------
-// Passive BLE scanner commands (listen-only observer role; see ble_main.c).
-// The device transmits nothing while scanning: it only collects advertisements
-// already broadcast by nearby devices. Available on both Ultra and Lite.
-// ---------------------------------------------------------------------------
-static bool cmd_ble_radio_is_on(void) {
-    uint8_t state[4];
-    return ble_radio_get(state) == NRF_SUCCESS && state[0] != 0;
-}
-
-static data_frame_tx_t *cmd_processor_ble_scan_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t active = (length >= 1) ? data[0] : 0; // 0 = passive (default), 1 = active
-    if (!cmd_ble_radio_is_on()) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    uint32_t err_code = ble_scan_start(active);
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_scan_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t err_code = ble_scan_stop();
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_scan_get_count(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t count = ble_scan_get_count();
-    return data_frame_make(cmd, STATUS_SUCCESS, 1, &count);
-}
-
-static data_frame_tx_t *cmd_processor_ble_scan_get_results(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t start_index = (length >= 1) ? data[0] : 0;
-    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
-    uint16_t out_len = ble_scan_copy_records(start_index, out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_advertising_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length < 1 || length > 2 || data[0] > 1 || (length == 2 && data[1] > 1)) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-
-    if (data[0] == 0) {
-        advertising_stop();
-    } else {
-        if (!cmd_ble_radio_is_on()) {
-            return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-        }
-        advertising_start((length == 2) ? (data[1] != 0) : false);
-    }
-
-    uint8_t state = is_ble_advertising();
-    return data_frame_make(cmd, STATUS_SUCCESS, 1, &state);
-}
-
-static data_frame_tx_t *cmd_processor_ble_advertising_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t state = is_ble_advertising();
-    return data_frame_make(cmd, STATUS_SUCCESS, 1, &state);
-}
-
-static data_frame_tx_t *cmd_processor_ble_link_probe(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length > 1) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    if (!cmd_ble_radio_is_on()) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    uint8_t global_mode = (length == 1) ? (data[0] != 0) : 0;
-    uint32_t err_code = ble_central_link_probe(global_mode);
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-// ---------------------------------------------------------------------------
-// BLE GATT fuzzing harness commands (central role; see ble_central.c).
-// Per-call scope selectable (single target / scan-buffer-wide / environment-
-// wide broadcast) — see CLAUDE.md fork-specific exemption, operator-authorised.
-// ---------------------------------------------------------------------------
-static data_frame_tx_t *cmd_processor_ble_connect(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 7) { // addr_type[1] + addr[6]
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    if (!cmd_ble_radio_is_on()) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    uint32_t err_code = ble_central_connect(data[0], &data[1]);
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_disconnect(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t err_code = ble_central_disconnect();
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_central_state(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[16]; // ble_central_get_state now serializes 10 bytes; keep headroom
-    uint16_t out_len = ble_central_get_state(out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_gatt_discover(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t err_code = ble_central_gatt_discover();
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_gatt_get_chars(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t start_index = (length >= 1) ? data[0] : 0;
-    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
-    uint16_t out_len = ble_central_copy_chars(start_index, out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_fuzz_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 6) { // value_handle[2] + max_iter[2] + interval_ms[2], big-endian
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint16_t handle   = ((uint16_t)data[0] << 8) | data[1];
-    uint16_t max_iter = ((uint16_t)data[2] << 8) | data[3];
-    uint16_t interval = ((uint16_t)data[4] << 8) | data[5];
-    uint32_t err_code = ble_central_fuzz_start(handle, max_iter, interval);
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_fuzz_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    ble_central_fuzz_stop();
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_fuzz_get_log(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint16_t start_index = (length >= 2) ? (((uint16_t)data[0] << 8) | data[1]) : 0;
-    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
-    uint16_t out_len = ble_central_copy_log(start_index, out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_gatt_read(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 2) { // value_handle[2], big-endian
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint16_t handle = ((uint16_t)data[0] << 8) | data[1];
-    uint32_t err_code = ble_central_gatt_read(handle);
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_gatt_get_read(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[3 + 244]; // state + status + len + up to BLE_READ_VALUE_MAX bytes
-    uint16_t out_len = ble_central_copy_read(out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_subscribe(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 3) { // cccd_handle[2] + mode[1]
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint16_t cccd = ((uint16_t)data[0] << 8) | data[1];
-    uint32_t err_code = ble_central_subscribe(cccd, data[2]);
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_get_notifications(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint16_t start_index = (length >= 2) ? (((uint16_t)data[0] << 8) | data[1]) : 0;
-    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
-    uint16_t out_len = ble_central_copy_notifs(start_index, out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_find_cccd(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 2) { // value_handle[2]
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint16_t value_handle = ((uint16_t)data[0] << 8) | data[1];
-    uint32_t err_code = ble_central_find_cccd(value_handle);
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_get_cccd(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[3];
-    uint16_t out_len = ble_central_get_cccd(out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_gatt_write(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length < 3) { // value_handle[2] + at least 1 data byte
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint16_t handle = ((uint16_t)data[0] << 8) | data[1];
-    uint32_t err_code = ble_central_gatt_write(handle, &data[2], (uint8_t)(length - 2));
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_get_write(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[2];
-    uint16_t out_len = ble_central_get_write_result(out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_get_mtu(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint16_t mtu = ble_central_mtu();
-    uint8_t out[2] = { (mtu >> 8) & 0xFF, mtu & 0xFF };
-    return data_frame_make(cmd, STATUS_SUCCESS, 2, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_desc_discover(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t err_code = ble_central_desc_discover();
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_desc_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t start_index = (length >= 1) ? data[0] : 0;
-    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
-    uint16_t out_len = ble_central_copy_descs(start_index, out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_svc_discover(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t err_code = ble_central_svc_discover();
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_svc_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t start_index = (length >= 1) ? data[0] : 0;
-    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
-    uint16_t out_len = ble_central_copy_svcs(start_index, out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_device_info(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t err_code = ble_central_devinfo_start();
-    return data_frame_make(cmd, err_code == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_DEVICE_MODE_ERROR, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_get_device_info(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[512]; // state + count + 11 fields * (4 + BLE_DEVINFO_VAL_MAX) < 512
-    uint16_t out_len = ble_central_copy_devinfo(out, sizeof(out));
-    return data_frame_make(cmd, STATUS_SUCCESS, out_len, out);
-}
-
-// ---------------------------------------------------------------------------
-// Own-radio identity / radio power (cybersecurity fork additions).
-// These mutate OUR OWN radio. Scope (single target / scan-buffer-wide /
-// environment-wide broadcast) is selectable at the host / GUI for every
-// stress / broadcast command in the 7000-block — see CLAUDE.md fork-specific
-// exemption.
-// ---------------------------------------------------------------------------
-static data_frame_tx_t *cmd_processor_ble_set_addr(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length < 1 || length > 7 || data[0] > 3) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    // mode 1 (static-random) requires exactly 6 address bytes following the mode byte.
-    if (data[0] == BLE_ADDR_MODE_RANDOM_STATIC && length != 7) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    const uint8_t *addr_le = (data[0] == BLE_ADDR_MODE_RANDOM_STATIC) ? &data[1] : NULL;
-    uint32_t err = ble_addr_set(data[0], addr_le);
-    if (err == NRF_ERROR_BUSY) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL); // link active
-    }
-    if (err != NRF_SUCCESS) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_get_addr(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[1 + BLE_GAP_ADDR_LEN]; // addr_type + 6 bytes LE
-    uint32_t err = ble_addr_get(&out[0], &out[1]);
-    if (err != NRF_SUCCESS) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(out), out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_radio_set(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    if (length != 1 || data[0] > 1) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint32_t err = ble_radio_set(data[0]);
-    if (err != NRF_SUCCESS) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_radio_get(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t out[4]; // radio_on | advertising | scanning | central_link
-    uint32_t err = ble_radio_get(out);
-    if (err != NRF_SUCCESS) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(out), out);
-}
-
-// ---------------------------------------------------------------------------
-// Stress / broadcast tools (cybersecurity fork — operator-authorised, see
-// CLAUDE.md fork-specific exemption). Scope is selected per call:
-//   0 = single target (already-connected central link)
-//   1 = scan-buffer-wide (every address the passive scanner has cached)
-//   2 = full environment-wide broadcast on the 2.4 GHz BLE spectrum
-//       (non-connectable advertising spam, max payload, min regulatory
-//       interval — every scanner / peer in range sees it)
-// Flood = rapid WRITE_CMD spam. Kick = repeated disconnect on each target.
-// ---------------------------------------------------------------------------
-static data_frame_tx_t *cmd_processor_ble_flood_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    // scope[1] | value_handle[2 BE] | payload_size[1] | max_iter[2 BE] | interval_ms[2 BE]
-    if (length != 8 || data[0] > 2) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint8_t  scope        = data[0];
-    uint16_t value_handle = ((uint16_t)data[1] << 8) | data[2];
-    uint8_t  payload_size = data[3];
-    uint16_t max_iter     = ((uint16_t)data[4] << 8) | data[5];
-    uint16_t interval_ms  = ((uint16_t)data[6] << 8) | data[7];
-    if (interval_ms < 1) interval_ms = 1; // floor
-    if (!cmd_ble_radio_is_on()) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-
-    uint32_t err;
-    switch (scope) {
-    case 0: // single target — already-connected central link
-        err = ble_central_flood_start(value_handle, payload_size, max_iter, interval_ms);
-        break;
-    case 1: // scan-buffer-wide — iterate every cached address
-        err = ble_central_flood_scan_buffer(value_handle, payload_size, max_iter, interval_ms);
-        break;
-    case 2: // environment-wide broadcast — non-connectable adv spam
-        err = ble_adv_flood_start((uint8_t)value_handle, interval_ms);
-        break;
-    default:
-        err = NRF_ERROR_INVALID_PARAM;
-        break;
-    }
-
-    if (err == NRF_ERROR_INVALID_STATE || err == NRF_ERROR_BUSY ||
-            (scope == 2 && (err == NRF_ERROR_NO_MEM || err == NRF_ERROR_RESOURCES))) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    if (err != NRF_SUCCESS) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_flood_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    ble_central_flood_stop();
-    ble_adv_flood_stop();
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_flood_count(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint32_t n = ble_central_flood_count();
-    uint8_t out[4];
-    out[0] = (n >> 24) & 0xFF;
-    out[1] = (n >> 16) & 0xFF;
-    out[2] = (n >>  8) & 0xFF;
-    out[3] = (n      ) & 0xFF;
-    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(out), out);
-}
-
-static data_frame_tx_t *cmd_processor_ble_kick(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    // scope[1] | cycles[1]
-    if (length != 2 || data[1] == 0 || data[1] > 10 || data[0] > 1) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    if (data[0] == 0 && data[1] != 1) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    if (!cmd_ble_radio_is_on()) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    uint32_t err;
-    if (data[0] == 0) {
-        err = ble_central_kick(data[1]);
-    } else {
-        err = ble_central_kick_scan_buffer(data[1]);
-    }
-    if (err == NRF_ERROR_INVALID_STATE || err == NRF_ERROR_BUSY) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    if (err != NRF_SUCCESS) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_adv_flood_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    // scope[1] | fill_byte[1] | interval_units[1]. scope must be 2 for the
-    // environment-wide broadcast contract in data_cmd.h.
-    if (length != 3 || data[0] != 2) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    if (!cmd_ble_radio_is_on()) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    uint8_t fill = data[1];
-    uint8_t interval_units = data[2];
-    if (interval_units < 1 || interval_units > 102) { // 102 * 100 ms <= S140 10.24 s max
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    uint16_t interval_ms = (uint16_t)interval_units * 100u; // operator-facing ms; 100ms = min legacy
-    uint32_t err = ble_adv_flood_start(fill, interval_ms);
-    if (err == NRF_ERROR_INVALID_STATE || err == NRF_ERROR_BUSY ||
-            err == NRF_ERROR_NO_MEM || err == NRF_ERROR_RESOURCES) {
-        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
-    }
-    if (err != NRF_SUCCESS) {
-        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    }
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
-
-static data_frame_tx_t *cmd_processor_ble_adv_flood_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    ble_adv_flood_stop();
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
-}
 
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
@@ -4088,7 +3675,6 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_JABLOTRON_GET_EMU_ID,           NULL,                      cmd_processor_jablotron_get_emu_id,          NULL                   },
     {    DATA_CMD_IDTECK_SET_EMU_ID,              NULL,                      cmd_processor_idteck_set_emu_id,             NULL                   },
     {    DATA_CMD_IDTECK_GET_EMU_ID,              NULL,                      cmd_processor_idteck_get_emu_id,             NULL                   },
-    /* ISO14443-4 T=CL emulation */
 #if defined(PROJECT_CHAMELEON_ULTRA)
     /* ISO14443-4 T=CL emulation */
     {    DATA_CMD_HF14A_4_APDU_RECV,              NULL,                        cmd_processor_hf14a_4_apdu_recv,             NULL                   },
@@ -4096,9 +3682,12 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14A_4_SET_ANTI_COLL,          NULL,                        cmd_processor_hf14a_4_set_anti_coll,         NULL                   },
     {    DATA_CMD_HF14A_4_STATIC_RESP,            NULL,                        cmd_processor_hf14a_4_static_resp,           NULL                   },
     {    DATA_CMD_HF14A_4_READER_APDU,            before_hf_reader_run,        cmd_processor_hf14a_4_reader_apdu,           NULL                   },
-    {    DATA_CMD_HF14A_4_EMV_SCAN,               before_hf_reader_run,        cmd_processor_hf14a_4_emv_scan,              NULL                   },
-    {    DATA_CMD_HF14A_4_DESFIRE_SCAN,           before_hf_reader_run,        cmd_processor_hf14a_4_desfire_scan,          NULL                   },
-    {    6010,                                     NULL,                        cmd_processor_hf14a_4_debug_counters,        NULL                   },
+    {    DATA_CMD_HF14A_4_EMV_SCAN,               before_hf_reader_run,        cmd_processor_hf14a_4_emv_scan,              after_hf_reader_run    },
+    {    DATA_CMD_HF14A_4_DESFIRE_SCAN,           before_hf_reader_run,        cmd_processor_hf14a_4_desfire_scan,          after_hf_reader_run    },
+    {    DATA_CMD_HF14A_4_EMV_TRACE_START,        before_hf_reader_run,        cmd_processor_hf14a_4_emv_trace_start,       after_hf_reader_run    },
+    {    DATA_CMD_HF14A_4_EMV_TRACE_META,         NULL,                        cmd_processor_hf14a_4_emv_trace_meta,        NULL                   },
+    {    DATA_CMD_HF14A_4_EMV_TRACE_GET,          NULL,                        cmd_processor_hf14a_4_emv_trace_get,         NULL                   },
+    {    DATA_CMD_HF14A_4_DEBUG_COUNTERS,         NULL,                        cmd_processor_hf14a_4_debug_counters,        NULL                   },
     /* HF14A scan keeping field alive */
     {    DATA_CMD_HF14A_SCAN_KEEP,                before_hf_reader_run,        cmd_processor_hf14a_scan_keep,               NULL                   },
 #endif
@@ -4121,14 +3710,17 @@ data_frame_tx_t *cmd_processor_get_device_capabilities(uint16_t cmd, uint16_t st
  * @param resp data
  */
 static void auto_response_data(data_frame_tx_t *resp) {
-    // TODO Please select the reply source automatically according to the message source,
-    //  and do not reply by checking the validity of the link layer by layer
-    if (is_usb_working()) {
+    data_frame_transport_t transport = data_frame_get_transport();
+    if (transport == DATA_FRAME_TRANSPORT_USB && is_usb_working()) {
         usb_cdc_write(resp->buffer, resp->length);
-    } else if (is_nus_working()) {
+    } else if (transport == DATA_FRAME_TRANSPORT_BLE && is_nus_working()) {
+        nus_data_response(resp->buffer, resp->length);
+    } else if (transport == DATA_FRAME_TRANSPORT_NONE && is_usb_working()) {
+        usb_cdc_write(resp->buffer, resp->length);
+    } else if (transport == DATA_FRAME_TRANSPORT_NONE && is_nus_working()) {
         nus_data_response(resp->buffer, resp->length);
     } else {
-        NRF_LOG_ERROR("No connection valid found at response client.");
+        NRF_LOG_ERROR("Request transport is no longer available.");
     }
 }
 
@@ -4138,6 +3730,13 @@ static void auto_response_data(data_frame_tx_t *resp) {
 void on_data_frame_received(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     data_frame_tx_t *response = NULL;
     bool is_cmd_support = false;
+    if (data_frame_get_transport() == DATA_FRAME_TRANSPORT_BLE &&
+            settings_get_ble_pairing_enable_first_load() &&
+            !ble_command_link_authorized()) {
+        response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+        auto_response_data(response);
+        return;
+    }
     for (int i = 0; i < ARRAY_SIZE(m_data_cmd_map); i++) {
         if (m_data_cmd_map[i].cmd == cmd) {
             is_cmd_support = true;

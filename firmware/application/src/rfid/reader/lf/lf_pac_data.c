@@ -25,6 +25,9 @@ static circular_buffer cb;
 static void pac_saadc_cb(nrf_saadc_value_t *vals, size_t size) {
     for (size_t i = 0; i < size; i++) {
         nrf_saadc_value_t val = vals[i];
+        if (val < 0) {
+            val = 0;
+        }
         if (!cb_push_back(&cb, &val)) {
             return;
         }
@@ -40,7 +43,13 @@ static void uninit_pac_hw(void) {
 }
 
 bool pac_read(uint8_t *data, uint32_t timeout_ms) {
+    if (data == NULL) {
+        return false;
+    }
     void *codec = pac.alloc();
+    if (codec == NULL) {
+        return false;
+    }
     pac.decoder.start(codec, 0);
 
     // Start carrier first, then wait for T55XX POR (~5ms) before
@@ -49,7 +58,11 @@ bool pac_read(uint8_t *data, uint32_t timeout_ms) {
     start_lf_125khz_radio();
     bsp_delay_ms(10);
 
-    cb_init(&cb, PAC_BUFFER_SIZE, sizeof(uint16_t));
+    if (!cb_init(&cb, PAC_BUFFER_SIZE, sizeof(uint16_t))) {
+        stop_lf_125khz_radio();
+        pac.free(codec);
+        return false;
+    }
     init_pac_hw();
 
     bool ok = false;

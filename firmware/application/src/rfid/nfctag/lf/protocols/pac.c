@@ -149,7 +149,7 @@ static bool try_decode_frame(pac_codec *d, bool inverted) {
         decoded[i] = (uint8_t)val;
     }
 
-    if (decoded[0] != PAC_STX) {
+    if (decoded[0] != PAC_STX || decoded[1] != '2' || decoded[2] != '0') {
         return false;
     }
 
@@ -351,7 +351,22 @@ static void pac_build_bitstream(const uint8_t *card_id, uint8_t *bits_out) {
     }
 }
 
+bool pac_data_valid(const uint8_t *data) {
+    if (data == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < PAC_DATA_SIZE; i++) {
+        if ((data[i] & 0x80u) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static const nrf_pwm_sequence_t *pac_modulator(pac_codec *d, uint8_t *buf) {
+    if (!pac_data_valid(buf)) {
+        return NULL;
+    }
     uint8_t bits[PAC_FRAME_BITS];
     pac_build_bitstream(buf, bits);
 
@@ -371,6 +386,9 @@ static const nrf_pwm_sequence_t *pac_modulator(pac_codec *d, uint8_t *buf) {
 #define PAC_T55XX_BLOCK_COUNT 5  // 1 config + 4 data blocks
 
 uint8_t pac_t55xx_writer(uint8_t *data, uint32_t *blks) {
+    if (!pac_data_valid(data) || blks == NULL) {
+        return 0;
+    }
     uint8_t bits[PAC_FRAME_BITS];
     pac_build_bitstream(data, bits);
 

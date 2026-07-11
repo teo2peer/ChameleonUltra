@@ -45,14 +45,28 @@ protocol, production batch/week/year, and each application AID with its file IDs
 
 ## EMV — richer `emv scan`
 
-`emv scan` runs the full EMV sequence (PPSE → SELECT AID → GPO → READ RECORDs,
-optionally GENERATE AC) in one firmware call and decodes the card's data
-elements. The CLI and GUI now show a per-frame APDU trace (command name, raw
-command/response, status word, and parsed response TLVs), including transaction
-cryptogram fields when `GENERATE AC` succeeds. GPO format-1 responses (`80` =
-AIP + AFL) are expanded so AIP/AFL decode the same way as format-2 `77`
-responses. Beyond PAN (with Luhn check), expiry, cardholder name, issuer country
-and application label/name, it now also gathers and displays:
+`emv scan` is a multi-application EMV data-discovery and trace command. Its normal
+mode selects PPSE, parses every advertised application template, selects every AID,
+requests standard GET DATA objects, and performs bounded record discovery. It does
+not run GPO by default because Visa-style GPO can generate a cryptogram and advance
+card state.
+
+Firmware that advertises commands 6007-6009 uses the retained paged protocol. The
+CLI and GUI validate the session ID, cursor, atomic record lengths/counts, and CRC32,
+then preserve every retained APDU and RF frame. RF records include direction, exact
+bit length, PCB/control traffic, CRC bytes, transport status, and relative timing.
+Metadata explicitly reports timeouts, transport failures, dropped RF detail, and
+logical trace/response truncation. Older firmware falls back to bounded command 6005.
+
+The explicit maximum-processing option reactivates and processes every discovered
+AID independently, builds the card's PDOL in its declared order, runs GPO, validates
+format-1/format-2 AIP+AFL, reads AFL records, and issues GENERATE AC only when a
+complete CDOL1 exists. Visa applications that already return cryptogram data from
+GPO do not receive a generic GENERATE AC. This mode can advance ATC or other card
+state even though the tool performs no issuer/bank communication.
+
+Beyond PAN (with Luhn check), expiry, cardholder name, issuer country and application
+label/name, decoding includes:
 
 - **Effective date** (tag 5F25)
 - **PAN sequence number** (5F34)
@@ -68,18 +82,18 @@ and application label/name, it now also gathers and displays:
 emv scan                    # print to terminal
 emv scan -f /tmp/card.json  # save PM3-compatible JSON
 emv scan -s 3               # also load the scanned card into slot 3 for emulation
-emv scan --amount 1.00      # offline GENERATE AC simulation; no bank traffic
+emv scan --maximum-processing --amount 1.00  # explicit state-changing processing
+emv scan --maximum-processing --grid --max-aids 16
+emv scan --rf --logs --budget-ms 30000 -f /tmp/lossless-trace.json
 ```
 
-The firmware GPO builder follows the card's actual PDOL tag order (`9F38`) and
-fills known terminal tags (`9F66`, `9F33`, `9F40`, `9F35`, `9F1A`, `5F2A`,
-`9A`, `9C`, `95`, `9F37`, amount fields, and several Mastercard-specific
-terminal fields) with a deterministic lab terminal profile. Fixed-length PDOL
-guesses remain only as compatibility fallbacks. If the AFL does not expose PAN or
-expiry data, the firmware falls back to a bounded nfc-frog-style sweep of SFI
-1..31, records 1..16. This mirrors the approach used by public EMV
-readers/kernels such as EMV-NFC-Paycard-Enrollment, nfc-frog, and OpenEMV
-without vendoring their code.
+The GPO/CDOL builder fills terminal country/currency/date/type, amount, TTQ and a
+fresh unpredictable number in the card-declared order. Unknown DOL objects are
+zero-filled and malformed or oversized DOLs are rejected rather than partially
+sent. Record discovery uses valid SFI 1..30 and configurable smart/grid limits.
+Transaction-log records are read only when requested and a valid `9F4D` Log Entry
+is present. This is investigative tooling, not a certified EMV Level-2 kernel and
+does not perform CVM, issuer authorization, issuer scripts, or cryptogram validation.
 
 `emv load --defaults` and the GUI EMV emulator "Test card" preset load a
 dummy, readable Mastercard-shaped test card: PPSE, SELECT AID, GPO format 1

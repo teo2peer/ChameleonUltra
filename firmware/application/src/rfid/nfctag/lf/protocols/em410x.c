@@ -138,25 +138,30 @@ uint8_t em410x_16_period(uint8_t interval) {
     return em410x_period(4, interval);  // clock_per_bit = 16, divisor = 4
 }
 
-em410x_codec *em410x_64_alloc(void) {
+static em410x_codec *em410x_alloc(period rp) {
     em410x_codec *codec = malloc(sizeof(em410x_codec));
+    if (codec == NULL) {
+        return NULL;
+    }
     codec->modem = malloc(sizeof(manchester));
-    codec->modem->rp = em410x_64_period;
+    if (codec->modem == NULL) {
+        free(codec);
+        return NULL;
+    }
+    codec->modem->rp = rp;
     return codec;
+}
+
+em410x_codec *em410x_64_alloc(void) {
+    return em410x_alloc(em410x_64_period);
 };
 
 em410x_codec *em410x_32_alloc(void) {
-    em410x_codec *codec = malloc(sizeof(em410x_codec));
-    codec->modem = malloc(sizeof(manchester));
-    codec->modem->rp = em410x_32_period;
-    return codec;
+    return em410x_alloc(em410x_32_period);
 };
 
 em410x_codec *em410x_16_alloc(void) {
-    em410x_codec *codec = malloc(sizeof(em410x_codec));
-    codec->modem = malloc(sizeof(manchester));
-    codec->modem->rp = em410x_16_period;
-    return codec;
+    return em410x_alloc(em410x_16_period);
 };
 
 void em410x_free(em410x_codec *d) {
@@ -230,6 +235,7 @@ bool em410x_decoder_feed(em410x_codec *d, uint16_t interval) {
     int8_t bitlen = 0;
     manchester_feed(d->modem, (uint8_t)interval, bits, &bitlen);
     if (bitlen == -1) {
+        manchester_reset(d->modem);
         d->raw = 0;
         d->raw_length = 0;
         d->total_length = 0;

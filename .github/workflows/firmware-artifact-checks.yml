@@ -1,0 +1,46 @@
+name: Firmware artifact budgets
+
+on:
+  workflow_run:
+    workflows: ["PR handler", "Push handler"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: Workflow run containing *-firmware-debug artifacts
+        required: true
+        type: string
+
+jobs:
+  check-reports:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Download link and size reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-firmware-debug"
+          path: firmware-reports
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.run-id || github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Validate Ultra and Lite budgets
+        run: |
+          checked=0
+          for report_dir in firmware-reports/*-firmware-debug; do
+            [ -d "$report_dir" ] || continue
+            bash .github/scripts/check_firmware_artifacts.sh "$report_dir"
+            checked=$((checked + 1))
+          done
+          if [ "$checked" -ne 2 ]; then
+            echo "Expected Ultra and Lite debug artifacts; checked $checked." >&2
+            exit 1
+          fi

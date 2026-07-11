@@ -3,8 +3,8 @@
 
 #include "tag_emulation.h"
 
-#define MAX_NFC_RX_BUFFER_SIZE  257
-#define MAX_NFC_TX_BUFFER_SIZE  512  /* must hold PCB + max APDU response */
+#define MAX_NFC_RX_BUFFER_SIZE  292  /* 256 data + parity expansion + CRC/slack */
+#define MAX_NFC_TX_BUFFER_SIZE  511  /* NFCT TXDATABYTES is a 9-bit value */
 
 #define NFC_TAG_14A_CRC_LENGTH  2
 
@@ -82,6 +82,7 @@ typedef struct {
 
 // Communication reception function that needs to be implemented
 typedef void (*nfc_tag_14a_reset_handler_t)(void);
+typedef void (*nfc_tag_14a_activation_handler_t)(uint8_t fsdi, uint8_t cid);
 
 /* Sniff callback — called for every received frame before the tag handler.
  * data    : raw frame bytes (after parity strip)
@@ -109,8 +110,10 @@ typedef nfc_tag_14a_coll_res_reference_t *(*nfc_tag_14a_coll_handler_t)(void);
 // The interface that 14A communication receiver needs to be implemented
 typedef struct {
     nfc_tag_14a_reset_handler_t cb_reset;
+    nfc_tag_14a_activation_handler_t cb_activated;
     nfc_tag_14a_state_handler_t cb_state;
     nfc_tag_14a_coll_handler_t get_coll_res;
+    bool cb_state_crc_strip;
 } nfc_tag_14a_handler_t;
 
 // Different or verification code
@@ -123,7 +126,7 @@ bool nfc_tag_14a_checks_crc(uint8_t *pbtData, size_t szLen);
 
 // 14A frame combination
 uint8_t nfc_tag_14a_wrap_frame(const uint8_t *pbtTx, const size_t szTxBits, const uint8_t *pbtTxPar, uint8_t *pbtFrame);
-uint8_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBits, uint8_t *pbtRx, uint8_t *pbtRxPar);
+size_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBits, uint8_t *pbtRx, uint8_t *pbtRxPar);
 
 // 14A communication control
 void nfc_tag_14a_sense_switch(bool enable);

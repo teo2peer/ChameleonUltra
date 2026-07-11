@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <string.h>
 #include "crc_utils.h"
 #include "app_status.h"
 #include "settings.h"
@@ -14,16 +15,51 @@ NRF_LOG_MODULE_REGISTER();
 
 static settings_data_t config;
 static uint16_t m_config_crc;
+static bool m_config_crc_valid;
 static bool m_ble_pairing_enable_first_load_value;
 
 static void update_config_crc(void) {
     calc_14a_crc_lut((uint8_t *)&config, sizeof(config), (uint8_t *)&m_config_crc);
+    m_config_crc_valid = true;
 }
 
 static bool config_did_change(void) {
     uint16_t new_calc_crc;
     calc_14a_crc_lut((uint8_t *)&config, sizeof(config), (uint8_t *)&new_calc_crc);
-    return new_calc_crc != m_config_crc;
+    return !m_config_crc_valid || new_calc_crc != m_config_crc;
+}
+
+static bool config_is_valid(uint16_t length) {
+    if (length != sizeof(config) || config.version > SETTINGS_CURRENT_VERSION || config.reserved0 != 0U) {
+        return false;
+    }
+    if (config.version == 0U) {
+        return true;
+    }
+    if (config.animation_config >= SettingsAnimationModeMAX) {
+        return false;
+    }
+    if (config.version >= 2U &&
+            (config.button_a_press >= SettingsButtonMAX || config.button_b_press >= SettingsButtonMAX)) {
+        return false;
+    }
+    if (config.version >= 3U &&
+            (config.button_a_long_press >= SettingsButtonMAX || config.button_b_long_press >= SettingsButtonMAX)) {
+        return false;
+    }
+    if (config.version >= 4U) {
+        for (uint8_t i = 0; i < BLE_PAIRING_KEY_LEN; i++) {
+            if (config.ble_connect_key[i] < '0' || config.ble_connect_key[i] > '9') {
+                return false;
+            }
+        }
+    }
+    if (config.version >= 6U &&
+            (config.sleep_timeout < SETTINGS_SLEEP_TIMEOUT_MIN_S ||
+             config.sleep_timeout > SETTINGS_SLEEP_TIMEOUT_MAX_S)) {
+        return false;
+    }
+    return true;
 }
 
 void settings_update_version_for_config(void) {
@@ -59,6 +95,7 @@ void settings_init_sleep_timeout_config(void) {
 }
 
 void settings_init_config(void) {
+    memset(&config, 0, sizeof(config));
     settings_update_version_for_config();
     config.animation_config = SettingsAnimationModeFull; // add on version1
     settings_init_button_press_config();
@@ -105,13 +142,14 @@ void settings_migrate(void) {
 
 void settings_load_config(void) {
     uint16_t length = sizeof(config);
+    m_config_crc_valid = false;
     bool ret = fds_read_sync(FDS_SETTINGS_FILE_ID, FDS_SETTINGS_RECORD_KEY, &length, (uint8_t *)&config);
-    if (ret) {
+    if (ret && config_is_valid(length)) {
         NRF_LOG_INFO("Load config done.");
         // After the reading is complete, we first save a copy of the current CRC, which can be used as a reference for comparison of changes when saving later
         update_config_crc();
     } else {
-        NRF_LOG_WARNING("Config does not exist, loading default values...");
+        NRF_LOG_WARNING("Config is missing or invalid, loading default values...");
         settings_init_config();
     }
     if (config.version > SETTINGS_CURRENT_VERSION) {
@@ -131,6 +169,10 @@ void settings_load_config(void) {
 }
 
 uint8_t settings_save_config(void) {
+    if (!config_is_valid(sizeof(config))) {
+        NRF_LOG_ERROR("Refusing to save invalid config.");
+        return STATUS_PAR_ERR;
+    }
     // We are saving the configuration, we need to calculate the crc code of the current configuration to judge whether the following data is updated
     if (config_did_change()) {    // Before saving, make sure that the configuration has changed
         NRF_LOG_INFO("Save config start.");

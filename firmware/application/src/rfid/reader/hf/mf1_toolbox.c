@@ -743,6 +743,9 @@ uint32_t measure_median(uint32_t *src, uint32_t length) {
     uint32_t minIndex;
     uint32_t temp, i;
 
+    if (src == NULL || length == 0) {
+        return 0;
+    }
     if (length == 1) {
         return src[0];
     }
@@ -761,7 +764,9 @@ uint32_t measure_median(uint32_t *src, uint32_t length) {
             src[minIndex] = temp;
         }
     }
-    return src[length / 2 - 1];
+    if (length & 1u) return src[length / 2u];
+    return src[length / 2u - 1u] / 2u + src[length / 2u] / 2u +
+           ((src[length / 2u - 1u] & 1u) && (src[length / 2u] & 1u));
 }
 
 /**
@@ -1226,12 +1231,12 @@ uint8_t mf1_static_encrypted_nonces_acquire(uint64_t keyKnown, uint8_t sector_co
             }
 
             uint32_t nt1 = 0;
-            if (authex(pcs, cuid, blockNo, 0x60 + keyType + 4, keyKnown, AUTH_FIRST, &nt1) != STATUS_HF_TAG_OK) {
+            if (authex(pcs, cuid, blockNo, PICC_AUTHENT1A + keyType, keyKnown, AUTH_FIRST, &nt1) != STATUS_HF_TAG_OK) {
                 return STATUS_MF_ERR_AUTH;
             }
 
             uint8_t cmd_status;
-            uint8_t res = send_cmd(pcs, AUTH_NESTED, 0x60 + keyType + 4, blockNo, &cmd_status, receivedAnswer, par_enc, sizeof(receivedAnswer) * 8);
+            uint8_t res = send_cmd(pcs, AUTH_NESTED, PICC_AUTHENT1A + keyType, blockNo, &cmd_status, receivedAnswer, par_enc, sizeof(receivedAnswer) * 8);
             if (res != 32) {
                 return STATUS_MF_ERR_AUTH;
             }
@@ -1246,11 +1251,11 @@ uint8_t mf1_static_encrypted_nonces_acquire(uint64_t keyKnown, uint8_t sector_co
                 return STATUS_HF_TAG_NO;
             }
 
-            if (authex(pcs, cuid, blockNo, 0x60 + keyType + 4, keyKnown, AUTH_FIRST, &nt1) != STATUS_HF_TAG_OK) {
+            if (authex(pcs, cuid, blockNo, PICC_AUTHENT1A + keyType, keyKnown, AUTH_FIRST, &nt1) != STATUS_HF_TAG_OK) {
                 return STATUS_MF_ERR_AUTH;
             }
 
-            res = send_cmd(pcs, AUTH_NESTED, 0x60 + keyType, blockNo, &cmd_status, receivedAnswer, par_enc, sizeof(receivedAnswer) * 8);
+            res = send_cmd(pcs, AUTH_NESTED, PICC_AUTHENT1A + keyType, blockNo, &cmd_status, receivedAnswer, par_enc, sizeof(receivedAnswer) * 8);
             if (res != 32) {
                 return STATUS_MF_ERR_AUTH;
             }

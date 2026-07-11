@@ -41,6 +41,7 @@ typedef enum {
     // exit for any in-progress stress / broadcast / scan-buffer attack, and
     // it overrides the configured button-press function. No enum entry needed;
     // see button_press_process() in app_main.c.
+    SettingsButtonMAX = 7U,
 } settings_button_function_t;
 
 typedef struct ALIGN_U32 {

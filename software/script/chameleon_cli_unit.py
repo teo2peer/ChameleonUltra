@@ -52,6 +52,24 @@ from chameleon_enum import (
 )
 from chameleon_enum import HIDFormat
 from crypto1 import Crypto1
+from emv_trace import (
+    ApduPayload,
+    AppPayload,
+    EmvTraceError,
+    EmvTraceRequest,
+    OPT_INCLUDE_RF,
+    OPT_MAXIMUM_PROCESSING,
+    OPT_PDOL_FALLBACK,
+    OPT_RECORD_GRID,
+    OPT_TIMING,
+    OPT_TRANSACTION_LOG,
+    TRACE_APP_LIMIT,
+    TRACE_RESPONSE_TRUNCATED,
+    TRACE_RF_TRUNCATED,
+    TRACE_TIMEOUT,
+    TRACE_TRANSPORT_ERROR,
+    trace_to_json,
+)
 
 # NXP IDs based on https://www.nxp.com/docs/en/application-note/AN10833.pdf
 type_id_SAK_dict = {
@@ -73,17 +91,36 @@ default_cwd = Path.cwd() / Path(__file__).with_name("bin")
 
 def load_key_file(import_key, keys):
     """
-    Load key file and append its content to the provided set of keys.
-    Each key is expected to be on a new line in the file.
+    Load a binary .key file (raw 6-byte keys concatenated, as written by
+    --export-key) and add each key to the provided set.
     """
     with open(import_key.name, "rb") as file:
-        keys.update(
-            line.encode("utf-8") for line in file.read().decode("utf-8").splitlines()
-        )
+        data = file.read()
+    if len(data) % 6 != 0:
+        print(f' - {color_string((CR, ".key file length is not a multiple of 6, ignored"))}')
+        return keys
+    for i in range(0, len(data), 6):
+        keys.add(data[i:i + 6])
     return keys
 
 
 def load_dic_file(import_dic, keys):
+    """
+    Load a text .dic file (one 12-hex-char key per line, as written by
+    --export-dic) and add each parsed 6-byte key to the provided set.
+    Blank lines and lines starting with '#' are skipped.
+    """
+    with open(import_dic.name, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not re.match(r"^[a-fA-F0-9]{12}$", line):
+                print(
+                    f' - {color_string((CR, "Key should be in hex[12] format, invalid key is ignored"))}, key = "{line}"'
+                )
+                continue
+            keys.add(bytes.fromhex(line))
     return keys
 
 
@@ -1031,6 +1068,54 @@ def decode_ble_adv(adv: bytes):
     return name, fields
 
 
+def _drain_ble_pages(fetch_page, *, start_index=0, expected_count=None,
+                     stateful=False, index_limit=0xFFFF, max_pages=256):
+    """Drain record-indexed BLE pages, advancing by parsed records, not bytes."""
+    if not 0 <= start_index <= index_limit:
+        raise ValueError("BLE page start index is out of range")
+    if expected_count is not None and expected_count < start_index:
+        raise ValueError("BLE expected count precedes the start index")
+
+    items = []
+    state = None
+    index = start_index
+    for _ in range(max_pages):
+        page = fetch_page(index)
+        if stateful:
+            if not isinstance(page, dict) or 'state' not in page or 'items' not in page:
+                raise ValueError("malformed stateful BLE page")
+            state = page['state']
+            records = page['items']
+        else:
+            records = page
+        if not isinstance(records, list):
+            raise ValueError("malformed BLE page: records must be a list")
+
+        items.extend(records)
+        absolute_count = start_index + len(items)
+        if expected_count is not None:
+            if absolute_count > expected_count:
+                raise RuntimeError("BLE page returned more records than advertised")
+            if absolute_count == expected_count:
+                return {'state': state, 'items': items} if stateful else items
+        if not records:
+            if expected_count is not None:
+                raise RuntimeError(
+                    f"BLE paging stopped at {absolute_count} of {expected_count} records")
+            return {'state': state, 'items': items} if stateful else items
+
+        next_index = index + len(records)
+        if next_index <= index:
+            raise RuntimeError("BLE paging made no forward progress")
+        if next_index > index_limit:
+            if expected_count is None:
+                return {'state': state, 'items': items} if stateful else items
+            raise RuntimeError("BLE paging index exceeds protocol range")
+        index = next_index
+
+    raise RuntimeError(f"BLE paging exceeded {max_pages} pages")
+
+
 @ble.command("scan")
 class BLEScan(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -1057,7 +1142,10 @@ class BLEScan(DeviceRequiredUnit):
         return parser
 
     def on_exec(self, args: argparse.Namespace):
-        self.cmd.ble_scan_start(args.active)
+        start = self.cmd.ble_scan_start(args.active)
+        if start.status != Status.SUCCESS:
+            print(f"Could not start BLE scan (status 0x{start.status:02X}).")
+            return
         mode = "active (sends scan requests)" if args.active else "passive, no transmission"
         print(f"Listening for BLE advertisements for {args.timeout:.1f}s ({mode})...")
         try:
@@ -1070,7 +1158,8 @@ class BLEScan(DeviceRequiredUnit):
             print("No BLE devices found")
             return
 
-        devices = self.cmd.ble_scan_get_results(0)
+        devices = _drain_ble_pages(
+            self.cmd.ble_scan_get_results, expected_count=count, index_limit=0xFF)
         # Strongest signal first.
         devices.sort(key=lambda d: d['rssi'], reverse=True)
         if args.min_rssi is not None:
@@ -1137,7 +1226,10 @@ class BLEConnect(DeviceRequiredUnit):
 
     def on_exec(self, args: argparse.Namespace):
         addr_le = _parse_ble_addr(args.addr)
-        self.cmd.ble_connect(addr_le, args.type)
+        response = self.cmd.ble_connect(addr_le, args.type)
+        if response.status != Status.SUCCESS:
+            print(f"Could not start BLE connection (status 0x{response.status:02X}).")
+            return
         print(f"Connecting to {args.addr} (type {args.type})...")
         for _ in range(50):  # up to ~5 s
             time.sleep(0.1)
@@ -1196,18 +1288,28 @@ class BLEStatus(DeviceRequiredUnit):
 class BLEPing(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
         parser = ArgumentParserNoExit()
-        parser.description = "Run a native firmware-side BLE link probe against one target or all scanned devices."
-        parser.add_argument("--addr", metavar="<MAC>",
-                            help="Target BLE address for a single probe, e.g. AA:BB:CC:DD:EE:FF")
-        parser.add_argument("--all", action="store_true",
-                            help="Probe all devices from the last passive scan instead of a single target")
+        parser.description = (
+            "Run a native firmware-side BLE link probe. With no selector, probe "
+            "the current central link; use --addr to connect first or --all for "
+            "all devices from the last scan.")
+        target = parser.add_mutually_exclusive_group()
+        target.add_argument("--addr", metavar="<MAC>",
+                            help="Connect to and probe one BLE address, e.g. AA:BB:CC:DD:EE:FF")
+        target.add_argument("--all", action="store_true",
+                            help="Probe all devices from the last passive scan")
+        parser.add_argument("--type", type=int, default=0, choices=[0, 1, 2, 3],
+                            help="Address type with --addr: 0=public, 1=random, 2=RPA, 3=NRPA (default 0)")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
         if args.all:
+            count = self.cmd.ble_scan_get_count()
+            if count == 0:
+                print("No scanned devices. Run 'ble scan' first.")
+                return
             self.cmd.ble_link_probe(True)
             print("Probing all scanned devices...")
-            for _ in range(80):
+            for _ in range(max(80, count * 60 + 20)):
                 time.sleep(0.1)
                 st = self.cmd.ble_central_state()
                 if st.get('probe_state') == 2:
@@ -1223,41 +1325,58 @@ class BLEPing(DeviceRequiredUnit):
             return
 
         if not args.addr:
-            print("Either --addr or --all is required.")
+            st = self.cmd.ble_central_state()
+            if st.get('conn_state') != 2:
+                print("No current BLE link. Use 'ble connect' or pass --addr/--all.")
+                return
+            self.cmd.ble_link_probe()
+            print("Probing current link...")
+            for _ in range(40):
+                time.sleep(0.05)
+                st = self.cmd.ble_central_state()
+                if st.get('probe_state') == 2:
+                    print("Ping completed successfully.")
+                    return
+                if st.get('probe_state') == 3:
+                    print(f"Ping failed (0x{st.get('probe_result', 0):02X}).")
+                    return
+            print("Ping timed out.")
             return
 
         addr_le = _parse_ble_addr(args.addr)
 
-        self.cmd.ble_connect(addr_le, 0)
-        print(f"Connecting to {args.addr}...")
-        for _ in range(50):
-            time.sleep(0.1)
-            st = self.cmd.ble_central_state()
-            if st.get('conn_state') == 2:
-                break
-            if st.get('conn_state') in (0, 3):
-                print("Connection failed / timed out.")
-                return
-        else:
-            print("Still connecting; check 'ble status'.")
+        response = self.cmd.ble_connect(addr_le, args.type)
+        if response.status != Status.SUCCESS:
+            print(f"Could not start BLE connection (status 0x{response.status:02X}).")
             return
-
-        self.cmd.ble_link_probe()
-        print("Probing link...")
-        for _ in range(40):
-            time.sleep(0.05)
-            st = self.cmd.ble_central_state()
-            if st.get('probe_state') == 2:
-                print("Ping completed successfully.")
-                self.cmd.ble_disconnect()
+        try:
+            print(f"Connecting to {args.addr} (type {args.type})...")
+            for _ in range(50):
+                time.sleep(0.1)
+                st = self.cmd.ble_central_state()
+                if st.get('conn_state') == 2:
+                    break
+                if st.get('conn_state') in (0, 3):
+                    print("Connection failed / timed out.")
+                    return
+            else:
+                print("Still connecting; cancelling the attempt.")
                 return
-            if st.get('probe_state') == 3:
-                print(f"Ping failed (0x{st.get('probe_result', 0):02X}).")
-                self.cmd.ble_disconnect()
-                return
 
-        print("Ping timed out.")
-        self.cmd.ble_disconnect()
+            self.cmd.ble_link_probe()
+            print("Probing link...")
+            for _ in range(40):
+                time.sleep(0.05)
+                st = self.cmd.ble_central_state()
+                if st.get('probe_state') == 2:
+                    print("Ping completed successfully.")
+                    return
+                if st.get('probe_state') == 3:
+                    print(f"Ping failed (0x{st.get('probe_result', 0):02X}).")
+                    return
+            print("Ping timed out.")
+        finally:
+            self.cmd.ble_disconnect()
 
 
 @ble.command("advertise")
@@ -1322,8 +1441,8 @@ class BLESpoofMac(DeviceRequiredUnit):
         sub.add_parser("private", help="Auto: random private resolvable (RPA)")
         sub.add_parser("nonresolv", help="Auto: random private non-resolvable")
         sub.add_parser("show", help="Print current address and type")
-        s = sub.add_parser("static", help="Set a static-random address (6 hex bytes LE)")
-        s.add_argument("addr", help="6-byte address (LE), e.g. 'C0:11:22:33:44:55' or 'c01122334455'")
+        s = sub.add_parser("static", help="Set a static-random address")
+        s.add_argument("addr", help="Display-order address, e.g. 'C0:11:22:33:44:55'")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -1334,7 +1453,7 @@ class BLESpoofMac(DeviceRequiredUnit):
                 return
             addr_type = _BLE_ADDR_TYPES.get(r['addr_type'], f"type={r['addr_type']}")
             print(f"Type : {addr_type}")
-            print(f"Addr : {bytes(r['addr']).hex(':').upper()}")
+            print(f"Addr : {bytes(reversed(r['addr'])).hex(':').upper()}")
             return
 
         if args.action == "restore":
@@ -1354,12 +1473,13 @@ class BLESpoofMac(DeviceRequiredUnit):
             if len(raw) != 12:
                 raise ValueError(f"static-random address must be 6 bytes (got {len(raw) // 2})")
             try:
-                addr = bytes.fromhex(raw)
+                addr_display = bytes.fromhex(raw)
             except ValueError as e:
                 raise ValueError(f"invalid hex address: {e}")
-            # Static-random must have top 2 bits of MSB = 11 — firmware enforces this.
-            self.cmd.ble_set_addr(1, addr)
-            print(f"Static-random address set: {addr.hex(':').upper()}.")
+            if addr_display[0] & 0xC0 != 0xC0:
+                raise ValueError("static-random address must start with a byte in C0..FF")
+            self.cmd.ble_set_addr(1, addr_display[::-1])
+            print(f"Static-random address set: {addr_display.hex(':').upper()}.")
 
 
 @ble.command("radio")
@@ -1644,11 +1764,22 @@ class BLEDiscover(DeviceRequiredUnit):
             print("Not connected to a target (use 'ble connect' first).")
             return
         print("Discovering characteristics...")
+        state = None
         for _ in range(50):  # up to ~5 s
             time.sleep(0.1)
-            if self.cmd.ble_central_state().get('disc_state') in (2, 3):
+            state = self.cmd.ble_central_state()
+            if state.get('disc_state') in (2, 3):
                 break
-        chars = self.cmd.ble_gatt_get_chars(0)
+        if state is None or state.get('disc_state') == 1:
+            print("Characteristic discovery timed out.")
+            return
+        if state.get('disc_state') == 3:
+            print("Characteristic discovery failed.")
+            return
+        expected_chars = state.get('char_count') if state is not None else None
+        chars = _drain_ble_pages(
+            self.cmd.ble_gatt_get_chars, expected_count=expected_chars,
+            index_limit=0xFF)
         if not chars:
             print("No characteristics found.")
             return
@@ -1657,8 +1788,12 @@ class BLEDiscover(DeviceRequiredUnit):
         services = []
         for _ in range(30):  # up to ~3 s
             time.sleep(0.1)
-            sv = self.cmd.ble_get_svcs(0)
-            if sv['state'] in (2, 3):
+            sv = _drain_ble_pages(
+                self.cmd.ble_get_svcs, stateful=True, index_limit=0xFF)
+            if sv['state'] == 3:
+                print("Primary-service discovery failed.")
+                break
+            if sv['state'] == 2:
                 services = sv['items']
                 break
 
@@ -1713,8 +1848,12 @@ class BLEDescriptors(DeviceRequiredUnit):
         items = []
         for _ in range(50):  # up to ~5 s
             time.sleep(0.1)
-            r = self.cmd.ble_get_descs(0)
-            if r['state'] in (2, 3):
+            r = _drain_ble_pages(
+                self.cmd.ble_get_descs, stateful=True, index_limit=0xFF)
+            if r['state'] == 3:
+                print("Descriptor discovery failed.")
+                return
+            if r['state'] == 2:
                 items = r['items']
                 break
         if not items:
@@ -1757,7 +1896,10 @@ class BLEInfo(DeviceRequiredUnit):
         for _ in range(60):  # up to ~3 s
             time.sleep(0.05)
             info = self.cmd.ble_get_devinfo()
-            if info['state'] in (2, 3):
+            if info['state'] == 3:
+                print("Device-information read failed.")
+                return
+            if info['state'] == 2:
                 break
         present = [it for it in info['items'] if it['status'] != 0xFF]
         if not present:
@@ -1788,7 +1930,7 @@ class BLERead(DeviceRequiredUnit):
         for _ in range(40):  # up to ~2 s
             time.sleep(0.05)
             r = self.cmd.ble_gatt_read_result()
-            if r['state'] == 2:
+            if r['state'] in (2, 3):
                 if r['gatt_status'] != 0:
                     print(f"Read failed (ATT status 0x{r['gatt_status']:02X})")
                 else:
@@ -1819,6 +1961,12 @@ class BLEWrite(DeviceRequiredUnit):
         if not payload:
             print("No data to write")
             return
+        mtu = self.cmd.ble_get_mtu()
+        max_payload = max(0, mtu - 3)
+        if len(payload) > max_payload:
+            print(f"Write payload is {len(payload)} bytes; current ATT MTU {mtu} "
+                  f"allows at most {max_payload} bytes (MTU-3).")
+            return
         resp = self.cmd.ble_gatt_write_start(args.handle, payload)
         if resp.status != Status.SUCCESS:
             print("Not connected to a target (use 'ble connect' first).")
@@ -1826,7 +1974,7 @@ class BLEWrite(DeviceRequiredUnit):
         for _ in range(40):  # up to ~2 s
             time.sleep(0.05)
             r = self.cmd.ble_gatt_write_result()
-            if r['state'] == 2:
+            if r['state'] in (2, 3):
                 gs = r['gatt_status']
                 if gs == 0:
                     print(f"Write to 0x{args.handle:04X} OK ({len(payload)} bytes)")
@@ -1886,9 +2034,10 @@ class BLESubscribe(DeviceRequiredUnit):
         try:
             while time.time() < end:
                 time.sleep(0.3)
-                notifs = self.cmd.ble_get_notifications(0)
-                while seen < len(notifs):
-                    n = notifs[seen]
+                notifs = _drain_ble_pages(
+                    self.cmd.ble_get_notifications, start_index=seen,
+                    index_limit=0xFFFF)
+                for n in notifs:
                     seen += 1
                     d = n['data']
                     printable = f"  \"{d.decode('utf-8', 'replace')}\"" if d else ""
@@ -1938,35 +2087,37 @@ class BLEFuzz(DeviceRequiredUnit):
         print(f"Fuzzing handle 0x{args.handle:04X}: {limit} writes @ {args.interval}ms. "
               f"Ctrl-C to cancel. The target is freed to reconnect to its normal "
               f"source when the batch finishes.")
+        log = []
         try:
-            while True:
-                time.sleep(0.3)
-                st = self.cmd.ble_central_state()
-                print(f"\r  sent={st.get('fuzz_sent', 0)}  "
-                      f"target_alive={st.get('target_alive', False)}   ", end='', flush=True)
-                if not st.get('target_alive', False) and st.get('conn_state') == 3:
-                    print("\n! Target dropped the connection — possible crash / defensive "
-                          "disconnect.")
-                    break
-                if st.get('fuzz_state') != 1:
-                    print("\n  fuzzing finished.")
-                    break
-        except KeyboardInterrupt:
-            print("\n  interrupted.")
-        finally:
-            self.cmd.ble_fuzz_stop()
+            try:
+                while True:
+                    time.sleep(0.3)
+                    st = self.cmd.ble_central_state()
+                    print(f"\r  sent={st.get('fuzz_sent', 0)}  "
+                          f"target_alive={st.get('target_alive', False)}   ", end='', flush=True)
+                    if not st.get('target_alive', False) and st.get('conn_state') == 3:
+                        print("\n! Target dropped the connection — possible crash / defensive "
+                              "disconnect.")
+                        break
+                    if st.get('fuzz_state') != 1:
+                        print("\n  fuzzing finished.")
+                        break
+            except KeyboardInterrupt:
+                print("\n  interrupted.")
+            finally:
+                self.cmd.ble_fuzz_stop()
 
-        try:
-            log = self.cmd.ble_fuzz_get_log(0)
-        except Exception:
-            log = []
+            log = _drain_ble_pages(
+                self.cmd.ble_fuzz_get_log, index_limit=0xFFFF)
+        finally:
+            # Free the target after every post-start path, including polling or
+            # malformed-log exceptions.
+            self.cmd.ble_disconnect()
         if log:
             print(f"Log ({len(log)} entries, showing last 10):")
             for e in log[-10:]:
                 st_str = 'ok' if e['status'] == 0 else f"err0x{e['status']:02X}"
                 print(f"  #{e['index']:>5}  len={e['len']:>3}  {st_str}  {e['data'].hex().upper()}")
-        # Free the target so it can reconnect to its normal source.
-        self.cmd.ble_disconnect()
         print("Target released — it can now reconnect to its normal source.")
         if args.out:
             with open(args.out, 'w') as fp:
@@ -2114,7 +2265,8 @@ class HWConnect(BaseCLIUnit):
             self.device_com.open(args.port)
             self.device_com.commands = self.cmd.get_device_capabilities()
             major, minor = self.cmd.get_app_version()
-            model = ["Ultra", "Lite"][self.cmd.get_device_model()]
+            model_id = self.cmd.get_device_model()
+            model = ["Ultra", "Lite"][model_id] if model_id < 2 else f"Unknown({model_id})"
             print(f" {{ Chameleon {model} connected: v{major}.{minor} }}")
 
         except Exception as e:
@@ -3341,11 +3493,12 @@ class HFMFStaticEncryptedNested(ReaderRequiredUnit):
             b_key_dic = f"keys_{uid}_{sector_name}_{format(acquire_datas['nts']['b'][sector]['nt'], 'x').zfill(8)}.dic"
             execute_tool("staticnested_2x1nt_rf08s", [a_key_dic, b_key_dic])
 
-            keys = open(
+            with open(
                 os.path.join(
                     tempfile.gettempdir(), b_key_dic.replace(".dic", "_filtered.dic")
                 )
-            ).readlines()
+            ) as f:
+                keys = f.readlines()
             keys_bytes = []
             for key in keys:
                 keys_bytes.append(bytes.fromhex(key.strip()))
@@ -3393,12 +3546,13 @@ class HFMFStaticEncryptedNested(ReaderRequiredUnit):
                     print(
                         "Failed to find A key by fast method, trying all possible keys"
                     )
-                    keys = open(
+                    with open(
                         os.path.join(
                             tempfile.gettempdir(),
                             a_key_dic.replace(".dic", "_filtered.dic"),
                         )
-                    ).readlines()
+                    ) as f:
+                        keys = f.readlines()
                     keys_bytes = []
                     for key in keys:
                         keys_bytes.append(bytes.fromhex(key.strip()))
@@ -10501,6 +10655,15 @@ def _emv_amount_bcd(amount: str) -> bytes:
     return bytes((int(digits[i]) << 4) | int(digits[i + 1]) for i in range(0, 12, 2))
 
 
+def _emv_numeric_bcd(value: str, byte_length: int, name: str) -> bytes:
+    digits = value.strip()
+    if not digits.isdigit() or len(digits) > byte_length * 2:
+        raise ValueError(f'{name} must be at most {byte_length * 2} decimal digits')
+    digits = digits.rjust(byte_length * 2, '0')
+    return bytes((int(digits[i]) << 4) | int(digits[i + 1])
+                 for i in range(0, len(digits), 2))
+
+
 @emv.command('scan')
 class EMVScan(DeviceRequiredUnit):
     """
@@ -10521,11 +10684,52 @@ class EMVScan(DeviceRequiredUnit):
         parser = ArgumentParserNoExit()
         parser.description = 'EMV contactless card scan (reader mode) — like PM3 emv scan -at'
         parser.add_argument('-f', '--file', default='', metavar='<path>',
-                            help='Save results to JSON file (PM3-compatible format)')
+                            help='Save results to JSON (includes a lossless trace when supported)')
         parser.add_argument('-s', '--slot', type=int, default=None,
                             metavar='<1-8>', help='Also load scanned card into this slot for emulation')
         parser.add_argument('--amount', default='', metavar='<decimal>',
                             help='Offline transaction simulation amount, e.g. 1.00. Adds GENERATE AC when the card exposes CDOL1; no bank authorisation is performed.')
+        parser.add_argument('--maximum-processing', action='store_true',
+                            help='Reset/reselect and run GPO for every discovered application; may advance ATC/card state')
+        rf_group = parser.add_mutually_exclusive_group()
+        rf_group.add_argument('--rf', dest='rf', action='store_true',
+                              help='Include raw RF frames in the retained trace')
+        rf_group.add_argument('--no-rf', dest='rf', action='store_false',
+                              help='Do not retain raw RF frames')
+        parser.set_defaults(rf=True)
+        timing_group = parser.add_mutually_exclusive_group()
+        timing_group.add_argument('--timing', dest='timing', action='store_true',
+                                  help='Record valid trace timing (default)')
+        timing_group.add_argument('--no-timing', dest='timing', action='store_false',
+                                  help='Disable trace timing')
+        parser.set_defaults(timing=True)
+        parser.add_argument('--grid', action='store_true',
+                            help='Scan the bounded SFI/record grid in addition to AFL records')
+        parser.add_argument('--logs', '--transaction-log', dest='transaction_log',
+                            action='store_true',
+                            help='Request transaction-log collection')
+        pdol_group = parser.add_mutually_exclusive_group()
+        pdol_group.add_argument('--pdol-fallback', dest='pdol_fallback', action='store_true',
+                                help='Enable fixed PDOL fallback (default)')
+        pdol_group.add_argument('--no-pdol-fallback', dest='pdol_fallback', action='store_false',
+                                help='Disable fixed PDOL fallback')
+        parser.set_defaults(pdol_fallback=True)
+        parser.add_argument('--max-aids', type=int, default=0, metavar='<0-16>',
+                            help='Application limit; 0 uses firmware default')
+        parser.add_argument('--max-records', type=int, default=0, metavar='<0-64>',
+                            help='Per-application record limit; 0 uses firmware default')
+        parser.add_argument('--max-apdus', type=int, default=0, metavar='<0-512>',
+                            help='APDU limit; 0 uses firmware default')
+        parser.add_argument('--budget-ms', type=int, default=0, metavar='<0-30000>',
+                            help='Scan time budget; 0 uses firmware default')
+        parser.add_argument('--max-payload', type=int, default=4096, metavar='<48-4096>',
+                            help='Maximum GET response bytes per page')
+        parser.add_argument('--country', default='000', metavar='<ISO-3166 numeric>',
+                            help='Terminal country code (default: 000)')
+        parser.add_argument('--currency', default='000', metavar='<ISO-4217 numeric>',
+                            help='Transaction currency code (default: 000)')
+        parser.add_argument('--cryptogram', choices=('none', 'aac', 'tc', 'arqc'),
+                            default=None, help='GENERATE AC type (default: ARQC with --amount, otherwise none)')
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -10543,6 +10747,9 @@ class EMVScan(DeviceRequiredUnit):
 
         amount_bcd = b''
         if args.amount:
+            if not args.maximum_processing:
+                print(f' {CR}--amount requires --maximum-processing because GPO/GENERATE AC can change card state{C0}')
+                return
             try:
                 amount_bcd = _emv_amount_bcd(args.amount)
             except ValueError as e:
@@ -10552,28 +10759,100 @@ class EMVScan(DeviceRequiredUnit):
         else:
             print(f' {CY}Scanning... (place card on antenna) [fw-canary:v5]{C0}')
 
-        # Single firmware call — full EMV sequence without USB round-trips
-        resp = cmd.hf14a_4_emv_scan(amount_bcd)
-        if resp.status != Status.HF_TAG_OK or not resp.data:
-            print(f' {CR}No card found or scan failed (status={resp.status}){C0}')
-            return
+        trace_commands = {
+            Command.HF14A_4_EMV_TRACE_START,
+            Command.HF14A_4_EMV_TRACE_META,
+            Command.HF14A_4_EMV_TRACE_GET,
+        }
+        use_trace = trace_commands.issubset(set(self.device_com.commands))
+        trace = None
+        if use_trace:
+            try:
+                flags = 0
+                if args.maximum_processing:
+                    flags |= OPT_MAXIMUM_PROCESSING
+                if args.rf:
+                    flags |= OPT_INCLUDE_RF
+                if args.timing:
+                    flags |= OPT_TIMING
+                if args.grid:
+                    flags |= OPT_RECORD_GRID
+                if args.transaction_log:
+                    flags |= OPT_TRANSACTION_LOG
+                if args.pdol_fallback:
+                    flags |= OPT_PDOL_FALLBACK
+                country = _emv_numeric_bcd(args.country, 2, 'country')
+                currency = _emv_numeric_bcd(args.currency, 2, 'currency')
+                date = _emv_numeric_bcd(datetime.now().strftime('%y%m%d'), 3, 'date')
+                cryptogram_name = args.cryptogram or ('arqc' if args.amount else 'none')
+                cryptogram = {'none': 0xFF, 'aac': 0x00, 'tc': 0x40, 'arqc': 0x80}[
+                    cryptogram_name]
+                request = EmvTraceRequest(
+                    flags=flags,
+                    max_aids=args.max_aids,
+                    max_records=args.max_records,
+                    max_apdus=args.max_apdus,
+                    budget_ms=args.budget_ms,
+                    amount=amount_bcd or b'\x00' * 6,
+                    country=country,
+                    currency=currency,
+                    date=date,
+                    cryptogram_type=cryptogram,
+                )
+                if not 48 <= args.max_payload <= 4096:
+                    raise ValueError('max-payload must be 48..4096')
+                trace = cmd.hf14a_4_emv_trace_download(request, args.max_payload)
+            except (EmvTraceError, ValueError, UnexpectedResponseError) as e:
+                print(f' {CR}EMV trace failed: {e}{C0}')
+                return
+            uid = trace.meta.uid
+            atqa = trace.meta.atqa
+            sak = trace.meta.sak
+            ats = trace.meta.ats
+            if trace.meta.state != 2 or trace.meta.result_status != Status.HF_TAG_OK:
+                print(f' {CR}Scan aborted (state={trace.meta.state}, status={trace.meta.result_status}){C0}')
+            if trace.meta.stored_records < trace.meta.observed_records:
+                print(f' {CY}Trace truncated: stored {trace.meta.stored_records} of '
+                      f'{trace.meta.observed_records} observed records{C0}')
+            flag_messages = (
+                (TRACE_TIMEOUT, 'scan time budget expired'),
+                (TRACE_RF_TRUNCATED, 'RF frame detail was truncated'),
+                (TRACE_RESPONSE_TRUNCATED, 'an APDU response exceeded the trace limit'),
+                (TRACE_APP_LIMIT, 'the application limit was reached'),
+                (TRACE_TRANSPORT_ERROR, 'one or more ISO-DEP exchanges failed'),
+            )
+            for flag, message in flag_messages:
+                if trace.meta.flags & flag:
+                    print(f' {CY}Trace notice: {message}{C0}')
+            pairs = [
+                (record.payload.command, record.payload.response)
+                for record in trace.records
+                if isinstance(record.payload, ApduPayload)
+            ]
+        else:
+            # Legacy single-response protocol for older firmware.
+            if not args.maximum_processing:
+                print(f' {CR}This firmware only supports legacy EMV command 6005, which runs GPO. Re-run with --maximum-processing to acknowledge possible ATC/card-state changes, or update firmware.{C0}')
+                return
+            resp = cmd.hf14a_4_emv_scan(amount_bcd)
+            if resp.status != Status.HF_TAG_OK or not resp.data:
+                print(f' {CR}No card found or scan failed (status={resp.status}){C0}')
+                return
 
-        # Parse packed response
-        d = bytes(resp.data)
-        off = 0
-
-        uid_len = d[off]
-        off += 1
-        uid = d[off:off+uid_len]
-        off += uid_len
-        atqa = d[off:off+2]
-        off += 2
-        sak = d[off]
-        off += 1
-        ats_len = d[off]
-        off += 1
-        ats = d[off:off+ats_len]
-        off += ats_len
+            d = bytes(resp.data)
+            off = 0
+            uid_len = d[off]
+            off += 1
+            uid = d[off:off+uid_len]
+            off += uid_len
+            atqa = d[off:off+2]
+            off += 2
+            sak = d[off]
+            off += 1
+            ats_len = d[off]
+            off += 1
+            ats = d[off:off+ats_len]
+            off += ats_len
 
         uid_str = ' '.join(f'{b:02X}' for b in uid)
         atqa_str = ' '.join(f'{b:02X}' for b in atqa)
@@ -10592,23 +10871,25 @@ class EMVScan(DeviceRequiredUnit):
         print(f' {CG}ATQA: {atqa_str}  SAK: {sak:02X}{C0}')
         print(f' {CG}ATS : {ats_str}{C0}')
 
-        num_apdus = d[off]
-        off += 1
-        pairs = []
-        for _ in range(num_apdus):
-            cl = d[off]
+        if trace is None:
+            num_apdus = d[off]
             off += 1
-            c = d[off:off+cl]
-            off += cl
-            rl = d[off] | (d[off+1] << 8)
-            off += 2
-            r = d[off:off+rl]
-            off += rl
-            pairs.append((c, r))
+            pairs = []
+            for _ in range(num_apdus):
+                cl = d[off]
+                off += 1
+                c = d[off:off+cl]
+                off += cl
+                rl = d[off] | (d[off+1] << 8)
+                off += 2
+                r = d[off:off+rl]
+                off += rl
+                pairs.append((c, r))
 
         if not pairs:
             print(f' {CR}No APDU responses captured. For phone wallets, unlock the wallet and keep the phone on the antenna until the scan finishes.{C0}')
-            return
+            if trace is None:
+                return
 
         print(f'\n {CG}APDU trace ({len(pairs)} frame(s)){C0}')
         for idx, (c, r) in enumerate(pairs, 1):
@@ -10624,6 +10905,35 @@ class EMVScan(DeviceRequiredUnit):
             'UID':  uid_str, 'ATQA': atqa_str,
             'SAK':  f'{sak:02X}', 'ATS': ats_str,
         }}
+        if trace is not None:
+            result['EMVTrace'] = trace_to_json(trace)
+            applications = []
+            for record in trace.records:
+                if not isinstance(record.payload, AppPayload):
+                    continue
+                app_exchanges = [
+                    {
+                        'Stage': exchange.stage,
+                        'Attempt': exchange.attempt,
+                        'Status': exchange.status,
+                        'Command': exchange.payload.command.hex().upper(),
+                        'Response': exchange.payload.response.hex().upper(),
+                        'SW': f'{exchange.payload.sw:04X}',
+                    }
+                    for exchange in trace.records
+                    if exchange.app_index == record.app_index and
+                    isinstance(exchange.payload, ApduPayload)
+                ]
+                applications.append({
+                    'Index': record.app_index,
+                    'AID': record.payload.aid.hex().upper(),
+                    'Priority': record.payload.priority,
+                    'Exchanges': app_exchanges,
+                })
+                print(f' {CG}Application {record.app_index}: '
+                      f'{record.payload.aid.hex().upper()} '
+                      f'(priority {record.payload.priority}){C0}')
+            result['Applications'] = applications
 
         def tlv_to_dict(data):
             if not data:
@@ -10674,7 +10984,7 @@ class EMVScan(DeviceRequiredUnit):
             return results
 
         # PPSE
-        if pairs:
+        if trace is None and pairs:
             ppse_cmd, ppse_resp = pairs[0]
             ppse_body = ppse_resp[:-2] if len(ppse_resp) >= 2 else ppse_resp
             print(f'\n {CG}PPSE OK ({len(ppse_resp)}b){C0}')
@@ -10683,7 +10993,7 @@ class EMVScan(DeviceRequiredUnit):
                 'FCITemplate': tlv_to_dict(ppse_body),
             }
 
-        if len(pairs) >= 2:
+        if trace is None and len(pairs) >= 2:
             sel_cmd, sel_resp = pairs[1]
             sel_body = sel_resp[:-2] if len(sel_resp) >= 2 else sel_resp
             aid_bytes = sel_cmd[5:-1] if len(sel_cmd) > 6 else b''
@@ -10692,7 +11002,7 @@ class EMVScan(DeviceRequiredUnit):
             result['Application'] = {'AID': aid_str,
                                      'FCITemplate': tlv_to_dict(sel_body)}
 
-        if len(pairs) >= 3:
+        if trace is None and len(pairs) >= 3:
             gpo_cmd, gpo_resp = pairs[2]
             gpo_body = gpo_resp[:-2] if len(gpo_resp) >= 2 else gpo_resp
             print(f' {CG}GPO OK ({len(gpo_resp)}b){C0}')
@@ -10811,28 +11121,52 @@ class EMVScan(DeviceRequiredUnit):
         # tlv_to_dict stores the VALUE (content) of the outermost tag —
         # so rec['Data']['value'] is already the unwrapped inner bytes.
         all_record_data = b''
-        for rec in result.get('Application', {}).get('Records', []):
-            raw_hex = rec.get('Data', {}).get('value', '')
-            try:
-                all_record_data += bytes.fromhex(raw_hex.replace(' ', ''))
-            except Exception:
-                pass
-        # Also include GPO and SELECT AID FCI values for label/name tags
-        extra_data = b''
-        for key in ('GPO', 'FCITemplate'):
-            v = result.get('Application', {}).get(key, {})
-            if isinstance(v, dict):
+        if trace is not None:
+            primary = next((record.app_index for record in trace.records
+                            if isinstance(record.payload, AppPayload)), None)
+            primary_apdus = [record for record in trace.records
+                             if record.app_index == primary and
+                             isinstance(record.payload, ApduPayload)]
+            all_record_data = b''.join(
+                record.payload.response[:-2]
+                for record in primary_apdus
+                if record.stage in (5, 6) and len(record.payload.response) >= 2)
+        else:
+            primary_apdus = []
+            for rec in result.get('Application', {}).get('Records', []):
+                raw_hex = rec.get('Data', {}).get('value', '')
                 try:
-                    extra_data += bytes.fromhex(v.get('value', '').replace(' ', ''))
+                    all_record_data += bytes.fromhex(raw_hex.replace(' ', ''))
                 except Exception:
                     pass
+        # Also include GPO and SELECT AID FCI values for label/name tags
+        extra_data = b''
+        if trace is not None:
+            extra_data = b''.join(
+                record.payload.response[:-2]
+                for record in primary_apdus
+                if record.stage in (2, 3, 4) and len(record.payload.response) >= 2)
+        else:
+            for key in ('GPO', 'FCITemplate'):
+                v = result.get('Application', {}).get(key, {})
+                if isinstance(v, dict):
+                    try:
+                        extra_data += bytes.fromhex(v.get('value', '').replace(' ', ''))
+                    except Exception:
+                        pass
         transaction_data = b''
-        v = result.get('Application', {}).get('Transaction', {}).get('Data', {})
-        if isinstance(v, dict):
-            try:
-                transaction_data = bytes.fromhex(v.get('value', '').replace(' ', ''))
-            except Exception:
-                transaction_data = b''
+        if trace is not None:
+            transaction_data = b''.join(
+                record.payload.response[:-2]
+                for record in primary_apdus
+                if record.stage == 8 and len(record.payload.response) >= 2)
+        else:
+            v = result.get('Application', {}).get('Transaction', {}).get('Data', {})
+            if isinstance(v, dict):
+                try:
+                    transaction_data = bytes.fromhex(v.get('value', '').replace(' ', ''))
+                except Exception:
+                    transaction_data = b''
         all_search_data = all_record_data + extra_data
 
         # EMV tag definitions:

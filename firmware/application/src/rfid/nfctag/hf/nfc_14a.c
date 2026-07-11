@@ -1,6 +1,7 @@
 #include <hal/nrf_nfct.h>
 #include <nrfx_nfct.h>
 #include <nrf_gpio.h>
+#include <app_util_platform.h>
 
 #define NRF_LOG_MODULE_NAME nfc
 #include "nrf_log.h"
@@ -43,8 +44,10 @@ nfc_tag_14a_state_t m_tag_state_14a = NFC_TAG_STATE_14A_IDLE;
 // 14443A protocol processor
 nfc_tag_14a_handler_t m_tag_handler = {
     .cb_reset = NULL,       // Tag Reset callback
+    .cb_activated = NULL,   // ISO14443-4 activation callback
     .cb_state = NULL,       // Label status machine callback
     .get_coll_res = NULL,   // Obtain packaging of anti -conflict resources of labels
+    .cb_state_crc_strip = false,
 };
 
 // RATS FSDI length check table
@@ -101,8 +104,10 @@ static bool reset_if_field_lost = false; // default is 'false', Unless there is 
  *
  */
 void nfc_tag_14a_create_bcc(uint8_t *pbtData, size_t szLen, uint8_t *pbtBcc) {
+    if (pbtBcc == NULL) return;
     // It is best to reset it when using the output buffer
     *pbtBcc = 0x00;
+    if (pbtData == NULL || szLen == 0) return;
     do {
         *pbtBcc ^= *pbtData++;
     } while (--szLen);
@@ -130,7 +135,7 @@ inline void nfc_tag_14a_append_crc(uint8_t *pbtData, size_t szLen) {
  *
  */
 bool nfc_tag_14a_checks_crc(uint8_t *pbtData, size_t szLen) {
-    //if (szLen < 3) return false;
+    if (szLen < NFC_TAG_14A_CRC_LENGTH + 1) return false;
     uint8_t crc_calc[2];
     calc_14a_crc_lut(pbtData, szLen - 2, crc_calc);
     // NRF_LOG_INFO("%02x%02x ,  %02x%02x", pbtData[szLen - 2], pbtData[szLen - 1], crc_calc[0], crc_calc[1]);
@@ -212,7 +217,7 @@ uint8_t nfc_tag_14a_wrap_frame(const uint8_t *pbtTx, const size_t szTxBits, cons
 *          pbtRxPar: The buffer of the bitstream Store after the packaging, the coupling school inspection area
 * @retval :The data length of the bitstream packaging, note that the length of the data area is the length of the data area.retval / 8
 */
-uint8_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBits, uint8_t *pbtRx, uint8_t *pbtRxPar) {
+size_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBits, uint8_t *pbtRx, uint8_t *pbtRxPar) {
     uint8_t btFrame;
     uint8_t btData;
     uint8_t uiBitPos;
@@ -292,7 +297,7 @@ uint8_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBi
  * @param[in]   appendCrc  Whether to send the byte flow, automatically send the CRC16 verification automatically
  */
 void nfc_tag_14a_tx_bytes(uint8_t *data, uint32_t bytes, bool appendCrc) {
-    ASSERT(bytes <= MAX_NFC_TX_BUFFER_SIZE);
+    if (data == NULL || bytes == 0 || bytes > MAX_NFC_TX_BUFFER_SIZE) return;
     NFC_14A_TX_BYTE_CORE(data, bytes, appendCrc, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
 }
 
@@ -319,8 +324,10 @@ void nfc_tag_14a_tx_bytes(uint8_t *data, uint32_t bytes, bool appendCrc) {
  * @param[in]   bits   The length of the bit stream to be sent
  */
 void nfc_tag_14a_tx_bits(uint8_t *data, uint32_t bits) {
+    uint32_t bytes = (bits + 7u) / 8u;
+    if (data == NULL || bits == 0 || bytes > MAX_NFC_TX_BUFFER_SIZE) return;
     m_is_responded = true;
-    memcpy(m_nfc_tx_buffer, data, (bits / 8) + (bits % 8 > 0 ? 1 : 0));
+    memcpy(m_nfc_tx_buffer, data, bytes);
     NFC_14A_TX_BITS_CORE(bits, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
 }
 
@@ -330,6 +337,7 @@ void nfc_tag_14a_tx_bits(uint8_t *data, uint32_t bits) {
  * @param[in]   bits   To send a few bites
  */
 void nfc_tag_14a_tx_nbit(uint8_t data, uint32_t bits) {
+    if (bits == 0 || bits > 8) return;
     m_is_responded = true;
     m_nfc_tx_buffer[0] = data;
     NFC_14A_TX_BITS_CORE(bits, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
@@ -339,10 +347,12 @@ void nfc_tag_14a_tx_nbit(uint8_t data, uint32_t bits) {
  * 14A monitoring the packaging function of data processing from PCD
  */
 void nfc_tag_14a_data_process(uint8_t *p_data) {
+    if (p_data == NULL) return;
+    nfc_tag_14a_handler_t handler = m_tag_handler;
     // Compute the number of bits currently received
     uint16_t szDataBits = (NRF_NFCT->RXD.AMOUNT & (NFCT_RXD_AMOUNT_RXDATABITS_Msk | NFCT_RXD_AMOUNT_RXDATABYTES_Msk));
     // The resource that may be used in anti -collision
-    nfc_tag_14a_coll_res_reference_t *auto_coll_res = m_tag_handler.get_coll_res != NULL ? m_tag_handler.get_coll_res() : NULL;
+    nfc_tag_14a_coll_res_reference_t *auto_coll_res = handler.get_coll_res != NULL ? handler.get_coll_res() : NULL;
 
     // I don't know why, here the CPU must run empty for a period of time before the data can be received normally.
     // If you have any problems with the receiving data, please try to restore this. This is a problem found in 2021, but it disappeared again in 2022
@@ -378,8 +388,8 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
         // Temporary through: Wupa response in non -choice state, no matter what state is in the state, you can use the Wupa instruction to wake up
         if ((szDataBits == 7) && ((isREQA && m_tag_state_14a != NFC_TAG_STATE_14A_HALTED) || isWUPA)) {
             // The receiver of the 14A communication is notified, the internal state machine is reset
-            if (m_tag_handler.cb_reset != NULL) {
-                m_tag_handler.cb_reset();
+            if (handler.cb_reset != NULL) {
+                handler.cb_reset();
             }
             // Only in the case that can provide anti -collision resources,
             if (auto_coll_res != NULL) {
@@ -400,9 +410,9 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
             // Normal communication process will not have N bits of frames, because it is the anti -conflict frame used in the 14A protocol for BIT
             // So you can handle this protocol frame separately here to realize the tag similar to the UID back door card (Chinese Magic)
             // Note that if we find REQA or WUPA, we will not repeat the processing (only the special ratio special frame)
-            if ((!isREQA && !isWUPA) && m_tag_handler.cb_state != NULL) {
+            if ((!isREQA && !isWUPA) && handler.cb_state != NULL) {
                 // If the 7bit processor is registered and successfully processed this command, the state machine update is completed
-                m_tag_handler.cb_state(p_data, szDataBits);
+                handler.cb_state(p_data, szDataBits);
                 return;
             }
         }
@@ -417,6 +427,11 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
         }
         // Preparation status, processing news related to anti -collision
         case NFC_TAG_STATE_14A_READY: {
+            if (auto_coll_res == NULL || auto_coll_res->size == NULL ||
+                    auto_coll_res->uid == NULL || auto_coll_res->sak == NULL) {
+                m_tag_state_14a = NFC_TAG_STATE_14A_IDLE;
+                return;
+            }
             static uint8_t uid[5] = { 0x00 };
             nfc_tag_14a_cascade_level_t level;
             // Extract cascade level
@@ -513,7 +528,8 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
             }
             // Incoming SELECT CLx for any cascade level
             if (szDataBits == 72 && p_data[1] == 0x70) {
-                if (memcmp(&p_data[2], uid, 4) == 0) {
+                if (memcmp(&p_data[2], uid, 5) == 0 &&
+                        nfc_tag_14a_checks_crc(p_data, 9)) {
                     bool cl_finished = (*auto_coll_res->size == NFC_TAG_14A_UID_SINGLE_SIZE && level == NFC_TAG_14A_CASCADE_LEVEL_1) ||
                                        (*auto_coll_res->size == NFC_TAG_14A_UID_DOUBLE_SIZE && level == NFC_TAG_14A_CASCADE_LEVEL_2) ||
                                        (*auto_coll_res->size == NFC_TAG_14A_UID_TRIPLE_SIZE && level == NFC_TAG_14A_CASCADE_LEVEL_3);
@@ -554,9 +570,14 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                 }
                 // RATS instruction
                 if (p_data[0] == NFC_TAG_14A_CMD_RATS && nfc_tag_14a_checks_crc(p_data, 4)) {
+                    if (auto_coll_res == NULL || auto_coll_res->ats == NULL) return;
                     // Reset T=CL layer state for the new session
-                    if (m_tag_handler.cb_reset != NULL) {
-                        m_tag_handler.cb_reset();
+                    if (handler.cb_reset != NULL) {
+                        handler.cb_reset();
+                    }
+                    if (handler.cb_activated != NULL) {
+                        handler.cb_activated((p_data[1] >> 4) & 0x0F,
+                                             p_data[1] & 0x0F);
                     }
                     // Make sure the sub -packaging opens the support of ATS
                     if (auto_coll_res->ats->length > 0) {
@@ -574,8 +595,16 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                 }
             }
             // No processing is successful, it may be some other data. You need to re-post processing
-            if (m_tag_handler.cb_state != NULL) {    //Activation status, transfer the message to other registered processor processing
-                m_tag_handler.cb_state(p_data, szDataBits);
+            if (handler.cb_state != NULL) {    //Activation status, transfer the message to other registered processor processing
+                if (handler.cb_state_crc_strip) {
+                    if ((szDataBits & 0x07) != 0 ||
+                            szDataBits < (3 * 8) ||
+                            !nfc_tag_14a_checks_crc(p_data, szDataBits / 8)) {
+                        return;
+                    }
+                    szDataBits -= NFC_TAG_14A_CRC_LENGTH * 8;
+                }
+                handler.cb_state(p_data, szDataBits);
                 break;
             }
         }
@@ -758,10 +787,9 @@ void nfc_tag_14a_set_state(nfc_tag_14a_state_t state) {
  */
 void nfc_tag_14a_set_handler(nfc_tag_14a_handler_t *handler) {
     if (handler != NULL) {
-        // Take it directly to the implementation of the introduction to our global object
-        m_tag_handler.cb_reset = handler->cb_reset;
-        m_tag_handler.cb_state = handler->cb_state;
-        m_tag_handler.get_coll_res = handler->get_coll_res;
+        CRITICAL_REGION_ENTER();
+        m_tag_handler = *handler;
+        CRITICAL_REGION_EXIT();
     }
 }
 

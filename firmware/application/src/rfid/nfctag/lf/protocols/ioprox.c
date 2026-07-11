@@ -66,6 +66,9 @@ static inline uint8_t bytebits_to_u8_msb_inv(const uint8_t *bits, uint16_t start
 
 // Unpacks a raw 8-byte card frame into the codec bit buffer (MSB-first).
 bool ioprox_raw8_to_bits(const uint8_t *raw8, ioprox_codec_t *d) {
+    if (raw8 == NULL || d == NULL) {
+        return false;
+    }
     d->bit_len = 0;
     for (int i = 0; i < 8; i++) {
         uint8_t byte = raw8[i];
@@ -110,11 +113,12 @@ static bool preamble_match(const uint8_t *d, uint16_t off, bool inv) {
 //   [4-11]  raw8 frame bytes (for debugging and storage)
 //   [12-15] reserved (0x00)
 static bool decode_and_pack(ioprox_codec_t *d, uint16_t idx, bool inv) {
-    uint8_t  b1, b2, b3, b4, b5, b6;
+    uint8_t  b0, b1, b2, b3, b4, b5, b6;
     uint16_t number;
     uint32_t raw_block1;
     uint32_t raw_block2;
 
+    b0 = bytebits_to_u8_msb_inv(d->bits, idx, inv);
     b1 = bytebits_to_u8_msb_inv(d->bits, (uint16_t)(idx + 9),  inv);
     b2 = bytebits_to_u8_msb_inv(d->bits, (uint16_t)(idx + 18), inv);
     b3 = bytebits_to_u8_msb_inv(d->bits, (uint16_t)(idx + 27), inv);
@@ -122,7 +126,7 @@ static bool decode_and_pack(ioprox_codec_t *d, uint16_t idx, bool inv) {
     b5 = bytebits_to_u8_msb_inv(d->bits, (uint16_t)(idx + 45), inv);
     b6 = bytebits_to_u8_msb_inv(d->bits, (uint16_t)(idx + 54), inv);
 
-    if (ioprox_checksum5(b1, b2, b3, b4, b5) != b6) {
+    if (b0 != 0x00 || b1 != 0xF0 || ioprox_checksum5(b1, b2, b3, b4, b5) != b6) {
         return false;
     }
 
@@ -154,6 +158,9 @@ static bool decode_and_pack(ioprox_codec_t *d, uint16_t idx, bool inv) {
 // Decodes a raw 8-byte ioProx card frame into the 16-byte output buffer.
 // Returns true if the frame checksum is valid.
 bool ioprox_decode_raw_to_data(const uint8_t *raw8, uint8_t *output) {
+    if (raw8 == NULL || output == NULL) {
+        return false;
+    }
     ioprox_codec_t codec;
     memset(&codec, 0, sizeof(codec));
     ioprox_raw8_to_bits(raw8, &codec);
@@ -176,6 +183,8 @@ static void write_bits_msb(uint8_t *bits, uint16_t pos, uint8_t v) {
 // Returns false if output pointer is NULL.
 bool ioprox_encode_params_to_data(uint8_t version, uint8_t facility, uint16_t number, uint8_t *output) {
     if (!output) return false;
+
+    memset(output, 0, IOPROX_DATA_SIZE);
 
     uint8_t b0 = 0x00;
     uint8_t b1 = 0xF0;
@@ -278,6 +287,10 @@ static void *ioprox_codec_alloc(void) {
     if (!d) return NULL;
     memset(d, 0, sizeof(*d));
     d->modem = fsk_alloc(FSK_BITRATE_IOPROX);
+    if (!d->modem) {
+        free(d);
+        return NULL;
+    }
     return d;
 }
 

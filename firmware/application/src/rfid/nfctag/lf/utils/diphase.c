@@ -4,7 +4,9 @@
 #include <string.h>
 
 void diphase_reset(diphase *d) {
-    d->boundary = true;
+    if (d != NULL) {
+        d->boundary = true;
+    }
 }
 
 /*
@@ -33,8 +35,14 @@ void diphase_reset(diphase *d) {
  *   mid-bit  + 2T   -> invalid (reset)
  */
 void diphase_feed(diphase *d, uint8_t interval, bool *bits, int8_t *bitlen) {
-    uint8_t t = d->rp(interval);
+    if (bitlen == NULL) {
+        return;
+    }
     *bitlen = -1;
+    if (d == NULL || d->rp == NULL || bits == NULL) {
+        return;
+    }
+    uint8_t t = d->rp(interval);
     if (t == 3) {
         diphase_reset(d);
         return;

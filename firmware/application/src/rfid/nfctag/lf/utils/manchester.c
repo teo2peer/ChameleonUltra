@@ -4,14 +4,23 @@
 #include <string.h>
 
 void manchester_reset(manchester *m) {
-    m->sync = true;
+    if (m != NULL) {
+        m->sync = true;
+    }
 }
 
 void manchester_feed(manchester *m, uint8_t interval, bool *bits, int8_t *bitlen) {
+    if (bitlen == NULL) {
+        return;
+    }
+    *bitlen = -1;
+    if (m == NULL || m->rp == NULL || bits == NULL) {
+        return;
+    }
     // after the current interval is processed, is it on the judgment line
     uint8_t t = m->rp(interval);
-    *bitlen = -1;
     if (t == 3) {
+        manchester_reset(m);
         return;
     }
 
@@ -31,6 +40,7 @@ void manchester_feed(manchester *m, uint8_t interval, bool *bits, int8_t *bitlen
             bits[0] = 1;
             bits[1] = 0;
         } else {
+            manchester_reset(m);
             return;
         }
     } else {

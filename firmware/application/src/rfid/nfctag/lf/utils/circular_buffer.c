@@ -3,49 +3,91 @@
 #include <stdlib.h>
 #include <string.h>
 
+static bool cb_configure(circular_buffer *cb, void *storage, size_t capacity,
+                         size_t sz, bool owns_buffer) {
+    if (cb == NULL || storage == NULL || capacity == 0 || sz == 0 ||
+            capacity >= SIZE_MAX / sz) {
+        return false;
+    }
+    size_t storage_capacity = capacity + 1;
+    cb->buffer = storage;
+    cb->buffer_end = (char *)storage + storage_capacity * sz;
+    cb->capacity = capacity;
+    cb->sz = sz;
+    cb->head = storage;
+    cb->tail = storage;
+    cb->dropped = 0;
+    cb->owns_buffer = owns_buffer;
+    return true;
+}
+
 bool cb_init(circular_buffer *cb, size_t capacity, size_t sz) {
-    cb->buffer = malloc(capacity * sz);
+    if (cb == NULL || capacity == 0 || sz == 0 || capacity >= SIZE_MAX / sz) {
+        return false;
+    }
+    size_t storage_capacity = capacity + 1;
+    void *storage = malloc(storage_capacity * sz);
+    cb->buffer = storage;
     if (cb->buffer == NULL) {
         return false;
     }
-    cb->buffer_end = (char *)cb->buffer + capacity * sz;
-    cb->capacity = capacity;
-    cb->count = 0;
-    cb->sz = sz;
-    cb->head = cb->buffer;
-    cb->tail = cb->buffer;
-    return true;
+    return cb_configure(cb, storage, capacity, sz, true);
+}
+
+bool cb_init_static(circular_buffer *cb, void *storage, size_t capacity, size_t sz) {
+    return cb_configure(cb, storage, capacity, sz, false);
 }
 
 void cb_free(circular_buffer *cb) {
     if (cb != NULL && cb->buffer != NULL) {
-        free(cb->buffer);
+        if (cb->owns_buffer) free(cb->buffer);
         cb->buffer = NULL;
+        cb->buffer_end = NULL;
+        cb->head = NULL;
+        cb->tail = NULL;
+        cb->capacity = 0;
+        cb->sz = 0;
+        cb->owns_buffer = false;
     }
 }
 
 bool cb_push_back(circular_buffer *cb, const void *item) {
-    if (cb->buffer == NULL || cb->count == cb->capacity) {
+    if (cb == NULL || cb->buffer == NULL || item == NULL) {
         return false;
     }
-    memcpy(cb->head, item, cb->sz);
-    cb->head = (char *)cb->head + cb->sz;
-    if (cb->head == cb->buffer_end) {
-        cb->head = cb->buffer;
+
+    void *head = cb->head;
+    void *next = (char *)head + cb->sz;
+    if (next == cb->buffer_end) {
+        next = cb->buffer;
     }
-    cb->count++;
+    if (next == cb->tail) {
+        cb->dropped++;
+        return false;
+    }
+    memcpy(head, item, cb->sz);
+    cb->head = next;
     return true;
 }
 
 bool cb_pop_front(circular_buffer *cb, void *item) {
-    if (cb->buffer == NULL || cb->count == 0) {
+    if (cb == NULL || cb->buffer == NULL || item == NULL) {
         return false;
     }
-    memcpy(item, cb->tail, cb->sz);
-    cb->tail = (char *)cb->tail + cb->sz;
-    if (cb->tail == cb->buffer_end) {
-        cb->tail = cb->buffer;
+
+    void *tail = cb->tail;
+    if (tail == cb->head) {
+        return false;
     }
-    cb->count--;
+    memcpy(item, tail, cb->sz);
+    tail = (char *)tail + cb->sz;
+    if (tail == cb->buffer_end) {
+        tail = cb->buffer;
+    }
+    cb->tail = tail;
     return true;
+}
+
+size_t cb_dropped(const circular_buffer *cb) {
+    return cb == NULL ? 0 : cb->dropped;
 }

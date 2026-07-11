@@ -5,7 +5,8 @@ GROUP(-lgcc -lc -lnosys)
 
 MEMORY
 {
-  FLASH (rx) : ORIGIN = 0x27000, LENGTH = 0xCC000
+  /* FDS owns 0xC7000-0xF3000 (22 virtual pages) below the bootloader. */
+  FLASH (rx) : ORIGIN = 0x27000, LENGTH = 0xA0000
   /* RAM ORIGIN was 0x20002ae8 (peripheral-only). Enabling the BLE central role
    * + 2 total links (see sdk_config.h) makes the SoftDevice request more RAM, so
    * the origin is raised by 0x1000 (4 KB) to 0x20003ae8 and LENGTH reduced to match.

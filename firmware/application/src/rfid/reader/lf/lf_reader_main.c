@@ -117,12 +117,13 @@ uint8_t scan_jablotron(uint8_t *uid) {
 /**
  * Try reset t55XX tag passwords by enumerating old passwords.
  */
-static void try_reset_t55xx_passwd(uint32_t new_passwd, uint8_t *old_passwds, uint8_t old_passwd_count) {
+static ret_code_t try_reset_t55xx_passwd(uint32_t new_passwd, uint8_t *old_passwds, uint8_t old_passwd_count) {
     for (uint8_t i = 0; i < old_passwd_count; i++) {
         uint32_t old_passwd = bytes_to_num(old_passwds + i * 4, 4);
-        t55xx_reset_passwd(old_passwd, new_passwd);
+        ret_code_t err = t55xx_reset_passwd(old_passwd, new_passwd);
+        if (err != NRF_SUCCESS) return err;
     }
-    t55xx_reset_passwd(new_passwd, new_passwd);
+    return t55xx_reset_passwd(new_passwd, new_passwd);
 }
 
 /**
@@ -134,13 +135,15 @@ static uint8_t write_t55xx(uint32_t *blks, uint8_t blk_count, uint8_t *new_passw
     start_lf_125khz_radio();
     bsp_delay_ms(1);  // Delays for a while after starting the field
 
-    try_reset_t55xx_passwd(passwd, old_passwds, old_passwd_count);
-    t55xx_write_data(passwd, blks, blk_count);
+    ret_code_t err = try_reset_t55xx_passwd(passwd, old_passwds, old_passwd_count);
+    if (err == NRF_SUCCESS) {
+        err = t55xx_write_data(passwd, blks, blk_count);
+    }
 
     stop_lf_125khz_radio();
 
     // writing results should be verified by upper computer
-    return STATUS_LF_TAG_OK;
+    return err == NRF_SUCCESS ? STATUS_LF_TAG_OK : STATUS_CMD_ERR;
 }
 
 /**
@@ -269,10 +272,12 @@ uint8_t lf_t55xx_write_block(uint8_t block, uint32_t word, uint32_t passwd, bool
     start_lf_125khz_radio();
     bsp_delay_ms(1);  // Delay for a while after starting the field
 
-    t55xx_send_cmd(opcode, pwd_ptr, 0, &word, block);
-    t55xx_send_cmd(T5577_OPCODE_RESET, NULL, 0, NULL, 0);
+    ret_code_t err = t55xx_send_cmd(opcode, pwd_ptr, 0, &word, block);
+    if (err == NRF_SUCCESS) {
+        err = t55xx_send_cmd(T5577_OPCODE_RESET, NULL, 0, NULL, 0);
+    }
 
     stop_lf_125khz_radio();
-    return STATUS_LF_TAG_OK;
+    return err == NRF_SUCCESS ? STATUS_LF_TAG_OK : STATUS_CMD_ERR;
 }
 #endif

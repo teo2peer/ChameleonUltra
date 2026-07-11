@@ -15,10 +15,11 @@ void ble_slave_init(void);
 void advertising_start(bool erase_bonds);
 void advertising_stop(void);
 bool is_ble_advertising(void);
-bool is_ble_scanning(void);  // true while the passive scanner is running
 void delete_bonds_all(void);
 void nus_data_response(uint8_t *p_data, uint16_t length);
+uint32_t nus_data_response_try(const uint8_t *p_data, uint16_t length);
 bool is_nus_working(void);
+bool ble_command_link_authorized(void);
 void set_ble_connect_key(uint8_t *key);
 
 void register_lf_adc_callback(lf_adc_callback_t cb);
@@ -44,34 +45,23 @@ typedef enum {
 // Apply a new BLE GAP address. mode selects the source:
 //   0 - restore the original (NRF_FICR->DEVICEADDR with the 0xC000 static bit pattern)
 //   1 - static-random from host (data[0..5] holds 6 bytes LE order)
-//   2 - firmware-generated random private resolvable (cycles via SoftDevice)
-//   3 - firmware-generated random private non-resolvable
+//   2 - SoftDevice privacy with resolvable private addresses
+//   3 - SoftDevice privacy with non-resolvable private addresses
 // Returns NRF_SUCCESS, NRF_ERROR_BUSY (a link is active — caller should disconnect
 // first), or NRF_ERROR_INVALID_PARAM.
 uint32_t ble_addr_set(uint8_t mode, const uint8_t *addr_le);
 
-// Read the currently-active BLE GAP address. addr_type out is one of
-// BLE_GAP_ADDR_TYPE_*. addr_out receives 6 bytes in LE order.
+// Read the current advertising address when advertising, otherwise the GAP
+// identity address. addr_out receives 6 bytes in SoftDevice LE order.
 uint32_t ble_addr_get(uint8_t *addr_type, uint8_t *addr_out);
 
 // Toggle our own radio on/off. On: starts normal peripheral advertising.
 // Off: stops advertising + scan + drops any active central link (silent / stealth).
 uint32_t ble_radio_set(uint8_t on);
 
-// State snapshot. out[0]=radio_on (1/0), out[1]=advertising, out[2]=scanning,
-// out[3]=central link active.
+// State snapshot. out[0]=radio_on (1/0), out[1]=normal/flood advertising,
+// out[2]=scanning, out[3]=central link active.
 uint32_t ble_radio_get(uint8_t *out);
-
-// ---- scan-buffer snapshot (used by scan-buffer-wide stress / kick) -------
-// Compact address+type pair, little-endian address, BLE_GAP_ADDR_TYPE_*.
-typedef struct {
-    uint8_t addr[BLE_GAP_ADDR_LEN];
-    uint8_t addr_type;
-} ble_scan_addr_t;
-
-// Copy up to out_cap connectable addresses from the passive scanner's record
-// buffer, strongest RSSI first. Returns the number actually written.
-uint8_t  ble_scan_copy_addresses(ble_scan_addr_t *out, uint8_t out_cap);
 
 // ---- environment-wide broadcast (full 2.4 GHz BLE spectrum spam) --------
 // Start a non-connectable advertising flood. fill_byte fills the maximum
@@ -83,26 +73,6 @@ uint8_t  ble_scan_copy_addresses(ble_scan_addr_t *out, uint8_t out_cap);
 uint32_t ble_adv_flood_start(uint8_t fill_byte, uint16_t interval_ms);
 uint32_t ble_adv_flood_stop(void);
 
-// ---------------------------------------------------------------------------
-// Passive BLE scanner (SoftDevice observer role).
-//
-// Listen-only: scanning is started in PASSIVE mode (active=0), so the device
-// never emits scan requests or any other packet. It purely receives the
-// advertisements that nearby devices already broadcast. There is no central
-// connection and no transmission of any kind here.
-// ---------------------------------------------------------------------------
-// Max distinct devices retained per passive scan. Shared so ble_central.c's
-// batch link-probe can bound its iteration over the scanner records.
-#define BLE_SCAN_MAX_DEVICES 40
-
 uint16_t ble_link_mtu(uint16_t conn_handle); // effective ATT MTU for a connection
-
-uint32_t ble_scan_start(uint8_t active); // start a scan (0=passive listen-only, 1=active)
-uint32_t ble_scan_stop(void);    // stop the scan
-uint8_t  ble_scan_get_count(void);
-// Serialize discovered records starting at start_index into out (max out_cap
-// bytes). Wire format per record: addr[6] | addr_type[1] | rssi[1] | adv_len[1]
-// | adv[adv_len]. Returns the number of bytes written.
-uint16_t ble_scan_copy_records(uint8_t start_index, uint8_t *out, uint16_t out_cap);
 
 #endif

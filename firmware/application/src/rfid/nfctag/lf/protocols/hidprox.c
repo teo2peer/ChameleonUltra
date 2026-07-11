@@ -48,8 +48,15 @@ void hidprox_decoder_start(hidprox_codec *d, uint8_t format_hint) {
 
 hidprox_codec *hidprox_codec_alloc(void) {
     hidprox_codec *d = malloc(sizeof(hidprox_codec));
+    if (d == NULL) {
+        return NULL;
+    }
     d->card = NULL;
     d->modem = fsk_alloc(FSK_BITRATE_HID);
+    if (d->modem == NULL) {
+        free(d);
+        return NULL;
+    }
     return d;
 }
 

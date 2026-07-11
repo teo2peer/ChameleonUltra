@@ -28,6 +28,7 @@ NRF_LOG_MODULE_REGISTER();
 
 #include "app_cmd.h"
 #include "ble_main.h"
+#include "ble_scan.h"
 #include "ble_central.h"
 #include "bsp_delay.h"
 #include "bsp_time.h"
@@ -1122,6 +1123,7 @@ int main(void) {
             blink_usb_led_status();
         }
 
+        lf_tag_emulation_process();
         // Data pack process
         data_frame_process();
         // Log print process

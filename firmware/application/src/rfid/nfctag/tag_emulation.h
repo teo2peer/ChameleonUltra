@@ -16,7 +16,8 @@ extern bool g_is_tag_emulating;
 
 // Tag data buffer
 typedef struct {
-    uint16_t length;
+    uint16_t length;        // buffer capacity
+    uint16_t actual_length; // bytes supplied by the current record/load
     uint8_t *buffer;
     uint16_t *crc;
 } tag_data_buffer_t;

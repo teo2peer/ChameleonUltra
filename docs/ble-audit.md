@@ -47,7 +47,7 @@ that policy context.
 |---|---|
 | `ble scan [-t <sec>] [-v] [--active] [--min-rssi <dbm>] [--name <substr>] [--out <file.json>]` | Passive (default) or active scan. Lists address, type, RSSI, name and a decode of the advertising data (flags, service UUIDs with names, manufacturer/company, TX power, appearance). Sorts by RSSI; `-v` prints the full breakdown; `--out` exports JSON. |
 | `ble connect -a <MAC> [--type <0-3>]` | Connect to one target. `--type`: 0 public, 1 random, 2 random-RPA, 3 random-NRPA. |
-| `ble status` | Show connection / discovery / fuzz state. |
+| `ble status` | Show connection, discovery, fuzz, flood, read/write and notification state when supported by the firmware. |
 | `ble discover [--out <file.json>]` | Enumerate the target's GATT characteristics (handle, UUID + SIG name, properties), grouped under their primary services. |
 | `ble descriptors` | List all GATT descriptors of the connected target (handle + UUID + name). |
 | `ble info` | Read the connected target's standard device information — Generic Access name/appearance, Device Information Service (manufacturer, model, serial, hardware/firmware/software revision, system ID, PnP ID) and battery level — via read-only GATT reads. Run after `ble discover`. |
@@ -55,9 +55,11 @@ that policy context.
 | `ble write --handle <hex> --data <hex>` | Write a value to a characteristic (write-with-response; shows the target's ATT status). |
 | `ble subscribe --handle <hex> [--cccd <hex>] [--indicate] [--off] [-t <sec>]` | Subscribe to notifications/indications and stream incoming values. The CCCD descriptor is auto-discovered (override with `--cccd`). |
 | `ble fuzz --handle <hex> [-n <count>] [-i <ms>] [--out <file.json>]` | Write mutated payloads to a characteristic to exercise its input parsing, detecting when the target drops the link. Boundary-case corpus first, then random mutation. |
-| `ble ping` | One-shot BLE link liveness probe of the connected target (a single connection-parameter-update round-trip). |
+| `ble ping [--addr <MAC> --type <0-3>\|--all]` | Probe the current link by default, connect to and probe one address, or probe all connectable devices from the last scan. |
 | `ble disconnect` | Disconnect from the target, freeing it to reconnect to its normal source. |
 | `ble advertise [on\|off\|toggle\|status] [--erase-bonds]` | Control the device's **own** advertising (discoverable state). |
+| `ble spoof-mac [show\|restore\|private\|nonresolv\|static <addr>]` | Change the device's **own** BLE GAP address/identity (static-random, random private resolvable/non-resolvable, or restore the FICR default). Mutates our radio only. |
+| `ble radio [on\|off\|toggle\|status]` | Turn the device's **own** BLE radio on/off. `off` = stealth: stops advertising + passive scan and drops any active central link. |
 | `ble flood-ping --scope single\|buffer\|broadcast ...` | WRITE_CMD flood for single/buffer scopes, or non-connectable advertising spam for broadcast scope (`--fill`, `--interval-units 1..102`). Buffer scope uses the scan buffer and defaults an omitted count to a bounded per-peer run. |
 | `ble kick [cycles] --scope single\|buffer` | One disconnect for the current central link (`scope=single` requires `cycles=1`), or repeated connect/disconnect cycles for connectable peers in the scan buffer. |
 | `ble broadcast [--fill hex] [--interval-units 1..102] [--stop]` | Environment-wide non-connectable advertising broadcast. |
@@ -80,12 +82,13 @@ can reconnect to its normal source. While a BLE test runs, the device shows an
 
 ## GUI
 
-*Ethical Hacking → Bluetooth (BLE) → BLE audit* has two tabs:
+*Ethical Hacking → Bluetooth (BLE)* is a three-tab hub: **Audit**, **Radio &
+ID**, and **Stress & broadcast**. The Audit page has two inner tabs:
 
 - **Passive scan** — duration, active-scan toggle, name/RSSI filters, tap a
   device for a full advertising-data dialog, "Fuzz this" to target it.
 - **Directed fuzz** — target address + type, Connect / Discover / Disconnect /
-  Ping (single-target liveness). After Discover, characteristics are listed
+  Ping (single-target or scan-buffer liveness). After Discover, characteristics are listed
   **grouped under their primary services**, each with Read / Write / Notify /
   Select actions; a header button lists **all descriptors** in a dialog. The
   live status panel shows connection / discovery / fuzz state, the negotiated
@@ -121,25 +124,54 @@ BLE commands occupy the **7000** block of the request/response command protocol
 | 7044–7047 | Stress: flood start/stop/count, kick |
 | 7050–7051 | Environment-wide advertising flood start/stop |
 
-There is no async push channel; continuous data (scan results, fuzz log,
-notifications) is buffered in firmware and paged out by index by the host.
+There is no async command-event push channel; continuous data (scan results,
+fuzz log, notifications) is buffered in firmware and paged out by record index.
+The CLI drains all pages and rejects malformed/truncated records.
+
+The central-state response retains its original 12-byte prefix. Current firmware
+appends flood state/count, read state, write state, and notification count, for a
+21-byte response. Older 10/12-byte responses remain accepted by the clients.
+
+## Reliability and current limits
+
+- One peripheral host link and one central audit link can be active at once.
+- Scanning and initiating use the 1M PHY and legacy 31-byte advertisements.
+- One GATT client procedure can be active at a time; conflicting operations are
+  rejected rather than silently replacing pending state.
+- Explicit writes are limited to the negotiated `ATT_MTU - 3` and are never
+  silently truncated. The fuzzer/flood payload remains limited to 20 bytes.
+- Disconnects and GATT timeouts terminate pending discovery/read/write/CCCD/info
+  operations, so host polling cannot remain pending forever.
+- NUS command responses are copied to a bounded queue and advanced by
+  `BLE_NUS_EVT_TX_RDY`; a connected client that has not enabled notifications can
+  no longer trap the firmware in a busy loop.
+- Responses are sent back over the transport that supplied the request. A USB
+  connection no longer steals a response to a BLE NUS command.
+- Full unknown 128-bit target UUIDs, long reads/reliable writes, central-role
+  pairing, extended advertising, Coded PHY and multiple central links remain
+  future work.
 
 ## Firmware notes
 
 - `ble_main.c` — BLE peripheral (advertising, NUS command transport, battery,
-  pairing) **and** the passive observer scanner.
+  pairing), own identity/privacy and radio ownership.
+- `ble_scan.c` — passive/active observer scan state, advertisement/scan-response
+  merge, fixed result cache and connectable-target snapshots.
 - `ble_central.c` — the central-role harness (connect, primary-service /
   characteristic / descriptor discovery, CCCD lookup, read, write, subscribe,
   link probe, the directed fuzzer, and scan-buffer-wide stress iteration). MTU is negotiated by `nrf_ble_gatt`
   (`nrf_ble_gatt_att_mtu_central_set` in `ble_main.c`'s `gatt_init`), so read /
-  write / fuzz scale to the negotiated ATT MTU (up to ~244 bytes) instead of the
-  23-byte default. Registers its own SoftDevice observer; the peripheral handler
+  explicit write scales to the negotiated ATT MTU (up to 244 bytes) instead of
+  the 20-byte default. Registers its own SoftDevice observer; the peripheral handler
   in `ble_main.c` is role/handle-guarded so it ignores the central link.
 - Enabling the central role required `NRF_SDH_BLE_CENTRAL_LINK_COUNT=1` /
   `TOTAL=2` in `sdk_config.h` and a **RAM-origin bump** in `application.ld`. The
   origin there is an estimate — if `nrf_sdh_ble_enable` asserts `NRF_ERROR_NO_MEM`
   on first boot, the SoftDevice logs the exact required RAM start; set `ORIGIN`
   to it and shrink `LENGTH` accordingly.
+- Application flash ends at `0xC7000`; `0xC7000–0xF3000` is reserved for the 22
+  FDS virtual pages used by Peer Manager/settings, and the bootloader begins at
+  `0xF3000`.
 - The outside-to-center LED effect is `rgb_marquee_ble_test_loop()`, driven from
   the main loop while `rgb_marquee_is_ble_test_anim()`; it is auto-enabled while a
   fuzz runs.

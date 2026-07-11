@@ -1,0 +1,21 @@
+name: Firmware release safety
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate firmware partitions and DFU policy
+        run: |
+          HW_VERSION=0 .github/scripts/validate_firmware_release.sh --device ultra
+          HW_VERSION=1 .github/scripts/validate_firmware_release.sh --device lite
+      - name: Reject newly tracked secrets
+        run: .github/scripts/check_no_new_secrets.sh

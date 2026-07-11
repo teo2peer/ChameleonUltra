@@ -34,6 +34,13 @@ extern bool g_usb_led_marquee_enable;
 static volatile bool m_is_lf_emulating = false;
 // Cache tag type
 static tag_specific_type_t m_tag_type = TAG_TYPE_UNDEFINED;
+static volatile bool m_pwm_stopped_pending = false;
+static bool m_hfclk_requested = false;
+static enum {
+    LF_SENSE_STATE_NONE,
+    LF_SENSE_STATE_DISABLE,
+    LF_SENSE_STATE_ENABLE,
+} m_lf_sense_state = LF_SENSE_STATE_NONE;
 
 // The pwm to broadcast modulated card id
 const nrfx_pwm_t m_broadcast = NRFX_PWM_INSTANCE(0);
@@ -95,7 +102,11 @@ static void lpcomp_event_handler(nrf_lpcomp_event_t event) {
     // PWM has fully released LF_MOD, so ANT_NO_MOD() and the settle delay are
     // effective. NRFX_PWM_FLAG_LOOP kept the pin owned by the peripheral,
     // making the field check always read "present" due to self-drive on LF_RSSI.
-    nrfx_pwm_simple_playback(&m_broadcast, m_pwm_seq, 10, NRFX_PWM_FLAG_STOP);
+    if (m_pwm_seq != NULL) {
+        nrfx_pwm_simple_playback(&m_broadcast, m_pwm_seq, 10, NRFX_PWM_FLAG_STOP);
+    } else {
+        lf_field_lost();
+    }
 
     NRF_LOG_INFO("LF FIELD DETECTED");
 }
@@ -115,13 +126,24 @@ static void pwm_handler(nrfx_pwm_evt_type_t event_type) {
     if (event_type != NRFX_PWM_EVT_STOPPED) {
         return;
     }
-    // PWM has fully stopped — LF_MOD is released back to GPIO.
-    // Now ANT_NO_MOD() and the settle delay are effective.
+    m_pwm_stopped_pending = true;
+}
+
+void lf_tag_emulation_process(void) {
+    if (!m_pwm_stopped_pending) return;
+    m_pwm_stopped_pending = false;
+    if (m_lf_sense_state != LF_SENSE_STATE_ENABLE) return;
+
+    // PWM has fully stopped. Handle field settling and restart in thread context.
     ANT_NO_MOD();
     bsp_delay_ms(2);  // let peak detector drain: ~2 ms time constant on LF_RSSI
     if (is_lf_field_exists()) {
         // Field still present — play another finite burst then check again.
-        nrfx_pwm_simple_playback(&m_broadcast, m_pwm_seq, 10, NRFX_PWM_FLAG_STOP);
+        if (m_pwm_seq != NULL) {
+            nrfx_pwm_simple_playback(&m_broadcast, m_pwm_seq, 10, NRFX_PWM_FLAG_STOP);
+        } else {
+            lf_field_lost();
+        }
     } else {
         // Field gone — clean up.
         lf_field_lost();
@@ -150,7 +172,7 @@ static void pwm_init(void) {
     APP_ERROR_CHECK(err_code);
 }
 
-static void lf_sense_enable(void) {
+static bool lf_sense_enable(void) {
     // PWM bit timing divides HFCLK by a fixed ratio. On HFINT (64 MHz RC,
     // ±1.5% at 25°C after factory trim, wider over temperature) this gives a
     // chip-to-chip spread that NRZ readers — which see cumulative error across
@@ -166,10 +188,25 @@ static void lf_sense_enable(void) {
     // Paired release in lf_sense_disable(). SD reference-counts HFXO requests,
     // so this coexists with BLE. Both functions run from thread context
     // (tag_mode_enter/tag_emulation_sense_end) where SVCs are safe.
-    sd_clock_hfclk_request();
+    uint32_t err = sd_clock_hfclk_request();
+    if (err != NRF_SUCCESS) {
+        NRF_LOG_WARNING("Unable to request LF emulation HFXO: 0x%x", err);
+        return false;
+    }
+    m_hfclk_requested = true;
     uint32_t hfclk_running = 0;
-    while (!hfclk_running) {
-        sd_clock_hfclk_is_running(&hfclk_running);
+    for (uint16_t elapsed_ms = 0; elapsed_ms < 100 && !hfclk_running; elapsed_ms++) {
+        err = sd_clock_hfclk_is_running(&hfclk_running);
+        if (err != NRF_SUCCESS) break;
+        if (!hfclk_running) {
+            bsp_delay_ms(1);
+        }
+    }
+    if (err != NRF_SUCCESS || !hfclk_running) {
+        NRF_LOG_WARNING("LF emulation HFXO did not start: 0x%x", err);
+        (void)sd_clock_hfclk_release();
+        m_hfclk_requested = false;
+        return false;
     }
 
     lpcomp_init();
@@ -177,21 +214,22 @@ static void lf_sense_enable(void) {
     if (is_lf_field_exists()) {
         lpcomp_event_handler(NRF_LPCOMP_EVENT_UP);
     }
+    return true;
 }
 
 static void lf_sense_disable(void) {
     nrfx_pwm_uninit(&m_broadcast);
     nrfx_lpcomp_uninit();
     m_pwm_seq = NULL;
+    m_pwm_stopped_pending = false;
     m_is_lf_emulating = false;
-    sd_clock_hfclk_release();
+    g_is_tag_emulating = false;
+    TAG_FIELD_LED_OFF()
+    if (m_hfclk_requested) {
+        (void)sd_clock_hfclk_release();
+        m_hfclk_requested = false;
+    }
 }
-
-static enum {
-    LF_SENSE_STATE_NONE,
-    LF_SENSE_STATE_DISABLE,
-    LF_SENSE_STATE_ENABLE,
-} m_lf_sense_state = LF_SENSE_STATE_NONE;
 
 static uint16_t lf_em410x_id_size(tag_specific_type_t type) {
     return type == TAG_TYPE_EM410X_ELECTRA ? LF_EM410X_ELECTRA_TAG_ID_SIZE : LF_EM410X_TAG_ID_SIZE;
@@ -209,7 +247,7 @@ void lf_tag_125khz_sense_switch(bool enable) {
     if ((m_lf_sense_state == LF_SENSE_STATE_NONE || m_lf_sense_state == LF_SENSE_STATE_DISABLE) && enable) {
         // switch from disable -> enable
         m_lf_sense_state = LF_SENSE_STATE_ENABLE;
-        lf_sense_enable();
+        if (!lf_sense_enable()) m_lf_sense_state = LF_SENSE_STATE_DISABLE;
     } else if (m_lf_sense_state == LF_SENSE_STATE_ENABLE && !enable) {
         // switch from enable -> disable
         m_lf_sense_state = LF_SENSE_STATE_DISABLE;
@@ -217,73 +255,96 @@ void lf_tag_125khz_sense_switch(bool enable) {
     }
 }
 
+static bool lf_load_protocol(tag_specific_type_t type, const protocol *p, uint8_t *data) {
+    bool restart_sense = m_lf_sense_state == LF_SENSE_STATE_ENABLE;
+    if (restart_sense) {
+        lf_tag_125khz_sense_switch(false);
+    }
+
+    void *codec = p->alloc();
+    if (codec == NULL) {
+        if (restart_sense) {
+            lf_tag_125khz_sense_switch(true);
+        }
+        return false;
+    }
+
+    const nrf_pwm_sequence_t *sequence = p->modulator(codec, data);
+    p->free(codec);
+    if (sequence != NULL) {
+        m_tag_type = type;
+        m_pwm_seq = sequence;
+    }
+
+    if (restart_sense) {
+        lf_tag_125khz_sense_switch(true);
+    }
+    return sequence != NULL;
+}
+
 /** @brief lf card data loader
  * @param type     Refined tag type
  * @param buffer   Data buffer
  */
 int lf_tag_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
+    if (buffer == NULL || buffer->buffer == NULL) {
+        return 0;
+    }
     // ensure buffer size is large enough for specific tag type,
     // so that tag data (e.g., card numbers) can be converted to corresponding pwm sequence here.
     if ((type == TAG_TYPE_EM410X || type == TAG_TYPE_EM410X_ELECTRA) && buffer->length >= lf_em410x_id_size(type)) {
         const protocol *p = type == TAG_TYPE_EM410X_ELECTRA ? &em410x_electra : &em410x_64;
-        m_tag_type = type;
-        void *codec = p->alloc();
-        m_pwm_seq = p->modulator(codec, buffer->buffer);
-        p->free(codec);
+        if (!lf_load_protocol(type, p, buffer->buffer)) {
+            return 0;
+        }
         NRF_LOG_INFO("load lf em410x%s data finish.", type == TAG_TYPE_EM410X_ELECTRA ? " electra" : "");
         return lf_em410x_id_size(type);
     }
 
     if (type == TAG_TYPE_HID_PROX && buffer->length >= LF_HIDPROX_TAG_ID_SIZE) {
-        m_tag_type = type;
-        void *codec = hidprox.alloc();
-        m_pwm_seq = hidprox.modulator(codec, buffer->buffer);
-        hidprox.free(codec);
+        if (!lf_load_protocol(type, &hidprox, buffer->buffer)) {
+            return 0;
+        }
         NRF_LOG_INFO("load lf hidprox data finish.");
         return LF_HIDPROX_TAG_ID_SIZE;
     }
 
     if (type == TAG_TYPE_IOPROX && buffer->length >= LF_IOPROX_TAG_ID_SIZE) {
-        m_tag_type = type;
-        void *codec = ioprox.alloc();
-        m_pwm_seq = ioprox.modulator(codec, buffer->buffer);
-        ioprox.free(codec);
+        if (!lf_load_protocol(type, &ioprox, buffer->buffer)) {
+            return 0;
+        }
         NRF_LOG_INFO("load lf ioprox data finish.");
         return LF_IOPROX_TAG_ID_SIZE;
     }
 
     if (type == TAG_TYPE_VIKING && buffer->length >= LF_VIKING_TAG_ID_SIZE) {
-        m_tag_type = type;
-        void *codec = viking.alloc();
-        m_pwm_seq = viking.modulator(codec, buffer->buffer);
-        viking.free(codec);
+        if (!lf_load_protocol(type, &viking, buffer->buffer)) {
+            return 0;
+        }
         NRF_LOG_INFO("load lf viking data finish.");
         return LF_VIKING_TAG_ID_SIZE;
     }
 
     if (type == TAG_TYPE_PAC && buffer->length >= LF_PAC_TAG_ID_SIZE) {
-        m_tag_type = type;
-        void *codec = pac.alloc();
-        m_pwm_seq = pac.modulator(codec, buffer->buffer);
-        pac.free(codec);
+        if (!pac_data_valid(buffer->buffer) || !lf_load_protocol(type, &pac, buffer->buffer)) {
+            return 0;
+        }
         NRF_LOG_INFO("load lf pac data finish.");
         return LF_PAC_TAG_ID_SIZE;
     }
 
     if (type == TAG_TYPE_JABLOTRON && buffer->length >= LF_JABLOTRON_TAG_ID_SIZE) {
-        m_tag_type = type;
-        void *codec = jablotron.alloc();
-        m_pwm_seq = jablotron.modulator(codec, buffer->buffer);
-        jablotron.free(codec);
+        if (!jablotron_data_valid(buffer->buffer) || !lf_load_protocol(type, &jablotron, buffer->buffer)) {
+            return 0;
+        }
         NRF_LOG_INFO("load lf jablotron data finish.");
         return LF_JABLOTRON_TAG_ID_SIZE;
     }
 
     if (type == TAG_TYPE_IDTECK && buffer->length >= LF_IDTECK_TAG_ID_SIZE) {
-        m_tag_type = type;
-        void *codec = idteck.alloc();
-        m_pwm_seq = idteck.modulator(codec, buffer->buffer);
-        idteck.free(codec);
+        if (!lf_load_protocol(type, &idteck, buffer->buffer)) {
+            return 0;
+        }
         NRF_LOG_INFO("load lf idteck data finish.");
         return LF_IDTECK_TAG_ID_SIZE;
     }

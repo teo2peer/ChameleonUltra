@@ -39,6 +39,9 @@ typedef struct {
     uint8_t lrc3;
 } PACKED netdata_frame_postamble_t;
 
+#define NETDATA_FRAME_OVERHEAD    (sizeof(netdata_frame_preamble_t) + sizeof(netdata_frame_postamble_t))
+#define NETDATA_MAX_FRAME_LENGTH  (NETDATA_MAX_DATA_LENGTH + NETDATA_FRAME_OVERHEAD)
+
 // For reception and CRC check
 typedef struct {
     netdata_frame_preamble_t pre;

@@ -11,6 +11,7 @@
 #include "nrf_sdh_ble.h"
 #include "nrf_ble_gatt.h"
 #include "nrf_ble_lesc.h"
+#include "ble_conn_state.h"
 
 #include "peer_manager.h"
 #include "peer_manager_handler.h"
@@ -20,8 +21,10 @@
 
 #include "syssleep.h"
 #include "ble_main.h"
+#include "ble_scan.h"
 #include "ble_central.h"
 #include "dataframe.h"
+#include "netdata.h"
 #include "hw_connect.h"
 #include "settings.h"
 #include "rgb_marquee.h"
@@ -47,7 +50,7 @@ NRF_LOG_MODULE_REGISTER();
 #define SEC_PARAMS_LESC                 1                                           /**< LE Secure Connections pairing required. */
 #define SEC_PARAMS_KEYPRESS             0                                           /**< Keypress notifications not required. */
 #define SEC_PARAMS_OOB                  0                                           /**< Out Of Band data not available. */
-#define SEC_PARAMS_MIN_KEY_SIZE         7                                           /**< Minimum encryption key size in octets. */
+#define SEC_PARAMS_MIN_KEY_SIZE         16                                          /**< Require full-length encryption keys. */
 #define SEC_PARAMS_MAX_KEY_SIZE         16                                          /**< Maximum encryption key size in octets. */
 
 #define APP_BLE_CONN_CFG_TAG            1                                           /**< A tag identifying the SoftDevice BLE configuration. */
@@ -105,7 +108,36 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 volatile bool g_is_ble_connected = false;
 volatile bool g_is_low_battery_shutdown = false;
 volatile bool g_is_ble_advertising = false;
+static volatile bool g_ble_radio_on = true;
 static ble_opt_t m_static_pin_option;
+
+#define BLE_ADV_FLOOD_MAX_INTERVAL_MS 10240u
+static volatile uint8_t m_adv_flood_state = 0;
+static uint8_t m_adv_flood_payload[31];
+static uint16_t m_adv_flood_interval = 0;
+
+#define NUS_TX_QUEUE_DEPTH 2
+typedef struct {
+    volatile bool valid;
+    uint16_t length;
+    uint8_t data[NETDATA_MAX_FRAME_LENGTH];
+} nus_tx_entry_t;
+
+static nus_tx_entry_t m_nus_tx_queue[NUS_TX_QUEUE_DEPTH];
+static uint8_t m_nus_tx_head;
+static uint8_t m_nus_tx_count;
+static uint16_t m_nus_tx_offset;
+static volatile bool m_nus_tx_sending;
+static volatile bool m_nus_tx_pending;
+static volatile uint32_t m_nus_tx_generation;
+static bool m_nus_comm_started;
+static uint8_t m_nus_rx_pending[BLE_NUS_MAX_DATA_LEN];
+static uint16_t m_nus_rx_length;
+static uint16_t m_nus_rx_offset;
+
+static bool nus_response_ready(void) {
+    return g_is_ble_connected && m_nus_comm_started && m_nus_tx_count < NUS_TX_QUEUE_DEPTH;
+}
 
 // Simple function to provide an index to the next input buffer
 // Will simply alernate between 0 and 1 when SAADC_BUF_COUNT is 2
@@ -183,160 +215,208 @@ static void on_bas_evt(ble_bas_t *p_bas, ble_bas_evt_t *p_evt) {
  * @param[in] p_evt       Nordic UART Service event.
  */
 /**@snippet [Handling the data received over BLE] */
+static void nus_tx_clear(void) {
+    CRITICAL_REGION_ENTER();
+    m_nus_tx_generation++;
+    for (uint8_t i = 0; i < NUS_TX_QUEUE_DEPTH; i++) {
+        m_nus_tx_queue[i].valid = false;
+    }
+    m_nus_tx_head = 0;
+    m_nus_tx_count = 0;
+    m_nus_tx_offset = 0;
+    CRITICAL_REGION_EXIT();
+}
+
+static void nus_tx_send(void) {
+    uint32_t generation;
+    bool retry;
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    if (m_nus_tx_sending) {
+        m_nus_tx_pending = true;
+        app_util_critical_region_exit(nested);
+        return;
+    }
+    m_nus_tx_sending = true;
+    generation = m_nus_tx_generation;
+    app_util_critical_region_exit(nested);
+
+    while (g_is_ble_connected && m_nus_comm_started) {
+        nus_tx_entry_t *entry;
+        uint16_t chunk_len;
+        uint8_t *chunk;
+        app_util_critical_region_enter(&nested);
+        if (generation != m_nus_tx_generation || m_nus_tx_count == 0) {
+            app_util_critical_region_exit(nested);
+            break;
+        }
+        entry = &m_nus_tx_queue[m_nus_tx_head];
+        if (!entry->valid) {
+            app_util_critical_region_exit(nested);
+            break;
+        }
+        chunk_len = MIN(m_ble_nus_max_data_len, entry->length - m_nus_tx_offset);
+        chunk = entry->data + m_nus_tx_offset;
+        app_util_critical_region_exit(nested);
+        ret_code_t err = ble_nus_data_send(&m_nus, chunk, &chunk_len, m_conn_handle);
+        app_util_critical_region_enter(&nested);
+        if (generation != m_nus_tx_generation || !entry->valid) {
+            app_util_critical_region_exit(nested);
+            break;
+        }
+        if (err == NRF_SUCCESS) {
+            m_nus_tx_offset += chunk_len;
+            if (m_nus_tx_offset == entry->length) {
+                entry->valid = false;
+                m_nus_tx_head = (m_nus_tx_head + 1) % NUS_TX_QUEUE_DEPTH;
+                m_nus_tx_count--;
+                m_nus_tx_offset = 0;
+            }
+            app_util_critical_region_exit(nested);
+            continue;
+        }
+        if (err == NRF_ERROR_BUSY || err == NRF_ERROR_RESOURCES) {
+            app_util_critical_region_exit(nested);
+            break;
+        }
+        app_util_critical_region_exit(nested);
+
+        NRF_LOG_WARNING("BLE NUS response cancelled at %u/%u: 0x%x",
+                        m_nus_tx_offset, entry->length, err);
+        if (err == NRF_ERROR_INVALID_STATE || err == NRF_ERROR_NOT_FOUND) {
+            nus_tx_clear();
+            break;
+        }
+        app_util_critical_region_enter(&nested);
+        if (generation != m_nus_tx_generation || !entry->valid) {
+            app_util_critical_region_exit(nested);
+            break;
+        }
+        entry->valid = false;
+        m_nus_tx_head = (m_nus_tx_head + 1) % NUS_TX_QUEUE_DEPTH;
+        m_nus_tx_count--;
+        m_nus_tx_offset = 0;
+        app_util_critical_region_exit(nested);
+    }
+    app_util_critical_region_enter(&nested);
+    m_nus_tx_sending = false;
+    retry = m_nus_tx_pending;
+    m_nus_tx_pending = false;
+    app_util_critical_region_exit(nested);
+    if (retry) {
+        nus_tx_send();
+    }
+}
+
+static void nus_rx_resume(void) {
+    if (m_nus_rx_length == 0) {
+        return;
+    }
+    uint16_t consumed = data_frame_receive_from(m_nus_rx_pending + m_nus_rx_offset,
+                                                 m_nus_rx_length - m_nus_rx_offset,
+                                                 DATA_FRAME_TRANSPORT_BLE);
+    m_nus_rx_offset += consumed;
+    if (m_nus_rx_offset == m_nus_rx_length) {
+        m_nus_rx_length = 0;
+        m_nus_rx_offset = 0;
+    }
+}
+
+static void nus_rx_overrun(void) {
+    NRF_LOG_WARNING("BLE NUS ingress queue overrun; disconnecting peer");
+    m_nus_rx_length = 0;
+    m_nus_rx_offset = 0;
+    data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
+    if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
+        ret_code_t err = sd_ble_gap_disconnect(m_conn_handle,
+                                               BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+        if (err != NRF_SUCCESS && err != NRF_ERROR_INVALID_STATE) {
+            NRF_LOG_WARNING("BLE NUS overrun disconnect failed: 0x%x", err);
+        }
+    }
+}
+
 static void nus_data_handler(ble_nus_evt_t *p_evt) {
+    if (p_evt->conn_handle != m_conn_handle) {
+        return;
+    }
+    if (p_evt->type == BLE_NUS_EVT_COMM_STARTED) {
+        m_nus_comm_started = true;
+        nus_tx_send();
+        return;
+    }
+    if (p_evt->type == BLE_NUS_EVT_COMM_STOPPED) {
+        m_nus_comm_started = false;
+        m_nus_rx_length = 0;
+        m_nus_rx_offset = 0;
+        nus_tx_clear();
+        data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
+        return;
+    }
     if (p_evt->type == BLE_NUS_EVT_RX_DATA) {
         NRF_LOG_DEBUG("Received data from BLE NUS.");
         NRF_LOG_HEXDUMP_DEBUG(p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
-        data_frame_receive((uint8_t *)(p_evt->params.rx_data.p_data), p_evt->params.rx_data.length);
+        if (m_nus_rx_length != 0 || p_evt->params.rx_data.length > sizeof(m_nus_rx_pending)) {
+            nus_rx_overrun();
+            return;
+        }
+        memcpy(m_nus_rx_pending, p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
+        m_nus_rx_length = p_evt->params.rx_data.length;
+        m_nus_rx_offset = 0;
+        nus_rx_resume();
+    } else if (p_evt->type == BLE_NUS_EVT_TX_RDY) {
+        nus_tx_send();
     }
 }
 /**@snippet [Handling the data received over BLE] */
 
+uint32_t nus_data_response_try(const uint8_t *p_data, uint16_t length) {
+    if (p_data == NULL || length == 0 || length > NETDATA_MAX_FRAME_LENGTH) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (!g_is_ble_connected || !m_nus_comm_started) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    uint8_t tail;
+    uint32_t generation;
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    if (m_nus_tx_count >= NUS_TX_QUEUE_DEPTH) {
+        app_util_critical_region_exit(nested);
+        return NRF_ERROR_RESOURCES;
+    }
+
+    tail = (m_nus_tx_head + m_nus_tx_count) % NUS_TX_QUEUE_DEPTH;
+    generation = m_nus_tx_generation;
+    m_nus_tx_queue[tail].valid = false;
+    m_nus_tx_count++;
+    app_util_critical_region_exit(nested);
+
+    memcpy(m_nus_tx_queue[tail].data, p_data, length);
+    app_util_critical_region_enter(&nested);
+    if (generation != m_nus_tx_generation) {
+        app_util_critical_region_exit(nested);
+        return NRF_ERROR_INVALID_STATE;
+    }
+    m_nus_tx_queue[tail].length = length;
+    __DMB();
+    m_nus_tx_queue[tail].valid = true;
+    app_util_critical_region_exit(nested);
+    nus_tx_send();
+    return NRF_SUCCESS;
+}
+
 void nus_data_response(uint8_t *p_data, uint16_t length) {
     NRF_LOG_INFO("BLE nus service response data length: %d", length);
     NRF_LOG_HEXDUMP_DEBUG(p_data, length);
-
-    ret_code_t err_code;
-    uint16_t remain = length;
-    uint16_t count = 0;
-    do {
-        remain = MIN(m_ble_nus_max_data_len, remain);
-        err_code = ble_nus_data_send(&m_nus, p_data + count, &remain, m_conn_handle);
-        // NRF_LOG_INFO("Data send length(amount): %d", remain);
-        if (err_code == NRF_SUCCESS) {
-            count += remain;
-            remain = length - count;
-        }
-        // NRF_LOG_INFO("Data send length(count): %d", count);
-        if (err_code == NRF_ERROR_BUSY) {
-            continue;
-        }
-        if ((err_code != NRF_ERROR_INVALID_STATE) &&
-                (err_code != NRF_ERROR_RESOURCES) &&
-                (err_code != NRF_ERROR_NOT_FOUND)) {
-            APP_ERROR_CHECK(err_code);
-        }
-
-    } while (count != length && g_is_ble_connected);
+    ret_code_t err = nus_data_response_try(p_data, length);
+    if (err != NRF_SUCCESS) {
+        NRF_LOG_WARNING("BLE NUS response not queued: 0x%x", err);
+    }
 }
 
 bool is_nus_working(void) {
-    return g_is_ble_connected;
-}
-
-// ---------------------------------------------------------------------------
-// Passive BLE scanner (observer role) — listen-only.
-//
-// The scan is started with active=0 (PASSIVE), so the SoftDevice never sends a
-// scan request. The device transmits nothing while scanning; it only collects
-// the advertising packets that nearby devices already broadcast. This is the
-// receive-only counterpart to advertising, and is used for device inventory /
-// detection. It never connects out and never emits a carrier.
-// ---------------------------------------------------------------------------
-#define BLE_SCAN_MAX_DEVICES        40      // distinct devices retained per scan
-#define BLE_SCAN_ADV_DATA_MAX       31      // legacy advertising payload maximum
-
-typedef struct {
-    uint8_t  addr[BLE_GAP_ADDR_LEN];        // device address as reported (LE byte order)
-    uint8_t  addr_type;                     // BLE_GAP_ADDR_TYPE_*
-    int8_t   rssi;                          // last observed RSSI (dBm)
-    bool     connectable;                   // seen in a connectable advertising event
-    uint8_t  adv_data_len;                  // bytes valid in adv_data
-    uint8_t  adv_data[BLE_SCAN_ADV_DATA_MAX];
-} ble_scan_record_t;
-
-static ble_scan_record_t m_scan_records[BLE_SCAN_MAX_DEVICES];
-static volatile uint8_t  m_scan_count  = 0;
-static volatile bool     m_scan_active = false;
-
-static uint8_t    m_scan_buffer_data[BLE_GAP_SCAN_BUFFER_MIN];
-static ble_data_t m_scan_buffer = { m_scan_buffer_data, BLE_GAP_SCAN_BUFFER_MIN };
-
-// active is chosen per scan: 0 = passive (listen only, default), 1 = active
-// (send scan requests to also collect scan responses, e.g. the full device
-// name). Active scan is the standard BLE discovery exchange, not disruption.
-static ble_gap_scan_params_t m_scan_params = {
-    .active        = 0,
-    .filter_policy = BLE_GAP_SCAN_FP_ACCEPT_ALL,
-    .scan_phys     = BLE_GAP_PHY_1MBPS,
-    .interval      = MSEC_TO_UNITS(100, UNIT_0_625_MS),
-    .window        = MSEC_TO_UNITS(50, UNIT_0_625_MS),
-    .timeout       = 0,                                  // run until explicitly stopped
-};
-
-// Merge one advertising report into the result table (dedup by address).
-static void ble_scan_record_update(const ble_gap_evt_adv_report_t *report) {
-    uint8_t adv_len = MIN(report->data.len, (uint16_t)BLE_SCAN_ADV_DATA_MAX);
-
-    for (uint8_t i = 0; i < m_scan_count; i++) {
-        if (m_scan_records[i].addr_type == report->peer_addr.addr_type &&
-                memcmp(m_scan_records[i].addr, report->peer_addr.addr, BLE_GAP_ADDR_LEN) == 0) {
-            // Known device: refresh RSSI and advertising payload.
-            m_scan_records[i].rssi = report->rssi;
-            m_scan_records[i].connectable = m_scan_records[i].connectable || (report->type.connectable != 0);
-            m_scan_records[i].adv_data_len = adv_len;
-            memcpy(m_scan_records[i].adv_data, report->data.p_data, adv_len);
-            return;
-        }
-    }
-
-    if (m_scan_count >= BLE_SCAN_MAX_DEVICES) {
-        return; // table full: keep the first BLE_SCAN_MAX_DEVICES distinct devices
-    }
-
-    ble_scan_record_t *rec = &m_scan_records[m_scan_count];
-    memcpy(rec->addr, report->peer_addr.addr, BLE_GAP_ADDR_LEN);
-    rec->addr_type    = report->peer_addr.addr_type;
-    rec->rssi         = report->rssi;
-    rec->connectable  = (report->type.connectable != 0);
-    rec->adv_data_len = adv_len;
-    memcpy(rec->adv_data, report->data.p_data, adv_len);
-    m_scan_count++;
-}
-
-uint32_t ble_scan_start(uint8_t active) {
-    if (m_scan_active) {
-        return NRF_SUCCESS;
-    }
-    m_scan_count = 0;
-    m_scan_params.active = active ? 1 : 0;
-    m_scan_buffer.len = BLE_GAP_SCAN_BUFFER_MIN;
-    ret_code_t err_code = sd_ble_gap_scan_start(&m_scan_params, &m_scan_buffer);
-    if (err_code == NRF_SUCCESS) {
-        m_scan_active = true;
-    }
-    return err_code;
-}
-
-uint32_t ble_scan_stop(void) {
-    if (!m_scan_active) {
-        return NRF_SUCCESS;
-    }
-    m_scan_active = false;
-    return sd_ble_gap_scan_stop();
-}
-
-uint8_t ble_scan_get_count(void) {
-    return m_scan_count;
-}
-
-uint16_t ble_scan_copy_records(uint8_t start_index, uint8_t *out, uint16_t out_cap) {
-    uint16_t offset = 0;
-    for (uint8_t i = start_index; i < m_scan_count; i++) {
-        ble_scan_record_t *rec = &m_scan_records[i];
-        uint16_t rec_size = BLE_GAP_ADDR_LEN + 3 + rec->adv_data_len; // addr + type + rssi + len + adv
-        if (offset + rec_size > out_cap) {
-            break;
-        }
-        memcpy(out + offset, rec->addr, BLE_GAP_ADDR_LEN);
-        offset += BLE_GAP_ADDR_LEN;
-        out[offset++] = rec->addr_type;
-        out[offset++] = (uint8_t)rec->rssi;
-        out[offset++] = rec->adv_data_len;
-        memcpy(out + offset, rec->adv_data, rec->adv_data_len);
-        offset += rec->adv_data_len;
-    }
-    return offset;
+    return g_is_ble_connected && m_nus_comm_started;
 }
 
 /**@brief Function for handling Queued Write Module errors.
@@ -420,6 +500,8 @@ static void services_init(void) {
 
     err_code = ble_nus_init(&m_nus, &nus_init);
     APP_ERROR_CHECK(err_code);
+    data_frame_set_flow_callback(DATA_FRAME_TRANSPORT_BLE, nus_rx_resume);
+    data_frame_set_ready_callback(DATA_FRAME_TRANSPORT_BLE, nus_response_ready);
 
     // -------------------------------------------------------------
     // battery service
@@ -531,15 +613,23 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             // to a fuzzing target are handled in ble_central.c — ignore them so
             // we don't clobber the app connection state.
             if (p_ble_evt->evt.gap_evt.params.connected.role != BLE_GAP_ROLE_PERIPH) {
+                ble_scan_mark_inactive();
                 break;
             }
             sleep_timer_stop();
 
             NRF_LOG_INFO("Connected");
             m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
+            m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;
             err_code = nrf_ble_qwr_conn_handle_assign(&m_qwr, m_conn_handle);
             APP_ERROR_CHECK(err_code);
             g_is_ble_connected = true;
+            m_nus_comm_started = false;
+            m_nus_rx_length = 0;
+            m_nus_rx_offset = 0;
+            nus_tx_clear();
+            data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
+            g_is_ble_advertising = false;
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
@@ -552,6 +642,17 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             // LED indication will be changed when advertising starts.
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             g_is_ble_connected = false;
+            m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;
+            m_nus_comm_started = false;
+            m_nus_rx_length = 0;
+            m_nus_rx_offset = 0;
+            nus_tx_clear();
+            data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
+            if (!g_ble_radio_on) {
+                advertising_stop();
+            }
+            // The higher-priority advertising observer records a successful
+            // automatic restart through on_adv_evt().
             // call sleep_timer_start *after* unsetting g_is_ble_connected
             sleep_timer_start(SLEEP_DELAY_MS_BLE_DISCONNECTED);
             break;
@@ -583,10 +684,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             break;
 
         case BLE_GAP_EVT_PASSKEY_DISPLAY: {
-            char passkey[BLE_GAP_PASSKEY_LEN + 1];
-            memcpy(passkey, p_ble_evt->evt.gap_evt.params.passkey_display.passkey, BLE_GAP_PASSKEY_LEN);
-            passkey[BLE_GAP_PASSKEY_LEN] = 0x00;
-            NRF_LOG_INFO("=== PASSKEY: %s =====",   nrf_log_push(passkey));
+            NRF_LOG_INFO("BLE passkey display requested");
         }
         break;
 
@@ -604,25 +702,29 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             // Disconnect on GATT Client timeout event.
             err_code = sd_ble_gap_disconnect(p_ble_evt->evt.gattc_evt.conn_handle,
                                              BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
-            APP_ERROR_CHECK(err_code);
+            if (err_code != NRF_SUCCESS && err_code != NRF_ERROR_INVALID_STATE &&
+                    err_code != BLE_ERROR_INVALID_CONN_HANDLE) {
+                NRF_LOG_WARNING("GATTC timeout disconnect failed: 0x%x", err_code);
+            }
             break;
 
         case BLE_GATTS_EVT_TIMEOUT:
             // Disconnect on GATT Server timeout event.
             err_code = sd_ble_gap_disconnect(p_ble_evt->evt.gatts_evt.conn_handle,
                                              BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
-            APP_ERROR_CHECK(err_code);
+            if (err_code != NRF_SUCCESS && err_code != NRF_ERROR_INVALID_STATE &&
+                    err_code != BLE_ERROR_INVALID_CONN_HANDLE) {
+                NRF_LOG_WARNING("GATTS timeout disconnect failed: 0x%x", err_code);
+            }
             break;
 
         case BLE_GAP_EVT_ADV_REPORT:
-            // Passive-scan result. Record it, then hand the scan buffer back to
-            // the SoftDevice so it keeps delivering reports (each report consumes
-            // the buffer). Not APP_ERROR_CHECK'd on purpose: if the scan was
-            // stopped meanwhile, a benign error is expected here.
-            if (m_scan_active) {
-                ble_scan_record_update(&p_ble_evt->evt.gap_evt.params.adv_report);
-                err_code = sd_ble_gap_scan_start(NULL, &m_scan_buffer);
-                UNUSED_VARIABLE(err_code);
+            ble_scan_on_adv_report(&p_ble_evt->evt.gap_evt.params.adv_report);
+            break;
+
+        case BLE_GAP_EVT_TIMEOUT:
+            if (p_ble_evt->evt.gap_evt.params.timeout.src == BLE_GAP_TIMEOUT_SRC_CONN) {
+                ble_scan_mark_inactive();
             }
             break;
 
@@ -751,6 +853,9 @@ static void whitelist_set(pm_peer_id_list_skip_t skip) {
 /**@brief Function for starting advertising.
  */
 void advertising_start(bool erase_bonds) {
+    if (!g_ble_radio_on) {
+        return;
+    }
     if (g_is_ble_advertising && !erase_bonds) {
         return;
     }
@@ -768,8 +873,11 @@ void advertising_start(bool erase_bonds) {
             whitelist_set(PM_PEER_ID_LIST_SKIP_NO_ID_ADDR);
         }
         ret_code_t ret = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
-        APP_ERROR_CHECK(ret);
-        g_is_ble_advertising = true;
+        if (ret == NRF_SUCCESS) {
+            g_is_ble_advertising = true;
+        } else if (ret != NRF_ERROR_INVALID_STATE) {
+            NRF_LOG_WARNING("Failed to start BLE advertising: 0x%x", ret);
+        }
     }
 }
 
@@ -780,16 +888,21 @@ void advertising_stop(void) {
     if (!g_is_ble_advertising) {
         return;
     }
-    sd_ble_gap_adv_stop(m_advertising.adv_handle);
-    g_is_ble_advertising = false;
+    uint32_t err_code = sd_ble_gap_adv_stop(m_advertising.adv_handle);
+    if (err_code == NRF_SUCCESS || err_code == NRF_ERROR_INVALID_STATE) {
+        g_is_ble_advertising = false;
+    } else {
+        NRF_LOG_WARNING("Failed to stop BLE advertising: 0x%x", err_code);
+    }
 }
 
 bool is_ble_advertising(void) {
-    return g_is_ble_advertising;
+    return g_is_ble_advertising || m_adv_flood_state != 0;
 }
 
-bool is_ble_scanning(void) {
-    return m_scan_active;
+bool ble_command_link_authorized(void) {
+    return m_conn_handle != BLE_CONN_HANDLE_INVALID && m_nus_comm_started &&
+           ble_conn_state_encrypted(m_conn_handle);
 }
 
 /**@brief Function for handling Peer Manager events.
@@ -956,8 +1069,6 @@ void create_battery_timer(void) {
 // the 7050-block + ble_central scan-buffer-wide kick/flood (CLAUDE.md
 // fork-specific exemption — operator-authorised).
 // ---------------------------------------------------------------------------
-static volatile bool g_ble_radio_on = true;
-
 // Original (factory) address cache, captured at first call. Format: the BLE
 // spec mandates bit14 of the high byte be 1 for a static-random address, so
 // we mask in 0xC000 over the FICR bytes (matches the pattern the firmware
@@ -965,6 +1076,23 @@ static volatile bool g_ble_radio_on = true;
 static bool     m_orig_addr_known = false;
 static uint8_t  m_orig_addr_type;                      // BLE_GAP_ADDR_TYPE_PUBLIC
 static uint8_t  m_orig_addr[BLE_GAP_ADDR_LEN];
+
+static void restore_address_gap_procedures(bool advertising, bool flooding,
+                                           bool scanning, uint8_t scan_mode,
+                                           uint8_t flood_fill, uint16_t flood_interval) {
+    if (flooding) {
+        uint16_t interval_ms = (uint16_t)(((uint32_t)flood_interval * 625u + 999u) / 1000u);
+        if (ble_adv_flood_start(flood_fill, interval_ms) != NRF_SUCCESS) {
+            NRF_LOG_WARNING("Failed to restore advertising flood");
+        }
+    } else if (advertising) {
+        advertising_start(false);
+    }
+
+    if (scanning && ble_scan_start(scan_mode) != NRF_SUCCESS) {
+        NRF_LOG_WARNING("Failed to restore BLE scan");
+    }
+}
 
 static void cache_original_address(void) {
     if (m_orig_addr_known) {
@@ -979,12 +1107,12 @@ static void cache_original_address(void) {
         memcpy(m_orig_addr, addr.addr, BLE_GAP_ADDR_LEN);
     } else {
         // Fall back to the FICR value with the 0xC000 static-random bit pattern.
-        m_orig_addr[5] = (uint8_t)(NRF_FICR->DEVICEADDR[0]        & 0xFF);
-        m_orig_addr[4] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 8) & 0xFF);
-        m_orig_addr[3] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 16) & 0xFF);
-        m_orig_addr[2] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 24) & 0xFF);
-        m_orig_addr[1] = (uint8_t)((NRF_FICR->DEVICEADDR[1] >> 8) & 0xFF);
-        m_orig_addr[0] = (uint8_t)(((NRF_FICR->DEVICEADDR[1] >> 16) & 0x3F) | 0xC0); // top 2 bits = 11
+        m_orig_addr[0] = (uint8_t)(NRF_FICR->DEVICEADDR[0] & 0xFF);
+        m_orig_addr[1] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 8) & 0xFF);
+        m_orig_addr[2] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 16) & 0xFF);
+        m_orig_addr[3] = (uint8_t)((NRF_FICR->DEVICEADDR[0] >> 24) & 0xFF);
+        m_orig_addr[4] = (uint8_t)(NRF_FICR->DEVICEADDR[1] & 0xFF);
+        m_orig_addr[5] = (uint8_t)(((NRF_FICR->DEVICEADDR[1] >> 8) & 0x3F) | 0xC0);
         m_orig_addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
     }
     m_orig_addr_known = true;
@@ -993,11 +1121,13 @@ static void cache_original_address(void) {
 uint32_t ble_addr_set(uint8_t mode, const uint8_t *addr_le) {
     cache_original_address();
 
-    // Refuse to change the address while a peripheral or central link is up —
-    // sd_ble_gap_addr_set() returns BUSY in that state, and silently swapping
-    // the identity under an active peer would only confuse things.
     if (g_is_ble_connected || ble_central_is_connected() || ble_central_is_connecting()) {
         return NRF_ERROR_BUSY;
+    }
+
+    if (mode > BLE_ADDR_MODE_RANDOM_NONRESOLV ||
+            (mode == BLE_ADDR_MODE_RANDOM_STATIC && addr_le == NULL)) {
+        return NRF_ERROR_INVALID_PARAM;
     }
 
     ble_gap_addr_t addr;
@@ -1010,43 +1140,82 @@ uint32_t ble_addr_set(uint8_t mode, const uint8_t *addr_le) {
         break;
 
     case BLE_ADDR_MODE_RANDOM_STATIC:
-        if (addr_le == NULL) {
-            return NRF_ERROR_INVALID_PARAM;
-        }
-        // BLE static-random: top 2 bits of the high byte must be 11 (0xC0).
         memcpy(addr.addr, addr_le, BLE_GAP_ADDR_LEN);
-        addr.addr[0] = (uint8_t)((addr.addr[0] & 0x3F) | 0xC0);
+        addr.addr[5] = (uint8_t)((addr.addr[5] & 0x3F) | 0xC0);
         addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
         break;
 
     case BLE_ADDR_MODE_RANDOM_PRIVATE:
-        addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_RESOLVABLE;
-        // Leave addr.addr all-zero: the SoftDevice picks the local part and
-        // resolves against our peer IRK (or the default all-zero IRK).
         break;
 
     case BLE_ADDR_MODE_RANDOM_NONRESOLV:
-        addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_NON_RESOLVABLE;
-        memset(addr.addr, 0, BLE_GAP_ADDR_LEN);
         break;
 
     default:
         return NRF_ERROR_INVALID_PARAM;
     }
 
-    uint32_t err = sd_ble_gap_addr_set(&addr);
-    if (err != NRF_SUCCESS) {
-        return err;
+    bool was_advertising = g_is_ble_advertising;
+    bool was_flooding = m_adv_flood_state != 0;
+    bool was_scanning = is_ble_scanning();
+    uint8_t scan_mode = ble_scan_get_mode();
+    uint8_t flood_fill = m_adv_flood_payload[5];
+    uint16_t flood_interval = m_adv_flood_interval;
+
+    if (was_flooding) {
+        uint32_t err = ble_adv_flood_stop();
+        if (err != NRF_SUCCESS) {
+            restore_address_gap_procedures(false, true, false, scan_mode,
+                                           flood_fill, flood_interval);
+            return err;
+        }
+    }
+    if (was_advertising) {
+        advertising_stop();
+        if (g_is_ble_advertising) {
+            return NRF_ERROR_BUSY;
+        }
+    }
+    if (was_scanning) {
+        uint32_t err = ble_scan_stop();
+        if (err != NRF_SUCCESS) {
+            restore_address_gap_procedures(was_advertising, was_flooding, false,
+                                           scan_mode, flood_fill, flood_interval);
+            return err;
+        }
     }
 
-    // If we were advertising, restart so the new address shows up in the
-    // advertising PDU (the SoftDevice bakes the address into the payload at
-    // sd_ble_gap_adv_start() time).
-    if (g_is_ble_advertising) {
-        advertising_stop();
-        advertising_start(false);
+    ble_gap_privacy_params_t old_privacy = {0};
+    uint32_t err = sd_ble_gap_privacy_get(&old_privacy);
+    if (err == NRF_SUCCESS) {
+        ble_gap_privacy_params_t privacy = old_privacy;
+        privacy.p_device_irk = NULL;
+        if (mode == BLE_ADDR_MODE_RANDOM_PRIVATE || mode == BLE_ADDR_MODE_RANDOM_NONRESOLV) {
+            privacy.privacy_mode = BLE_GAP_PRIVACY_MODE_DEVICE_PRIVACY;
+            privacy.private_addr_type = (mode == BLE_ADDR_MODE_RANDOM_PRIVATE) ?
+                                        BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_RESOLVABLE :
+                                        BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_NON_RESOLVABLE;
+            err = sd_ble_gap_privacy_set(&privacy);
+        } else {
+            privacy.privacy_mode = BLE_GAP_PRIVACY_MODE_OFF;
+            if (privacy.private_addr_type != BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_RESOLVABLE &&
+                    privacy.private_addr_type != BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_NON_RESOLVABLE) {
+                privacy.private_addr_type = BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_RESOLVABLE;
+            }
+            err = sd_ble_gap_privacy_set(&privacy);
+            if (err == NRF_SUCCESS) {
+                err = sd_ble_gap_addr_set(&addr);
+                if (err != NRF_SUCCESS) {
+                    old_privacy.p_device_irk = NULL;
+                    (void)sd_ble_gap_privacy_set(&old_privacy);
+                }
+            }
+        }
     }
-    return NRF_SUCCESS;
+
+    restore_address_gap_procedures(was_advertising, was_flooding, was_scanning,
+                                   scan_mode, flood_fill, flood_interval);
+    return err;
 }
 
 uint32_t ble_addr_get(uint8_t *addr_type, uint8_t *addr_out) {
@@ -1054,7 +1223,13 @@ uint32_t ble_addr_get(uint8_t *addr_type, uint8_t *addr_out) {
         return NRF_ERROR_INVALID_PARAM;
     }
     ble_gap_addr_t addr = {0};
-    uint32_t err = sd_ble_gap_addr_get(&addr);
+    uint32_t err = NRF_ERROR_INVALID_STATE;
+    if (is_ble_advertising()) {
+        err = sd_ble_gap_adv_addr_get(m_advertising.adv_handle, &addr);
+    }
+    if (err != NRF_SUCCESS) {
+        err = sd_ble_gap_addr_get(&addr);
+    }
     if (err != NRF_SUCCESS) {
         return err;
     }
@@ -1078,16 +1253,33 @@ uint32_t ble_radio_set(uint8_t on) {
         return NRF_SUCCESS;
     }
 
-    // off: stop advertising, stop passive scan, drop central link if any.
-    ble_adv_flood_stop();
+    // Mark the policy off before stopping GAP procedures so asynchronous
+    // disconnect/bond events cannot restart advertising during shutdown.
+    g_ble_radio_on = false;
+    uint32_t err = ble_adv_flood_stop();
+    if (err != NRF_SUCCESS) {
+        g_ble_radio_on = true;
+        return err;
+    }
     advertising_stop();
-    if (m_scan_active) {
-        ble_scan_stop();
+    if (is_ble_advertising()) {
+        g_ble_radio_on = true;
+        return NRF_ERROR_BUSY;
+    }
+    if (is_ble_scanning()) {
+        err = ble_scan_stop();
+        if (err != NRF_SUCCESS) {
+            g_ble_radio_on = true;
+            return err;
+        }
     }
     if (ble_central_is_connected() || ble_central_is_connecting()) {
-        ble_central_disconnect();
+        err = ble_central_disconnect();
+        if (err != NRF_SUCCESS) {
+            g_ble_radio_on = true;
+            return err;
+        }
     }
-    g_ble_radio_on = false;
     return NRF_SUCCESS;
 }
 
@@ -1096,55 +1288,13 @@ uint32_t ble_radio_get(uint8_t *out) {
         return NRF_ERROR_INVALID_PARAM;
     }
     out[0] = g_ble_radio_on ? 1 : 0;
-    out[1] = g_is_ble_advertising ? 1 : 0;
-    out[2] = m_scan_active ? 1 : 0;
+    out[1] = is_ble_advertising() ? 1 : 0;
+    out[2] = is_ble_scanning() ? 1 : 0;
     out[3] = ble_central_is_connected() ? 1 : 0;
     return NRF_SUCCESS;
 }
 
-// ---- scan-buffer snapshot (used by scan-buffer-wide stress / kick) -------
-uint8_t ble_scan_copy_addresses(ble_scan_addr_t *out, uint8_t out_cap) {
-    if (out == NULL || out_cap == 0) {
-        return 0;
-    }
-
-    bool used[BLE_SCAN_MAX_DEVICES] = {0};
-    uint8_t n = 0;
-    while (n < out_cap) {
-        uint8_t best = 0xFF;
-        int8_t best_rssi = -128;
-
-        for (uint8_t i = 0; i < m_scan_count; i++) {
-            if (used[i] || !m_scan_records[i].connectable ||
-                    m_scan_records[i].addr_type == BLE_GAP_ADDR_TYPE_ANONYMOUS) {
-                continue;
-            }
-            if (best == 0xFF || m_scan_records[i].rssi > best_rssi) {
-                best = i;
-                best_rssi = m_scan_records[i].rssi;
-            }
-        }
-
-        if (best == 0xFF) {
-            break;
-        }
-
-        used[best] = true;
-        memcpy(out[n].addr, m_scan_records[best].addr, BLE_GAP_ADDR_LEN);
-        out[n].addr_type = m_scan_records[best].addr_type;
-        n++;
-    }
-    return n;
-}
-
 // ---- environment-wide broadcast (full 2.4 GHz BLE spectrum spam) --------
-#define BLE_ADV_FLOOD_MAX_INTERVAL_MS 10240u // S140 max adv interval: 0x4000 * 0.625 ms
-
-// State: idle=0, running=1.
-static volatile uint8_t m_adv_flood_state = 0;
-static uint8_t m_adv_flood_payload[31]; // legacy adv max = 31 bytes
-static uint16_t m_adv_flood_interval = 0; // units of 0.625 ms
-
 uint32_t ble_adv_flood_start(uint8_t fill_byte, uint16_t interval_ms) {
     if (!g_ble_radio_on) {
         return NRF_ERROR_INVALID_STATE;
@@ -1156,8 +1306,12 @@ uint32_t ble_adv_flood_start(uint8_t fill_byte, uint16_t interval_ms) {
         return NRF_ERROR_INVALID_PARAM;
     }
     if (m_adv_flood_state == 1) {
-        ble_adv_flood_stop();
+        uint32_t err = ble_adv_flood_stop();
+        if (err != NRF_SUCCESS) {
+            return err;
+        }
     }
+    bool restore_normal_advertising = g_is_ble_advertising;
     // Stop normal peripheral advertising first so it doesn't fight the flood.
     advertising_stop();
 
@@ -1196,13 +1350,16 @@ uint32_t ble_adv_flood_start(uint8_t fill_byte, uint16_t interval_ms) {
     // advertising module's handle instead of allocating a second one.
     uint32_t err = sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, &data, &params);
     if (err != NRF_SUCCESS) {
+        if (restore_normal_advertising) advertising_start(false);
         return err;
     }
     err = sd_ble_gap_adv_start(m_advertising.adv_handle, BLE_CONN_CFG_TAG_DEFAULT);
     if (err != NRF_SUCCESS) {
         (void)sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, NULL, NULL);
+        if (restore_normal_advertising) advertising_start(false);
         return err;
     }
+    g_is_ble_advertising = false;
     m_adv_flood_state = 1;
     rgb_marquee_set_ble_active_anim(true);
     return NRF_SUCCESS;
@@ -1212,11 +1369,14 @@ uint32_t ble_adv_flood_stop(void) {
     if (m_adv_flood_state == 0) {
         return NRF_SUCCESS;
     }
-    sd_ble_gap_adv_stop(m_advertising.adv_handle);
-    sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, NULL, NULL);
+    uint32_t err = sd_ble_gap_adv_stop(m_advertising.adv_handle);
+    if (err != NRF_SUCCESS && err != NRF_ERROR_INVALID_STATE) {
+        return err;
+    }
+    err = sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, NULL, NULL);
     m_adv_flood_state = 0;
     rgb_marquee_set_ble_active_anim(false);
-    return NRF_SUCCESS;
+    return err;
 }
 
 /**

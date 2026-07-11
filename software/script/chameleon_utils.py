@@ -128,6 +128,10 @@ def print_help(self):
     self.help_requested = True
 
 
+# Use the colorized print_help for our non-exiting parser (argparse's default is monochrome).
+ArgumentParserNoExit.print_help = print_help
+
+
 def print_mem_dump(bindata, blocksize):
 
     hexadecimal_len = blocksize*3+1
@@ -332,11 +336,11 @@ class CustomNestedCompleter(NestedCompleter):
     """
 
     def __init__(
-        self, options, ignore_case: bool = True, meta_dict: dict = {}
+        self, options, ignore_case: bool = True, meta_dict: Union[dict, None] = None
     ) -> None:
         self.options = options
         self.ignore_case = ignore_case
-        self.meta_dict = meta_dict
+        self.meta_dict = meta_dict if meta_dict is not None else {}
 
     def __repr__(self) -> str:
         return f"CustomNestedCompleter({self.options!r}, ignore_case={self.ignore_case!r})"

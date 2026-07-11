@@ -168,6 +168,9 @@ typedef struct {
     uint8_t ats_len;  // 14443-4 answer to select size
 } PACKED picc_14a_tag_t;
 
+typedef void (*pcd_14a_trace_cb_t)(bool tx, const uint8_t *data,
+                                   uint16_t bit_length, uint8_t status);
+
 // A struct used to send hf14a-configs
 typedef struct {
     int8_t forcebcc;     // 0:expect valid BCC 1:force using computed BCC 2:force using card BCC
@@ -198,6 +201,8 @@ void set_register_mask(uint8_t reg, uint8_t mask);
 // Device communication control
 uint16_t pcd_14a_reader_timeout_get(void);
 void pcd_14a_reader_timeout_set(uint16_t timeout_ms);
+void pcd_14a_reader_trace_set(pcd_14a_trace_cb_t callback);
+void pcd_14a_reader_trace_clear(void);
 
 // Device communication interface
 uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command,

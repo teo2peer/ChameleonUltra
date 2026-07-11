@@ -6,10 +6,14 @@
 
 bool fds_read_sync(uint16_t id, uint16_t key, uint16_t *length, uint8_t *buffer);
 bool fds_write_sync(uint16_t id, uint16_t key, uint16_t length, void *buffer);
+/* Returns the number deleted; inspect fds_util_last_error() when zero is ambiguous. */
 int fds_delete_sync(uint16_t id, uint16_t key);
 bool fds_is_exists(uint16_t id, uint16_t key);
 void fds_util_init(void);
-void fds_gc_sync(void);
+/* Detailed status for bool/count APIs, including timeout and busy failures. */
+bool fds_util_is_ready(void);
+ret_code_t fds_util_last_error(void);
+bool fds_gc_sync(void);
 bool fds_wipe(void);
 
 #endif

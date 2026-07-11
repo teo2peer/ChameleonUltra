@@ -89,7 +89,7 @@ void t55xx_timeslot_callback() {
  * @param data Data, 32 bits, transmitted from the lower bit 0
  * @param blk_addr Block number, 3 bit 0-7 yuan, input 255 means not using this bit (for password wake-up mode)
  */
-void t55xx_send_cmd(uint8_t opcode, uint32_t *passwd, uint8_t lock_bit, uint32_t *data, uint8_t blk_addr) {
+ret_code_t t55xx_send_cmd(uint8_t opcode, uint32_t *passwd, uint8_t lock_bit, uint32_t *data, uint8_t blk_addr) {
     // Password reading mode,        2op(1+bck)  32pw    1(0)            3addr
     // Password writing mode,        2op(1+bck)  32pw    1l      32data  3addr
     // Password wake-up mode,        2op(1+0)    32pw
@@ -108,13 +108,17 @@ void t55xx_send_cmd(uint8_t opcode, uint32_t *passwd, uint8_t lock_bit, uint32_t
     t55xx_cmd.blk_addr = blk_addr;
 
     // request timing, and wait for the order operation to complete
-    request_timeslot(37 * 1000, t55xx_timeslot_callback);
+    ret_code_t err = request_timeslot(37 * 1000, t55xx_timeslot_callback);
+    if (err != NRF_SUCCESS) {
+        return err;
+    }
 
     if (opcode != 0) {
         bsp_delay_ms(6);  // Maybe continue to write a card next time, you need to wait more for a while
     } else {
         bsp_delay_ms(1);
     }
+    return NRF_SUCCESS;
 }
 
 /**
@@ -124,13 +128,15 @@ void t55xx_send_cmd(uint8_t opcode, uint32_t *passwd, uint8_t lock_bit, uint32_t
  * @param blks the blocks data to write
  * @param blk_count the number of blocks to write
  */
-void t55xx_write_data(uint32_t passwd, uint32_t *blks, uint8_t blk_count) {
+ret_code_t t55xx_write_data(uint32_t passwd, uint32_t *blks, uint8_t blk_count) {
     // write control bits (blk0) & data (w/wo passwd)
     for (uint8_t i = 0; i < blk_count; i++) {
-        t55xx_send_cmd(T5577_OPCODE_PAGE0, &passwd, 0, &blks[i], i);
-        t55xx_send_cmd(T5577_OPCODE_PAGE0, NULL, 0, &blks[i], i);
+        ret_code_t err = t55xx_send_cmd(T5577_OPCODE_PAGE0, &passwd, 0, &blks[i], i);
+        if (err != NRF_SUCCESS) return err;
+        err = t55xx_send_cmd(T5577_OPCODE_PAGE0, NULL, 0, &blks[i], i);
+        if (err != NRF_SUCCESS) return err;
     }
-    t55xx_send_cmd(T5577_OPCODE_RESET, NULL, 0, NULL, 0);
+    return t55xx_send_cmd(T5577_OPCODE_RESET, NULL, 0, NULL, 0);
 }
 
 /**
@@ -139,8 +145,10 @@ void t55xx_write_data(uint32_t passwd, uint32_t *blks, uint8_t blk_count) {
  * @param old_passwd current card password (32bits)
  * @param new_passwd target card password (32bits)
  */
-void t55xx_reset_passwd(uint32_t old_passwd, uint32_t new_passwd) {
-    t55xx_send_cmd(T5577_OPCODE_PAGE0, &old_passwd, 0, &new_passwd, 7);  // 0 area 7 blocks to write new passwords (passwords)
-    t55xx_send_cmd(T5577_OPCODE_PAGE0, &old_passwd, 0, &new_passwd, 7);  // 0 area 7 blocks to write new passwords (passwords)
-    t55xx_send_cmd(T5577_OPCODE_RESET, NULL, 0, NULL, 0);
+ret_code_t t55xx_reset_passwd(uint32_t old_passwd, uint32_t new_passwd) {
+    ret_code_t err = t55xx_send_cmd(T5577_OPCODE_PAGE0, &old_passwd, 0, &new_passwd, 7);
+    if (err != NRF_SUCCESS) return err;
+    err = t55xx_send_cmd(T5577_OPCODE_PAGE0, &old_passwd, 0, &new_passwd, 7);
+    if (err != NRF_SUCCESS) return err;
+    return t55xx_send_cmd(T5577_OPCODE_RESET, NULL, 0, NULL, 0);
 }

@@ -2,7 +2,8 @@
 #define __CRC_UTILS_H
 
 #include <stdint.h>
+#include <stddef.h>
 
-void calc_14a_crc_lut(uint8_t *data, int length, uint8_t *output);
+void calc_14a_crc_lut(const uint8_t *data, size_t length, uint8_t *output);
 
 #endif

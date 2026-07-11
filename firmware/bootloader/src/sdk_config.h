@@ -1018,7 +1018,7 @@
 // <i> This config only has an effect when NRF_DFU_APP_DOWNGRADE_PREVENTION is enabled.
 
 #ifndef NRF_DFU_APP_ACCEPT_SAME_VERSION
-#define NRF_DFU_APP_ACCEPT_SAME_VERSION 1
+#define NRF_DFU_APP_ACCEPT_SAME_VERSION 0
 #endif
 
 // <q> NRF_DFU_APP_DOWNGRADE_PREVENTION  - Check the firmware version and SoftDevice requirements of application (and SoftDevice) updates.
@@ -1301,7 +1301,7 @@
 // <i> firmware upgrade. The size must be a multiple of the flash page size.
 
 #ifndef NRF_DFU_APP_DATA_AREA_SIZE
-#define NRF_DFU_APP_DATA_AREA_SIZE 12288
+#define NRF_DFU_APP_DATA_AREA_SIZE 180224
 #endif
 
 // <q> NRF_DFU_IN_APP  - Specifies that this code is in the app, not the bootloader, so some settings are off-limits.

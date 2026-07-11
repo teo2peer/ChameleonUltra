@@ -1,191 +1,333 @@
 #include "dataframe.h"
 #include "netdata.h"
 
+#include <stddef.h>
+#include <string.h>
+#include "app_util_platform.h"
+
 #define NRF_LOG_MODULE_NAME data_frame
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 NRF_LOG_MODULE_REGISTER();
 
-static netdata_frame_raw_t m_netdata_frame_rx_buf;
+#define DATA_FRAME_REQUEST_QUEUE_DEPTH 2
+
+typedef struct {
+    netdata_frame_raw_t frame;
+    uint16_t length;
+    uint16_t payload_length;
+    bool complete;
+    uint32_t generation;
+} data_frame_decoder_t;
+
+typedef struct {
+    volatile bool reserved;
+    volatile bool valid;
+    uint32_t sequence;
+    uint32_t generation;
+    data_frame_transport_t transport;
+    uint16_t cmd;
+    uint16_t status;
+    uint16_t length;
+    uint8_t data[NETDATA_MAX_DATA_LENGTH];
+} data_frame_request_t;
+
+static data_frame_decoder_t m_decoders[DATA_FRAME_TRANSPORT_COUNT - 1];
+static data_frame_request_t m_requests[DATA_FRAME_REQUEST_QUEUE_DEPTH];
+static uint32_t m_request_sequence;
+static data_frame_transport_t m_current_transport = DATA_FRAME_TRANSPORT_NONE;
+static data_frame_request_t *m_processing_request;
+static void (*m_flow_callbacks[DATA_FRAME_TRANSPORT_COUNT])(void);
+static bool (*m_ready_callbacks[DATA_FRAME_TRANSPORT_COUNT])(void);
+
 static netdata_frame_raw_t m_netdata_frame_tx_buf;
 static data_frame_tx_t m_frame_tx_buf_info = {
-    .buffer = (uint8_t *) &m_netdata_frame_tx_buf,  // default buffer
+    .buffer = (uint8_t *)&m_netdata_frame_tx_buf,
 };
-static uint16_t m_data_rx_position = 0;
-static uint16_t m_data_cmd;
-static uint16_t m_data_status;
-static uint16_t m_data_len;
-static uint8_t *m_data_buffer;
-static volatile bool m_data_completed = false;
-static data_frame_cbk_t m_frame_process_cbk = NULL;
+static data_frame_cbk_t m_frame_process_cbk;
 
-static uint8_t compute_lrc(uint8_t *buf, uint16_t bufsize) {
-    uint8_t lrc = 0x00;
+static uint8_t compute_lrc(const uint8_t *buf, uint16_t bufsize) {
+    uint8_t lrc = 0;
     for (uint16_t i = 0; i < bufsize; i++) {
         lrc += buf[i];
     }
-    return 0x100 - lrc;
+    return (uint8_t)(0x100 - lrc);
 }
 
-//
-//  !!!!!!!!!!!!!!!!! NRF_LOG_HEXDUMP_INFO() printing long data can cause freezing and needs to be fixed. !!!!!!!!!!!!!!!!!
-//  FIXME.
-//
-
-/**
- * @brief: create a packet, put the created data packet into the buffer, and wait for the post to set up a non busy state
- * @param cmd: instructionResponse
- * @param status:responseStatus
- * @param length: answerDataLength
- * @param data: answerData
- */
-data_frame_tx_t *data_frame_make(uint16_t cmd, uint16_t status, uint16_t data_length, uint8_t *data) {
-    if (data_length > 0 && data == NULL) {
-        NRF_LOG_ERROR("data_frame_make error, null pointer.");
+static data_frame_decoder_t *decoder_for_transport(data_frame_transport_t transport) {
+    if (transport <= DATA_FRAME_TRANSPORT_NONE || transport >= DATA_FRAME_TRANSPORT_COUNT) {
         return NULL;
     }
-    if (data_length > 4096) {
-        NRF_LOG_ERROR("data_frame_make error, too much data.");
-        return NULL;
-    }
-
-    // NRF_LOG_INFO("TX Data frame: cmd = 0x%04x (%i), status = 0x%04x, length = %d%s", cmd, cmd, status, data_length, data_length > 0 ? ", data =" : "");
-    // if (data_length > 0) {
-    //     NRF_LOG_HEXDUMP_INFO(data, data_length);
-    // }
-
-    netdata_frame_postamble_t *tx_post = (netdata_frame_postamble_t *)((uint8_t *)&m_netdata_frame_tx_buf + sizeof(netdata_frame_preamble_t) + data_length);
-    // sof
-    m_netdata_frame_tx_buf.pre.sof = NETDATA_FRAME_SOF;
-    // sof lrc
-    m_netdata_frame_tx_buf.pre.lrc1 = compute_lrc((uint8_t *)&m_netdata_frame_tx_buf.pre, offsetof(netdata_frame_preamble_t, lrc1));
-    // cmd
-    m_netdata_frame_tx_buf.pre.cmd = U16HTONS(cmd);
-    // status
-    m_netdata_frame_tx_buf.pre.status = U16HTONS(status);
-    // data_length
-    m_netdata_frame_tx_buf.pre.len = U16HTONS(data_length);
-    // head lrc
-    m_netdata_frame_tx_buf.pre.lrc2 = compute_lrc((uint8_t *)&m_netdata_frame_tx_buf.pre, offsetof(netdata_frame_preamble_t, lrc2));
-    // data
-    if (data_length > 0) {
-        memcpy(&m_netdata_frame_tx_buf.data, data, data_length);
-    }
-    // length out.
-    m_frame_tx_buf_info.length = (sizeof(netdata_frame_preamble_t) + data_length + sizeof(netdata_frame_postamble_t));
-    // data all lrc
-    tx_post->lrc3 = compute_lrc((uint8_t *)&m_netdata_frame_tx_buf.data, data_length);
-    return (&m_frame_tx_buf_info);
+    return &m_decoders[transport - 1];
 }
 
-/**
- * @brief Data frame reset
- */
-void data_frame_reset(void) {
-    m_data_rx_position = 0;
+static data_frame_request_t *reserve_request(data_frame_transport_t transport,
+                                             uint32_t generation) {
+    data_frame_request_t *request = NULL;
+    CRITICAL_REGION_ENTER();
+    for (uint8_t i = 0; i < DATA_FRAME_REQUEST_QUEUE_DEPTH; i++) {
+        if (!m_requests[i].reserved) {
+            request = &m_requests[i];
+            request->reserved = true;
+            request->transport = transport;
+            request->generation = generation;
+            request->sequence = m_request_sequence++;
+            break;
+        }
+    }
+    CRITICAL_REGION_EXIT();
+    return request;
 }
 
-/**
- * @brief Package receiving, which is used to receive the sent from the data packet and perform splicing processing
- * @param data: Receive byte array
- * @param length:The length of the receiving byte array
- */
+static bool queue_decoder(data_frame_transport_t transport, data_frame_decoder_t *decoder) {
+    data_frame_request_t *request = reserve_request(transport, decoder->generation);
+    if (request == NULL) {
+        decoder->complete = true;
+        return false;
+    }
+
+    request->cmd = U16NTOHS(decoder->frame.pre.cmd);
+    request->status = U16NTOHS(decoder->frame.pre.status);
+    request->length = decoder->payload_length;
+    if (request->length != 0) {
+        memcpy(request->data, decoder->frame.data, request->length);
+    }
+    CRITICAL_REGION_ENTER();
+    if (request->reserved && request->generation == decoder->generation) {
+        __DMB();
+        request->valid = true;
+    } else {
+        request->valid = false;
+        request->reserved = false;
+    }
+    CRITICAL_REGION_EXIT();
+
+    decoder->length = 0;
+    decoder->payload_length = 0;
+    decoder->complete = false;
+    return true;
+}
+
+static bool decoder_prefix_valid(data_frame_decoder_t *decoder, bool *frame_complete) {
+    uint8_t *raw = (uint8_t *)&decoder->frame;
+    *frame_complete = false;
+
+    if (raw[0] != NETDATA_FRAME_SOF) {
+        return false;
+    }
+    if (decoder->length >= 2 &&
+            decoder->frame.pre.lrc1 != compute_lrc(raw, offsetof(netdata_frame_preamble_t, lrc1))) {
+        return false;
+    }
+    if (decoder->length < sizeof(netdata_frame_preamble_t)) {
+        return true;
+    }
+    if (decoder->frame.pre.lrc2 != compute_lrc(raw, offsetof(netdata_frame_preamble_t, lrc2))) {
+        return false;
+    }
+
+    decoder->payload_length = U16NTOHS(decoder->frame.pre.len);
+    if (decoder->payload_length > NETDATA_MAX_DATA_LENGTH) {
+        return false;
+    }
+
+    uint16_t frame_length = (uint16_t)(NETDATA_FRAME_OVERHEAD + decoder->payload_length);
+    if (decoder->length > frame_length) {
+        return false;
+    }
+    if (decoder->length == frame_length) {
+        netdata_frame_postamble_t *post = (netdata_frame_postamble_t *)(raw +
+                                                sizeof(netdata_frame_preamble_t) +
+                                                decoder->payload_length);
+        if (post->lrc3 != compute_lrc(decoder->frame.data, decoder->payload_length)) {
+            return false;
+        }
+        *frame_complete = true;
+    }
+    return true;
+}
+
+static void decoder_resynchronize(data_frame_decoder_t *decoder) {
+    uint8_t *raw = (uint8_t *)&decoder->frame;
+
+    while (decoder->length != 0) {
+        uint16_t next = 1;
+        while (next < decoder->length && raw[next] != NETDATA_FRAME_SOF) {
+            next++;
+        }
+        if (next == decoder->length) {
+            decoder->length = 0;
+            decoder->payload_length = 0;
+            decoder->complete = false;
+            return;
+        }
+
+        decoder->length -= next;
+        memmove(raw, raw + next, decoder->length);
+        bool complete;
+        if (decoder_prefix_valid(decoder, &complete)) {
+            decoder->complete = complete;
+            return;
+        }
+    }
+}
+
+uint16_t data_frame_receive_from(const uint8_t *data, uint16_t length,
+                                 data_frame_transport_t transport) {
+    data_frame_decoder_t *decoder = decoder_for_transport(transport);
+    if (decoder == NULL || (data == NULL && length != 0)) {
+        return 0;
+    }
+    if (decoder->complete && !queue_decoder(transport, decoder)) {
+        return 0;
+    }
+
+    uint16_t consumed = 0;
+    while (consumed < length) {
+        if (decoder->length >= sizeof(decoder->frame)) {
+            decoder_resynchronize(decoder);
+            if (decoder->length >= sizeof(decoder->frame)) {
+                decoder->length = 0;
+            }
+        }
+
+        ((uint8_t *)&decoder->frame)[decoder->length++] = data[consumed++];
+        bool complete;
+        if (!decoder_prefix_valid(decoder, &complete)) {
+            NRF_LOG_DEBUG("Malformed frame bytes on transport %u", transport);
+            decoder_resynchronize(decoder);
+            if (decoder->complete && !queue_decoder(transport, decoder)) {
+                break;
+            }
+            continue;
+        }
+        if (complete && !queue_decoder(transport, decoder)) {
+            break;
+        }
+    }
+    return consumed;
+}
+
 void data_frame_receive(uint8_t *data, uint16_t length) {
-    // buffer wait process
-    if (m_data_completed) {
-        NRF_LOG_ERROR("Data frame wait process.");
-        return;
-    }
-    // buffer overflow
-    if (m_data_rx_position + length > sizeof(m_netdata_frame_rx_buf)) {
-        NRF_LOG_ERROR("Data frame wait overflow.");
-        data_frame_reset();
-        return;
-    }
-    // frame process
-    for (int i = 0; i < length; i++) {
-        // copy to buffer
-        ((uint8_t *)(&m_netdata_frame_rx_buf))[m_data_rx_position] = data[i];
-        if (m_data_rx_position == offsetof(netdata_frame_preamble_t, sof)) {
-            if (m_netdata_frame_rx_buf.pre.sof != NETDATA_FRAME_SOF) {
-                // not sof byte
-                NRF_LOG_ERROR("Data frame no sof byte.");
-                data_frame_reset();
-                return;
-            }
-        } else if (m_data_rx_position == offsetof(netdata_frame_preamble_t, lrc1)) {
-            if (m_netdata_frame_rx_buf.pre.lrc1 != compute_lrc((uint8_t *)&m_netdata_frame_rx_buf.pre, offsetof(netdata_frame_preamble_t, lrc1))) {
-                // not sof lrc byte
-                NRF_LOG_ERROR("Data frame sof lrc error.");
-                data_frame_reset();
-                return;
-            }
-        } else if (m_data_rx_position == offsetof(netdata_frame_preamble_t, lrc2)) {  // frame head lrc
-            if (m_netdata_frame_rx_buf.pre.lrc2 != compute_lrc((uint8_t *)&m_netdata_frame_rx_buf.pre, offsetof(netdata_frame_preamble_t, lrc2))) {
-                // frame head lrc error
-                NRF_LOG_ERROR("Data frame head lrc error.");
-                data_frame_reset();
-                return;
-            }
-            // frame head complete, cache info
-            m_data_cmd = U16NTOHS(m_netdata_frame_rx_buf.pre.cmd);
-            m_data_status = U16NTOHS(m_netdata_frame_rx_buf.pre.status);
-            m_data_len = U16NTOHS(m_netdata_frame_rx_buf.pre.len);
-            NRF_LOG_INFO("Data frame data length %d.", m_data_len);
-            // check data length
-            if (m_data_len > NETDATA_MAX_DATA_LENGTH) {
-                NRF_LOG_ERROR("Data frame data length larger than max.");
-                data_frame_reset();
-                return;
-            }
-        } else if (m_data_rx_position >= offsetof(netdata_frame_raw_t, data)) {   // frame data
-            // check all data ready.
-            if (m_data_rx_position == (sizeof(netdata_frame_preamble_t) + m_data_len)) {
-                netdata_frame_postamble_t *rx_post = (netdata_frame_postamble_t *)((uint8_t *)&m_netdata_frame_rx_buf + sizeof(netdata_frame_preamble_t) + m_data_len);
-                if (rx_post->lrc3 == compute_lrc((uint8_t *)&m_netdata_frame_rx_buf.data, m_data_len)) {
-                    // ok, lrc for data is check success.
-                    // and we are receive completed
-                    m_data_buffer = m_data_len > 0 ? (uint8_t *)&m_netdata_frame_rx_buf.data : NULL;
-                    m_data_completed = true;
-                    // NRF_LOG_INFO("RX Data frame: cmd = 0x%04x (%i), status = 0x%04x, length = %d%s", m_data_cmd, m_data_cmd, m_data_status, m_data_len, m_data_len > 0 ? ", data =" : "");
-                    // if (m_data_len > 0) {
-                    //     NRF_LOG_HEXDUMP_INFO(m_data_buffer, m_data_len);
-                    // }
-                } else {
-                    // data frame lrc error
-                    NRF_LOG_ERROR("Data frame finally lrc error.");
-                    data_frame_reset();
-                }
-                return;
-            }
-        }
-        // index update
-        m_data_rx_position++;
+    uint16_t consumed = data_frame_receive_from(data, length, DATA_FRAME_TRANSPORT_USB);
+    if (consumed != length) {
+        NRF_LOG_WARNING("Legacy receive backpressured at %u/%u", consumed, length);
     }
 }
 
-/**
- * @brief After the data packet processing, when the received data forms a complete frame,
- *         This function will be distributed processing tasks through this function, which will be adjusted to notify the data processing of the data
- * If the data processing is time -consuming operation, you need to put this function in the main loop to call
- */
+void data_frame_reset_transport(data_frame_transport_t transport) {
+    data_frame_decoder_t *decoder = decoder_for_transport(transport);
+    if (decoder == NULL) {
+        return;
+    }
+    uint32_t generation = decoder->generation + 1;
+    memset(decoder, 0, sizeof(*decoder));
+    decoder->generation = generation;
+    CRITICAL_REGION_ENTER();
+    for (uint8_t i = 0; i < DATA_FRAME_REQUEST_QUEUE_DEPTH; i++) {
+        if (&m_requests[i] != m_processing_request && m_requests[i].reserved &&
+                m_requests[i].transport == transport) {
+            m_requests[i].valid = false;
+            m_requests[i].reserved = false;
+        }
+    }
+    CRITICAL_REGION_EXIT();
+}
+
+void data_frame_set_flow_callback(data_frame_transport_t transport, void (*callback)(void)) {
+    if (transport > DATA_FRAME_TRANSPORT_NONE && transport < DATA_FRAME_TRANSPORT_COUNT) {
+        m_flow_callbacks[transport] = callback;
+    }
+}
+
+void data_frame_set_ready_callback(data_frame_transport_t transport, bool (*callback)(void)) {
+    if (transport > DATA_FRAME_TRANSPORT_NONE && transport < DATA_FRAME_TRANSPORT_COUNT) {
+        m_ready_callbacks[transport] = callback;
+    }
+}
+
+data_frame_transport_t data_frame_get_transport(void) {
+    return m_current_transport;
+}
+
+static data_frame_request_t *oldest_request(void) {
+    data_frame_request_t *oldest = NULL;
+    for (uint8_t i = 0; i < DATA_FRAME_REQUEST_QUEUE_DEPTH; i++) {
+        if (!m_requests[i].valid) {
+            continue;
+        }
+        __DMB();
+        data_frame_transport_t transport = m_requests[i].transport;
+        bool ready = m_ready_callbacks[transport] == NULL || m_ready_callbacks[transport]();
+        if (ready && (oldest == NULL || m_requests[i].sequence < oldest->sequence)) {
+            oldest = &m_requests[i];
+        }
+    }
+    return oldest;
+}
+
 void data_frame_process(void) {
-    // check if data frame
-    if (m_data_completed) {
-        // to process data frame
-        if (m_frame_process_cbk != NULL) {
-            m_frame_process_cbk(m_data_cmd, m_data_status, m_data_len, m_data_buffer);
+    data_frame_request_t *request = oldest_request();
+    CRITICAL_REGION_ENTER();
+    if (request != NULL && request->valid) {
+        m_processing_request = request;
+    } else {
+        request = NULL;
+    }
+    CRITICAL_REGION_EXIT();
+    if (request == NULL) {
+        return;
+    }
+
+    m_current_transport = request->transport;
+    if (m_frame_process_cbk != NULL) {
+        m_frame_process_cbk(request->cmd, request->status, request->length,
+                            request->length ? request->data : NULL);
+    }
+    m_current_transport = DATA_FRAME_TRANSPORT_NONE;
+    CRITICAL_REGION_ENTER();
+    request->valid = false;
+    request->reserved = false;
+    m_processing_request = NULL;
+    CRITICAL_REGION_EXIT();
+
+    for (data_frame_transport_t transport = DATA_FRAME_TRANSPORT_USB;
+            transport < DATA_FRAME_TRANSPORT_COUNT; transport++) {
+        data_frame_decoder_t *decoder = decoder_for_transport(transport);
+        if (decoder->complete) {
+            (void)queue_decoder(transport, decoder);
         }
-        // reset after process data frame.
-        data_frame_reset();
-        m_data_completed = false;
+        if (m_flow_callbacks[transport] != NULL) {
+            m_flow_callbacks[transport]();
+        }
     }
 }
 
-/**
- * @brief Package processing registration registration
- */
 void on_data_frame_complete(data_frame_cbk_t callback) {
     m_frame_process_cbk = callback;
+}
+
+data_frame_tx_t *data_frame_make(uint16_t cmd, uint16_t status, uint16_t data_length, uint8_t *data) {
+    if ((data_length != 0 && data == NULL) || data_length > NETDATA_MAX_DATA_LENGTH) {
+        NRF_LOG_ERROR("Invalid response payload: %u bytes", data_length);
+        return NULL;
+    }
+
+    netdata_frame_postamble_t *post = (netdata_frame_postamble_t *)((uint8_t *)&m_netdata_frame_tx_buf +
+                                             sizeof(netdata_frame_preamble_t) + data_length);
+    m_netdata_frame_tx_buf.pre.sof = NETDATA_FRAME_SOF;
+    m_netdata_frame_tx_buf.pre.lrc1 = compute_lrc((uint8_t *)&m_netdata_frame_tx_buf.pre,
+                                                  offsetof(netdata_frame_preamble_t, lrc1));
+    m_netdata_frame_tx_buf.pre.cmd = U16HTONS(cmd);
+    m_netdata_frame_tx_buf.pre.status = U16HTONS(status);
+    m_netdata_frame_tx_buf.pre.len = U16HTONS(data_length);
+    m_netdata_frame_tx_buf.pre.lrc2 = compute_lrc((uint8_t *)&m_netdata_frame_tx_buf.pre,
+                                                  offsetof(netdata_frame_preamble_t, lrc2));
+    if (data_length != 0) {
+        memcpy(m_netdata_frame_tx_buf.data, data, data_length);
+    }
+    post->lrc3 = compute_lrc(m_netdata_frame_tx_buf.data, data_length);
+    m_frame_tx_buf_info.length = (uint16_t)(NETDATA_FRAME_OVERHEAD + data_length);
+    return &m_frame_tx_buf_info;
 }

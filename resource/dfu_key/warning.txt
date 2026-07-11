@@ -1,4 +1,10 @@
 It is absolutely and absolutely forbidden to modify the files in this directory.
 Modification will cause DFU exceptions of all subsequent devices.
 
+The tracked private key and backup are retained only because deployed-device
+migration requirements are unknown. Builds do not use them. Supply a signing
+key from outside the checkout through DFU_SIGNING_KEY when packaging releases.
+Do not add new private keys here; the existing key still requires a coordinated
+bootloader/public-key migration before it can be rotated or removed safely.
+
 绝对绝对绝对禁止修改此目录下的文件，修改会造成后续所有的设备的DFU异常。

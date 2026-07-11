@@ -122,7 +122,7 @@ static const uint8_t abTrailerAccessConditions[8][2] = {
     /* 0  0  0 RdKA:never WrKA:key A  RdAcc:key A WrAcc:never  RdKB:key A WrKB:key A      Key B may be read[1] */
     {
         /* Access with Key A */
-        ACC_TRAILER_WRITE_KEYA | ACC_TRAILER_READ_ACC | ACC_TRAILER_WRITE_ACC | ACC_TRAILER_READ_KEYB | ACC_TRAILER_WRITE_KEYB,
+        ACC_TRAILER_WRITE_KEYA | ACC_TRAILER_READ_ACC | ACC_TRAILER_READ_KEYB | ACC_TRAILER_WRITE_KEYB,
         /* Access with Key B */
         0
     },
@@ -154,19 +154,19 @@ static const uint8_t abTrailerAccessConditions[8][2] = {
         /* Access with Key B */
         0
     },
-    /* 0  1  1         never key B  keyA|B key B never key B */
-    {
-        /* Access with Key A */
-        ACC_TRAILER_READ_ACC,
-        /* Access with Key B */
-        ACC_TRAILER_WRITE_KEYA | ACC_TRAILER_READ_ACC | ACC_TRAILER_WRITE_ACC | ACC_TRAILER_WRITE_KEYB
-    },
     /* 1  0  1         never never  keyA|B key B never never */
     {
         /* Access with Key A */
         ACC_TRAILER_READ_ACC,
         /* Access with Key B */
         ACC_TRAILER_READ_ACC | ACC_TRAILER_WRITE_ACC
+    },
+    /* 0  1  1         never key B  keyA|B key B never key B */
+    {
+        /* Access with Key A */
+        ACC_TRAILER_READ_ACC,
+        /* Access with Key B */
+        ACC_TRAILER_WRITE_KEYA | ACC_TRAILER_READ_ACC | ACC_TRAILER_WRITE_ACC | ACC_TRAILER_WRITE_KEYB
     },
     /* 1  1  1         never never  keyA|B never never never */
     {
@@ -175,6 +175,19 @@ static const uint8_t abTrailerAccessConditions[8][2] = {
         /* Access with Key B */
         ACC_TRAILER_READ_ACC
     },
+};
+
+static const uint8_t abDataAccessConditions[8][2] = {
+    {ACC_BLOCK_READ | ACC_BLOCK_WRITE | ACC_BLOCK_INCREMENT | ACC_BLOCK_DECREMENT,
+     ACC_BLOCK_READ | ACC_BLOCK_WRITE | ACC_BLOCK_INCREMENT | ACC_BLOCK_DECREMENT},
+    {ACC_BLOCK_READ, ACC_BLOCK_READ | ACC_BLOCK_WRITE},
+    {ACC_BLOCK_READ, ACC_BLOCK_READ},
+    {ACC_BLOCK_READ | ACC_BLOCK_DECREMENT,
+     ACC_BLOCK_READ | ACC_BLOCK_WRITE | ACC_BLOCK_INCREMENT | ACC_BLOCK_DECREMENT},
+    {ACC_BLOCK_READ | ACC_BLOCK_DECREMENT, ACC_BLOCK_READ | ACC_BLOCK_DECREMENT},
+    {0, ACC_BLOCK_READ},
+    {0, ACC_BLOCK_READ | ACC_BLOCK_WRITE},
+    {0, 0},
 };
 
 // Save the current MF1 standard status
@@ -202,22 +215,51 @@ static struct Crypto1State *pcs = &mpcs;
 // Define the buffer of the data that stored the detected data
 // Place this data in a dormant RAM to save time and space to write into Flash
 #define MF1_AUTH_LOG_MAX_SIZE   1000
+#define MF1_AUTH_LOG_MAGIC      0x4D46314Cu
 static __attribute__((section(".noinit_mf1"))) struct nfc_tag_mf1_auth_log_buffer {
     uint32_t count;
     nfc_tag_mf1_auth_log_t logs[MF1_AUTH_LOG_MAX_SIZE];
+    uint32_t magic;
 } m_auth_log;
 
 static uint8_t CardResponse[4];
 static uint8_t ReaderResponse[4];
 static uint8_t CurrentAddress;
 static uint8_t KeyInUse;
+static uint8_t AuthenticatedSector = 0xFF;
+static uint8_t PendingAuthSector = 0xFF;
 static uint8_t m_data_block_buffer[MEM_BYTES_PER_BLOCK];
 
 // MifareClassic crypto1 setup use fixed uid by cascade level
 #define UID_BY_CASCADE_LEVEL (m_shadow_coll_res.uid + (*m_shadow_coll_res.size - NFC_TAG_14A_UID_SINGLE_SIZE))
 
 #define BYTE_SWAP(x) (((uint8_t)(x)>>4)|((uint8_t)(x)<<4))
-#define NO_ACCESS 0x07
+#define NO_ACCESS 0xFF
+
+static void ensure_auth_log_valid(void) {
+    if (m_auth_log.magic != MF1_AUTH_LOG_MAGIC ||
+            m_auth_log.count > MF1_AUTH_LOG_MAX_SIZE) {
+        m_auth_log.count = 0;
+        m_auth_log.magic = MF1_AUTH_LOG_MAGIC;
+    }
+}
+
+static uint8_t block_to_sector(uint8_t block) {
+    return block < 128 ? block / 4 : 32 + (block - 128) / 16;
+}
+
+static uint8_t sector_trailer(uint8_t sector) {
+    return sector < 32 ? sector * 4 + 3 : 128 + (sector - 32) * 16 + 15;
+}
+
+static bool is_sector_trailer(uint8_t block) {
+    return (block < 128 && (block & 3u) == 3u) ||
+           (block >= 128 && (block & 15u) == 15u);
+}
+
+static bool is_authenticated_block(uint8_t block) {
+    return AuthenticatedSector != 0xFF && block_to_sector(block) == AuthenticatedSector;
+}
 
 
 /* decode Access conditions for a block */
@@ -239,11 +281,11 @@ uint8_t GetAccessCondition(uint8_t Block) {
         return (NO_ACCESS);
     }
     /* Fix for MFClassic 4K cards */
-    if (Block < 128)
+    if (Block < 128) {
         Block &= 3;
-    else {
-        Block &= 15;
-        if (Block & 15)
+    } else {
+        Block &= 15u;
+        if (Block == 15u)
             Block = 3;
         else if (Block <= 4)
             Block = 0;
@@ -267,6 +309,16 @@ uint8_t GetAccessCondition(uint8_t Block) {
                      ((Acc1 & 1) << 1) |
                      (Acc0 & 1);
     return (ResultForBlock);
+}
+
+static uint8_t data_permissions(uint8_t block) {
+    uint8_t condition = GetAccessCondition(block);
+    return condition == NO_ACCESS ? 0 : abDataAccessConditions[condition][KeyInUse];
+}
+
+static uint8_t trailer_permissions(uint8_t block) {
+    uint8_t condition = GetAccessCondition(block);
+    return condition == NO_ACCESS ? 0 : abTrailerAccessConditions[condition][KeyInUse];
 }
 
 bool CheckValueIntegrity(uint8_t *Block) {
@@ -368,11 +420,7 @@ void nfc_tag_mf1_random_nonce(uint8_t nonce[4], bool isNested) {
  * @param nonce: Brightly random number
  */
 void append_mf1_auth_log_step1(bool isKeyB, bool isNested, uint8_t block, uint8_t *nonce) {
-    // Power up for the first time, reset the buffer information
-    if (m_auth_log.count == 0xFFFFFFFF) {
-        m_auth_log.count = 0;
-        NRF_LOG_INFO("Mifare Classic auth log buffer ready");
-    }
+    ensure_auth_log_valid();
     // Non -first -time call, see if you record whether the detection log is over the upper limit of the size
     if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         // Skill this operation directly over the upper limit.
@@ -395,6 +443,7 @@ void append_mf1_auth_log_step1(bool isKeyB, bool isNested, uint8_t block, uint8_
  * @param ar: The random number of the label, the random number of the read -headed head is encrypted
  */
 void append_mf1_auth_log_step2(uint8_t *nr, uint8_t *ar) {
+    ensure_auth_log_valid();
     // Determine to the upper limit and skip this operation directly to avoid covering the previous records
     if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         return;
@@ -413,6 +462,7 @@ void append_mf1_auth_log_step2(uint8_t *nr, uint8_t *ar) {
  * @param is_auth_success: Whether to verify success
  */
 void append_mf1_auth_log_step3(bool is_auth_success) {
+    ensure_auth_log_valid();
     // Determine to the upper limit and skip this operation directly to avoid covering the previous records
     if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         return;
@@ -429,8 +479,9 @@ void append_mf1_auth_log_step3(bool is_auth_success) {
  * @param count: The statistics of the verification log
  */
 nfc_tag_mf1_auth_log_t *mf1_get_auth_log(uint32_t *count) {
+    ensure_auth_log_valid();
     // First pass the total number of logs verified by verified
-    *count = m_auth_log.count;
+    if (count != NULL) *count = m_auth_log.count;
     // Just return to the head pointer of the log number array
     return m_auth_log.logs;
 }
@@ -522,25 +573,13 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                         case CMD_AUTH_B: {
                             uint8_t BlockAuth = p_data[1];
                             uint8_t CardNonce[4];
-                            uint8_t BlockStart;
-                            uint8_t BlockEnd;
-
-                            // Get the starting block of the corresponding sector that is visited, keep in mind: 4K cards have large sectors, and 16 blocks are used as one sector unit
-                            // Calculate ideas: x = (y / n) * n, x = starting block of the sector, y = verified block, n = y's number of blocks where the sector is located
-                            // Thinking analysis: First do divisions to get the current sector, and then multiply to obtain the number of blocks in the sector
-                            if (BlockAuth >= 128) {
-                                BlockStart = (BlockAuth / 16) * 16;
-                                BlockEnd = BlockStart + 16 - 1;
-                            } else {
-                                // Non -4K card, step by step with a small sector
-                                BlockStart = (BlockAuth / 4) * 4;
-                                BlockEnd = BlockStart + 4 - 1;
-                            }
-
                             // The type of current emulation card is not enough to support the access of the card reader
                             if (check_block_max_overflow(BlockAuth)) {
                                 break;
                             }
+
+                            PendingAuthSector = block_to_sector(BlockAuth);
+                            uint8_t BlockEnd = sector_trailer(PendingAuthSector);
 
                             // Set KeyInUse as global use to retain information about identity verification
                             KeyInUse = p_data[0] & 1;
@@ -698,8 +737,14 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                 crypto1_word(pcs, nr, 1);
                 num_to_bytes(ar ^ crypto1_word(pcs, 0, 0), 4, &p_data[4]);
 #endif
-                // Was the random number of the return of the card reader was sent by us
-                if ((p_data[4] == ReaderResponse[0]) && (p_data[5] == ReaderResponse[1]) && (p_data[6] == ReaderResponse[2]) && (p_data[7] == ReaderResponse[3])) {
+                uint8_t trailer_condition = GetAccessCondition(sector_trailer(PendingAuthSector));
+                bool key_b_usable = trailer_condition != NO_ACCESS &&
+                                    (abTrailerAccessConditions[trailer_condition][KEY_A] &
+                                     ACC_TRAILER_READ_KEYB) == 0;
+                // A readable Key B is data, not an authentication key.
+                if ((p_data[4] == ReaderResponse[0]) && (p_data[5] == ReaderResponse[1]) &&
+                        (p_data[6] == ReaderResponse[2]) && (p_data[7] == ReaderResponse[3]) &&
+                        (KeyInUse != KEY_B || key_b_usable)) {
                     // The reader has passed the authentication.The estimated calculation card response data and generating the puppet test position.
                     m_tag_tx_buffer.tx_raw_buffer[0] = CardResponse[0];
                     m_tag_tx_buffer.tx_raw_buffer[1] = CardResponse[1];
@@ -713,6 +758,7 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
 #endif
                     // The verification is successful, and you need to enter the state that has been successfully verified
                     m_mf1_state = MF1_STATE_AUTHENTICATED;
+                    AuthenticatedSector = PendingAuthSector;
                     // Commit the captured nonce for a *successful* auth too. This lets the
                     // reader-key (MFKey32) capture work even when the emulated dump already
                     // holds the reader's real key (auth succeeds); otherwise the tuple would
@@ -753,12 +799,28 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             // Reject blocks past the emulated card (would read
                             // adjacent RAM / other slots into the reply).
                             if (check_block_max_overflow(CurrentAddress)) {
-                                break;
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                                return;
+                            }
+                            if (!is_authenticated_block(CurrentAddress)) {
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                                return;
+                            }
+
+                            uint8_t access_condition = GetAccessCondition(CurrentAddress);
+                            if (access_condition == NO_ACCESS) {
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                                return;
+                            }
+                            if (!is_sector_trailer(CurrentAddress) &&
+                                    (data_permissions(CurrentAddress) & ACC_BLOCK_READ) == 0) {
+                                mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
+                                return;
                             }
                             // Generate access control, for data access control below
-                            uint8_t Acc = abTrailerAccessConditions[ GetAccessCondition(CurrentAddress) ][ KeyInUse ];
+                            uint8_t Acc = abTrailerAccessConditions[access_condition][KeyInUse];
                             // Read the command.Read data from memory and add CRCA.Note: Reading operations are limited by the control bit, but at present we only restrict the reading of the control bit
-                            if ((CurrentAddress < 128 && (CurrentAddress & 3) == 3) || ((CurrentAddress & 15) == 15)) {
+                            if (is_sector_trailer(CurrentAddress)) {
                                 // Clear the buffer to avoid the cache data that affect the follow -up operation
                                 memset(m_tag_tx_buffer.tx_raw_buffer, 0x00, sizeof(m_tag_tx_buffer.tx_raw_buffer));
                                 // Make this data area into the type of tail blocks we need
@@ -797,19 +859,24 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             return;
                         }
                         case CMD_WRITE: {
-                            //  Normal cards are not allowed to write block0, otherwise it will be recognized by CUID firewall
-                            if (p_data[1] == 0x00 && !m_tag_information->config.mode_gen2_magic) {
-                                // Reset the 14A state machine directly, let the label sleep
-                                nfc_tag_14a_set_state(NFC_TAG_STATE_14A_HALTED);
-                                // Tell me to read the head. This operation is not allowed to be allowed
+                            CurrentAddress = p_data[1];
+                            if (check_block_max_overflow(CurrentAddress) ||
+                                    !is_authenticated_block(CurrentAddress) ||
+                                    (CurrentAddress == 0 && !m_tag_information->config.mode_gen2_magic)) {
                                 mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
-                            } else if (check_block_max_overflow(p_data[1])) {
-                                // Block past the emulated card -> reject (the
-                                // MF1_STATE_WRITE handler would write memory[] OOB).
+                                break;
+                            }
+                            uint8_t condition = GetAccessCondition(CurrentAddress);
+                            uint8_t permissions = condition == NO_ACCESS ? 0 :
+                                                  (is_sector_trailer(CurrentAddress)
+                                                   ? trailer_permissions(CurrentAddress)
+                                                   : data_permissions(CurrentAddress));
+                            uint8_t required = is_sector_trailer(CurrentAddress)
+                                               ? ACC_TRAILER_WRITE_KEYA | ACC_TRAILER_WRITE_ACC | ACC_TRAILER_WRITE_KEYB
+                                               : ACC_BLOCK_WRITE;
+                            if (condition == NO_ACCESS || (permissions & required) == 0) {
                                 mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
                             } else {
-                                // Normally write command.Store the address and prepare to receive the upcoming data.
-                                CurrentAddress = p_data[1];
                                 m_mf1_state = MF1_STATE_WRITE;
                                 // Take ACK response, inform the reading head we are ready
                                 mf1_response_4bit_auto_encrypt(ACK_VALUE);
@@ -818,7 +885,9 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                         }
                         // Although I think the following three case code is a bit stupid. Except for the different other ones, the space is the same, but the space is changed (psychological comfort)
                         case CMD_DECREMENT: {
-                            if (check_block_max_overflow(p_data[1])) {
+                            if (check_block_max_overflow(p_data[1]) ||
+                                    !is_authenticated_block(p_data[1]) || is_sector_trailer(p_data[1]) ||
+                                    (data_permissions(p_data[1]) & ACC_BLOCK_DECREMENT) == 0) {
                                 mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
                                 break;
                             }
@@ -828,7 +897,9 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             break;
                         }
                         case CMD_INCREMENT: {
-                            if (check_block_max_overflow(p_data[1])) {
+                            if (check_block_max_overflow(p_data[1]) ||
+                                    !is_authenticated_block(p_data[1]) || is_sector_trailer(p_data[1]) ||
+                                    (data_permissions(p_data[1]) & ACC_BLOCK_INCREMENT) == 0) {
                                 mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
                                 break;
                             }
@@ -838,7 +909,9 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             break;
                         }
                         case CMD_RESTORE: {
-                            if (check_block_max_overflow(p_data[1])) {
+                            if (check_block_max_overflow(p_data[1]) ||
+                                    !is_authenticated_block(p_data[1]) || is_sector_trailer(p_data[1]) ||
+                                    (data_permissions(p_data[1]) & ACC_BLOCK_DECREMENT) == 0) {
                                 mf1_response_4bit_auto_encrypt(NAK_INVALID_OPERATION_TBIV);
                                 break;
                             }
@@ -850,7 +923,11 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                         case CMD_TRANSFER: {
                             uint8_t status;
                             // Do not judge the current writing mode here to control the writing mode
-                            if (m_tag_information->config.mode_block_write == NFC_TAG_MF1_WRITE_DENIED) {
+                            if (check_block_max_overflow(p_data[1]) ||
+                                    !is_authenticated_block(p_data[1]) || is_sector_trailer(p_data[1]) ||
+                                    (data_permissions(p_data[1]) & ACC_BLOCK_DECREMENT) == 0) {
+                                status = NAK_INVALID_OPERATION_TBIV;
+                            } else if (m_tag_information->config.mode_block_write == NFC_TAG_MF1_WRITE_DENIED) {
                                 // Under this mode directly reject operation
                                 status = NAK_INVALID_OPERATION_TBIV;
                             } else if (m_tag_information->config.mode_block_write == NFC_TAG_MF1_WRITE_DECEIVE) {
@@ -873,25 +950,13 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                             // The second verification request when it has been encrypted is the process of nested verification
                             uint8_t BlockAuth = p_data[1];
                             uint8_t CardNonce[4];
-                            uint8_t BlockStart;
-                            uint8_t BlockEnd;
-
-                            // The starting block of the corresponding sector that is visited, keep in mind: 4K cards have large sectors, with 16 blocks as one sector unit
-                            // Calculate ideas: x = (y / n) * n, x = starting block of the sector, y = verified block, n = y's number of blocks where the sector is located
-                            // Thinking analysis: First do divisions to get the current sector, and then multiply to obtain the number of blocks in the sector
-                            if (BlockAuth >= 128) {
-                                BlockStart = (BlockAuth / 16) * 16;
-                                BlockEnd = BlockStart + 16 - 1;
-                            } else {
-                                //Non -4K card, step by step with a small sector
-                                BlockStart = (BlockAuth / 4) * 4;
-                                BlockEnd = BlockStart + 4 - 1;
-                            }
-
                             // The type of current emulation card is not enough to support the access of the card reader
                             if (check_block_max_overflow(BlockAuth)) {
                                 break;
                             }
+
+                            PendingAuthSector = block_to_sector(BlockAuth);
+                            uint8_t BlockEnd = sector_trailer(PendingAuthSector);
 
                             // Set KeyInUse as global use to retain information about identity verification
                             KeyInUse = p_data[0] & 1;
@@ -1017,8 +1082,23 @@ void nfc_tag_mf1_state_handler(uint8_t *p_data, uint16_t szDataBits) {
                     } else if (m_tag_information->config.mode_block_write == NFC_TAG_MF1_WRITE_DECEIVE) {
                         // This mode responds to ACK, but it is not written in RAM
                         status = ACK_VALUE;
+                    } else if (is_sector_trailer(CurrentAddress)) {
+                        uint8_t permissions = trailer_permissions(CurrentAddress);
+                        nfc_tag_mf1_trailer_info_t *trailer =
+                            (nfc_tag_mf1_trailer_info_t *)m_tag_information->memory[CurrentAddress];
+                        nfc_tag_mf1_trailer_info_t *incoming =
+                            (nfc_tag_mf1_trailer_info_t *)p_data;
+                        if (permissions & ACC_TRAILER_WRITE_KEYA) {
+                            memcpy(trailer->key_a, incoming->key_a, sizeof(trailer->key_a));
+                        }
+                        if (permissions & ACC_TRAILER_WRITE_ACC) {
+                            memcpy(trailer->acs, incoming->acs, sizeof(trailer->acs));
+                        }
+                        if (permissions & ACC_TRAILER_WRITE_KEYB) {
+                            memcpy(trailer->key_b, incoming->key_b, sizeof(trailer->key_b));
+                        }
+                        status = ACK_VALUE;
                     } else {
-                        // Other remaining modes can be updated to the labeled RAM
                         memcpy(m_tag_information->memory[CurrentAddress], p_data, NFC_TAG_MF1_DATA_SIZE);
                         status = ACK_VALUE;
                     }
@@ -1157,6 +1237,9 @@ static void nfc_tag_mf1_regen_random_uid(void) {
 void nfc_tag_mf1_reset_handler() {
     m_mf1_state = MF1_STATE_UNAUTHENTICATED;
     m_gen1a_state = GEN1A_STATE_DISABLE;
+    AuthenticatedSector = 0xFF;
+    PendingAuthSector = 0xFF;
+    m_tag_trailer_info = NULL;
 
     // Random-UID mode: generate a fresh UID for every new reader session
     // (this handler runs on REQA/WUPA), so the reader sees a different card
@@ -1186,7 +1269,7 @@ static int get_information_size_by_tag_type(tag_specific_type_t type) {
  * @return The length of the data that needs to be saved is that it does not save when 0
  */
 int nfc_tag_mf1_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
-    if (m_tag_type != TAG_TYPE_UNDEFINED) {
+    if (m_tag_type == type && m_tag_information != NULL) {
         if (m_tag_information->config.mode_block_write == NFC_TAG_MF1_WRITE_SHADOW) {
             NRF_LOG_INFO("The mf1 is shadow write mode.");
             return 0;
@@ -1209,6 +1292,12 @@ int nfc_tag_mf1_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer)
 int nfc_tag_mf1_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
     // Make sure that external capacity is enough to convert to an information structure
     int info_size = get_information_size_by_tag_type(type);
+    uint16_t stored_size = (uint16_t)((info_size + 3) & ~3);
+    if (buffer->actual_length != 0 && buffer->actual_length != stored_size) {
+        NRF_LOG_ERROR("Invalid MF1 record length: %d, expected %d.",
+                      buffer->actual_length, stored_size);
+        return 0;
+    }
     if (buffer->length >= info_size) {
         //Convert the data buffer to MF1 structure type
         m_tag_information = (nfc_tag_mf1_information_t *)buffer->buffer;
@@ -1226,6 +1315,7 @@ int nfc_tag_mf1_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer)
         NRF_LOG_INFO("HF mf1 data load finish.");
     } else {
         NRF_LOG_ERROR("nfc_tag_mf1_information_t too big.");
+        return 0;
     }
     return info_size;
 }
@@ -1321,11 +1411,13 @@ bool nfc_tag_mf1_is_random_uid_mode(void) {
 
 // Clear detection record
 void nfc_tag_mf1_detection_log_clear(void) {
+    ensure_auth_log_valid();
     m_auth_log.count = 0;
 }
 
 // The number of statistics of detection records
 uint32_t nfc_tag_mf1_detection_log_count(void) {
+    ensure_auth_log_valid();
     return m_auth_log.count;
 }
 

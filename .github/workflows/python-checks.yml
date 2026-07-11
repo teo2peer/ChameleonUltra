@@ -1,14 +1,26 @@
-name: Lint (pyrefly + ruff)
+name: Python checks
 
 on:
   pull_request:
     paths:
       - "software/**"
+      - "firmware/application/src/app_cmd.c"
+      - "firmware/application/src/app_status.h"
+      - "firmware/application/src/data_cmd.h"
+      - ".github/scripts/run_hardware_free_python_tests.py"
+      - ".github/workflows/**"
+  push:
+    paths:
+      - "software/**"
+      - "firmware/application/src/app_cmd.c"
+      - "firmware/application/src/app_status.h"
+      - "firmware/application/src/data_cmd.h"
+      - ".github/scripts/run_hardware_free_python_tests.py"
       - ".github/workflows/**"
   workflow_dispatch:
 
 jobs:
-  lint:
+  checks:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -44,6 +56,14 @@ jobs:
           if [ -f script/requirements.txt ]; then pip install -r script/requirements.txt || true; fi
           # Ensure ruff and pyrefly are available
           pip install ruff pyrefly
+
+      - name: Hardware-free unit tests
+        run: |
+          if [ -f uv.lock ]; then
+            uv run python ../.github/scripts/run_hardware_free_python_tests.py
+          else
+            python ../.github/scripts/run_hardware_free_python_tests.py
+          fi
 
       - name: Ruff check
         run: |

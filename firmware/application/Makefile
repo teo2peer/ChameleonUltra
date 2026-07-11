@@ -10,7 +10,9 @@ SRC_FILES += \
   $(SRC_COMMON)/libc_nano_stubs.c \
   $(PROJ_DIR)/app_main.c \
   $(PROJ_DIR)/app_cmd.c \
+  $(PROJ_DIR)/app_cmd_ble.c \
   $(PROJ_DIR)/ble_main.c \
+  $(PROJ_DIR)/ble_scan.c \
   $(PROJ_DIR)/ble_central.c \
   $(PROJ_DIR)/rfid_main.c \
   $(PROJ_DIR)/settings.c \
@@ -46,6 +48,8 @@ SRC_FILES += \
   $(PROJ_DIR)/rfid/nfctag/lf/utils/diphase.c \
   $(PROJ_DIR)/rfid/nfctag/lf/protocols/wiegand.c \
   $(PROJ_DIR)/rfid/nfctag/lf/protocols/idteck.c \
+  $(PROJ_DIR)/rfid/reader/hf/iso_dep_reader.c \
+  $(PROJ_DIR)/rfid/reader/hf/emv_trace.c \
   $(PROJ_DIR)/utils/dataframe.c \
   $(PROJ_DIR)/utils/delayed_reset.c \
   $(PROJ_DIR)/utils/fds_util.c \
@@ -58,6 +62,7 @@ SRC_FILES += \
   $(SDK_ROOT)/components/libraries/log/src/nrf_log_frontend.c \
   $(SDK_ROOT)/components/libraries/log/src/nrf_log_str_formatter.c \
   $(SDK_ROOT)/components/libraries/button/app_button.c \
+  $(SDK_ROOT)/components/libraries/crc16/crc16.c \
   $(SDK_ROOT)/components/libraries/util/app_error.c \
   $(SDK_ROOT)/components/libraries/util/app_error_handler_gcc.c \
   $(SDK_ROOT)/components/libraries/util/app_error_weak.c \

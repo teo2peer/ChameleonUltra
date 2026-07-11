@@ -1,0 +1,24 @@
+name: Native firmware tests
+
+on:
+  pull_request:
+    paths:
+      - "firmware/application/src/**"
+      - "firmware/tests/**"
+      - ".github/workflows/native-firmware-tests.yml"
+  push:
+    paths:
+      - "firmware/application/src/**"
+      - "firmware/tests/**"
+      - ".github/workflows/native-firmware-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run with ASan and UBSan
+        run: make -C firmware/tests test SANITIZE=1

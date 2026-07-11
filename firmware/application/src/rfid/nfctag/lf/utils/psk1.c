@@ -18,6 +18,10 @@ size_t lf_psk1_build_sequence(const uint8_t *frame_bytes,
                               size_t bit_count,
                               nrf_pwm_values_wave_form_t *out_buf,
                               size_t out_capacity) {
+    if (frame_bytes == NULL || out_buf == NULL || bit_count == 0 ||
+            bit_count > SIZE_MAX / LF_PSK1_RF32_SUBCYCLES_PER_BIT) {
+        return 0;
+    }
     size_t required = bit_count * LF_PSK1_RF32_SUBCYCLES_PER_BIT;
     if (required > out_capacity) {
         return 0;

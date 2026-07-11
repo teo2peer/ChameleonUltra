@@ -134,12 +134,24 @@ static nfc_tag_mf0_ntag_tx_buffer_t m_tag_tx_buffer;
 static tag_specific_type_t m_tag_type;
 static bool m_tag_authenticated = false;
 static bool m_did_first_read = false;
+static bool m_compat_write_pending = false;
+static uint8_t m_compat_write_page = 0;
 
 #define MF0_NTAG_AUTH_LOG_MAX 32
+#define MF0_NTAG_AUTH_LOG_MAGIC 0x4D46304Cu
 static __attribute__((section(".noinit_mf0"))) struct nfc_tag_mf0_auth_log_buffer {
     nfc_tag_mf0_ntag_auth_log_t logs[MF0_NTAG_AUTH_LOG_MAX];
     uint32_t count;
+    uint32_t magic;
 } m_auth_log = {.count = 0};
+
+static void ensure_auth_log_valid(void) {
+    if (m_auth_log.magic != MF0_NTAG_AUTH_LOG_MAGIC ||
+            m_auth_log.count > MF0_NTAG_AUTH_LOG_MAX) {
+        m_auth_log.count = 0;
+        m_auth_log.magic = MF0_NTAG_AUTH_LOG_MAGIC;
+    }
+}
 
 int nfc_tag_mf0_ntag_get_nr_pages_by_tag_type(tag_specific_type_t tag_type) {
     int nr_pages = -1;
@@ -273,8 +285,8 @@ static int get_block_max_by_tag_type(tag_specific_type_t tag_type, bool read) {
     else return max_pages;
 }
 
-static bool is_ntag() {
-    switch (m_tag_type) {
+static bool is_ntag_type(tag_specific_type_t type) {
+    switch (type) {
         case TAG_TYPE_NTAG_210:
         case TAG_TYPE_NTAG_212:
         case TAG_TYPE_NTAG_213:
@@ -284,6 +296,10 @@ static bool is_ntag() {
         default:
             return false;
     }
+}
+
+static bool is_ntag(void) {
+    return is_ntag_type(m_tag_type);
 }
 
 int get_version_page_by_tag_type(tag_specific_type_t tag_type) {
@@ -324,7 +340,7 @@ int get_version_page_by_tag_type(tag_specific_type_t tag_type) {
 int get_signature_page_by_tag_type(tag_specific_type_t tag_type) {
     int version_page_off;
 
-    switch (m_tag_type) {
+    switch (tag_type) {
         case TAG_TYPE_MF0UL11:
             version_page_off = MF0UL11_PAGES + MF0ULx1_NUM_CTRS + PAGES_PER_VERSION;
             break;
@@ -517,7 +533,6 @@ static void bytes2hex(const uint8_t *bytes, char *hex, size_t len) {
 
 static void handle_any_read(uint8_t block_num, uint8_t block_cnt, uint8_t block_max) {
     ASSERT(block_cnt <= block_max);
-    ASSERT((block_max - block_cnt) >= block_num);
 
     uint8_t first_cfg_page = get_first_cfg_page_by_tag_type(m_tag_type);
 
@@ -675,14 +690,18 @@ static void handle_fast_read_command(uint8_t block_num, uint8_t end_block_num) {
 
     int block_max = get_block_max_by_tag_type(m_tag_type, true);
 
-    if (block_num > end_block_num || end_block_num >= block_max) {
+    uint16_t block_cnt = (uint16_t)end_block_num - block_num + 1u;
+    uint16_t tx_bytes = block_cnt * NFC_TAG_MF0_NTAG_DATA_SIZE;
+    if (block_num > end_block_num || end_block_num >= block_max ||
+            tx_bytes > MAX_NFC_TX_BUFFER_SIZE - 1u ||
+            tx_bytes > sizeof(m_tag_tx_buffer.tx_buffer)) {
         nfc_tag_14a_tx_nbit(NAK_INVALID_OPERATION_TBV, 4);
         return;
     }
 
     NRF_LOG_INFO("HANDLING FAST READ %02x %02x", block_num, end_block_num);
     // FAST_READ is inclusive: read from block_num to end_block_num (both included)
-    handle_any_read(block_num, end_block_num - block_num + 1, block_max);
+    handle_any_read(block_num, (uint8_t)block_cnt, block_max);
 }
 
 static bool check_ro_lock_on_page(int block_num) {
@@ -707,7 +726,8 @@ static bool check_ro_lock_on_page(int block_num) {
             case TAG_TYPE_NTAG_216: {
                 // pages can be locked or not independant of BL bits
                 //the BL bits only freezes the lock bytes !
-                uint16_t lock_bits = *(uint16_t *)&m_tag_information->memory[2][2];
+                uint16_t lock_bits = (uint16_t)m_tag_information->memory[2][2] |
+                                     ((uint16_t)m_tag_information->memory[2][3] << 8);
                 return ((lock_bits >> block_num) & 0x01) == 1;
             }
             default:
@@ -715,7 +735,9 @@ static bool check_ro_lock_on_page(int block_num) {
                 if (block_num <= 9) locked |= (m_tag_information->memory[2][2] & 2) == 2;
                 else locked |= (m_tag_information->memory[2][2] & 4) == 4;
 
-                locked |= (((*(uint16_t *)&m_tag_information->memory[2][2]) >> block_num) & 1) == 1;
+                uint16_t lock_bits = (uint16_t)m_tag_information->memory[2][2] |
+                                     ((uint16_t)m_tag_information->memory[2][3] << 8);
+                locked |= ((lock_bits >> block_num) & 1u) != 0;
 
                 return locked;
         }
@@ -754,7 +776,7 @@ static bool check_ro_lock_on_page(int block_num) {
                 user_memory_end = MF0UL11_USER_MEMORY_END;
                 break;
             case TAG_TYPE_MF0UL21: {
-                user_memory_end = MF0UL11_USER_MEMORY_END;
+                user_memory_end = MF0UL21_USER_MEMORY_END;
                 if (block_num < user_memory_end) {
                     p_lock_bytes = m_tag_information->memory[MF0UL21_USER_MEMORY_END];
                     uint16_t lock_word = (((uint16_t)p_lock_bytes[1]) << 8) | (uint16_t)p_lock_bytes[0];
@@ -1000,9 +1022,9 @@ static void handle_pwd_auth_command(uint8_t *p_data) {
         return;
     }
 
-    uint32_t pwd = *(uint32_t *)m_tag_information->memory[first_cfg_page + CONF_PWD_PAGE_OFFSET];
-    uint32_t supplied_pwd = *(uint32_t *)&p_data[1];
+    uint8_t *pwd = m_tag_information->memory[first_cfg_page + CONF_PWD_PAGE_OFFSET];
 
+    ensure_auth_log_valid();
     if (m_tag_information->config.detection_enable && m_auth_log.count < MF0_NTAG_AUTH_LOG_MAX) {
         memcpy(m_auth_log.logs[m_auth_log.count].pwd, &p_data[1], 4);
         m_auth_log.count++;
@@ -1010,7 +1032,7 @@ static void handle_pwd_auth_command(uint8_t *p_data) {
                      p_data[1], p_data[2], p_data[3], p_data[4]);
     }
 
-    if (pwd != supplied_pwd) {
+    if (memcmp(pwd, &p_data[1], 4) != 0) {
         if (auth_lim) {
             cnt_data[MF0_NTAG_AUTHLIM_OFF_IN_CTR] &= ~MF0_NTAG_AUTHLIM_MASK_IN_CTR;
             cnt_data[MF0_NTAG_AUTHLIM_OFF_IN_CTR] |= (auth_cnt + 1) & MF0_NTAG_AUTHLIM_MASK_IN_CTR;
@@ -1054,12 +1076,12 @@ static void handle_vcsl_command(uint16_t szDataBits) {
         case TAG_TYPE_MF0UL21:
             if (szDataBits < 168) {
                 nfc_tag_14a_tx_nbit(NAK_INVALID_OPERATION_TBV, 4);
-                break;
+                return;
             }
             break;
         default:
             if (is_ntag()) nfc_tag_14a_tx_nbit(NAK_INVALID_OPERATION_TBV, 4);
-            break;
+            return;
     }
 
     int first_cfg_page = get_first_cfg_page_by_tag_type(m_tag_type);
@@ -1069,50 +1091,83 @@ static void handle_vcsl_command(uint16_t szDataBits) {
 }
 
 static void nfc_tag_mf0_ntag_state_handler(uint8_t *p_data, uint16_t szDataBits) {
-    uint8_t command = p_data[0];
-    uint8_t block_num = p_data[1];
+    if (p_data == NULL) return;
 
-    if (szDataBits < 16) return;
+    if (m_compat_write_pending) {
+        uint8_t page = m_compat_write_page;
+        m_compat_write_pending = false;
+        if (szDataBits != 144 || !nfc_tag_14a_checks_crc(p_data, 18)) {
+            nfc_tag_14a_tx_nbit(NAK_CRC_PARITY_ERROR_TBV, 4);
+            return;
+        }
+        nfc_tag_14a_tx_nbit(handle_write_command(page, p_data), 4);
+        return;
+    }
+
+    if ((szDataBits & 7u) != 0 || szDataBits < 24) return;
+    uint16_t frame_bytes = szDataBits / 8u;
+    if (!nfc_tag_14a_checks_crc(p_data, frame_bytes)) {
+        nfc_tag_14a_tx_nbit(NAK_CRC_PARITY_ERROR_TBV, 4);
+        return;
+    }
+
+    uint8_t command = p_data[0];
+    uint8_t block_num = frame_bytes > 3 ? p_data[1] : 0;
 
     NRF_LOG_INFO("received mfu command %x of size %u bits", command, szDataBits);
 
     switch (command) {
         case CMD_GET_VERSION:
+            if (szDataBits != 24) return;
             handle_get_version_command();
             break;
         case CMD_READ: {
+            if (szDataBits != 32) return;
             handle_read_command(block_num);
             break;
         }
         case CMD_FAST_READ: {
+            if (szDataBits != 40) return;
             uint8_t end_block_num = p_data[2];
             // TODO: support ultralight
             handle_fast_read_command(block_num, end_block_num);
             break;
         }
-        case CMD_WRITE:
-        case CMD_COMPAT_WRITE: {
+        case CMD_WRITE: {
+            if (szDataBits != 64) return;
             int resp = handle_write_command(block_num, &p_data[2]);
             nfc_tag_14a_tx_nbit(resp, 4);
             break;
         }
+        case CMD_COMPAT_WRITE:
+            if (szDataBits != 32 || block_num >= get_block_max_by_tag_type(m_tag_type, false)) return;
+            m_compat_write_page = block_num;
+            m_compat_write_pending = true;
+            nfc_tag_14a_tx_nbit(ACK_VALUE, 4);
+            break;
         case CMD_PWD_AUTH: {
+            if (szDataBits != 56) return;
             handle_pwd_auth_command(p_data);
             break;
         }
         case CMD_READ_SIG:
+            if (szDataBits != 32) return;
             handle_read_sig_command();
             break;
         case CMD_READ_CNT:
+            if (szDataBits != 32) return;
             handle_read_cnt_command(block_num);
             break;
         case CMD_INCR_CNT:
+            if (szDataBits != 56) return;
             handle_incr_cnt_command(block_num, &p_data[2]);
             break;
         case CMD_CHECK_TEARING_EVENT:
+            if (szDataBits != 32) return;
             handle_check_tearing_event(block_num);
             break;
         case CMD_VCSL: {
+            if (szDataBits != 168) return;
             handle_vcsl_command(szDataBits);
             break;
         }
@@ -1137,6 +1192,7 @@ nfc_tag_14a_coll_res_reference_t *nfc_tag_mf0_ntag_get_coll_res() {
 static void nfc_tag_mf0_ntag_reset_handler() {
     m_tag_authenticated = false;
     m_did_first_read = false;
+    m_compat_write_pending = false;
 }
 
 static int get_information_size_by_tag_type(tag_specific_type_t type) {
@@ -1149,7 +1205,7 @@ static int get_information_size_by_tag_type(tag_specific_type_t type) {
  * @return to be saved, the length of the data that needs to be saved, it means not saved when 0
  */
 int nfc_tag_mf0_ntag_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
-    if (m_tag_type != TAG_TYPE_UNDEFINED && m_tag_information != NULL) {
+    if (m_tag_type == type && m_tag_information != NULL) {
         // Add shadow mode handling
         if (m_tag_information->config.mode_block_write == NFC_TAG_MF0_NTAG_WRITE_SHADOW) {
             NRF_LOG_INFO("The mf0/ntag is in shadow write mode.");
@@ -1169,6 +1225,12 @@ int nfc_tag_mf0_ntag_data_savecb(tag_specific_type_t type, tag_data_buffer_t *bu
 
 int nfc_tag_mf0_ntag_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
     int info_size = get_information_size_by_tag_type(type);
+    uint16_t stored_size = (uint16_t)((info_size + 3) & ~3);
+    if (buffer->actual_length != 0 && buffer->actual_length != stored_size) {
+        NRF_LOG_ERROR("Invalid MF0/NTAG record length: %d, expected %d.",
+                      buffer->actual_length, stored_size);
+        return 0;
+    }
     if (buffer->length >= info_size) {
         // Convert the data buffer to MF0/NTAG structure type
         m_tag_information = (nfc_tag_mf0_ntag_information_t *)buffer->buffer;
@@ -1183,8 +1245,8 @@ int nfc_tag_mf0_ntag_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *bu
         nfc_tag_14a_set_handler(&handler_for_14a);
         NRF_LOG_INFO("HF ntag data load finish.");
     } else {
-        ASSERT(buffer->length == info_size);
         NRF_LOG_ERROR("nfc_tag_mf0_ntag_information_t too big.");
+        return 0;
     }
     return info_size;
 }
@@ -1203,7 +1265,7 @@ bool nfc_tag_mf0_ntag_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     uint8_t default_p1[] = { 0xFA, 0x5C, 0x64, 0x80 };
     uint8_t default_p2[] = { 0x42, 0x48, 0x0F, 0xE0 };
 
-    if (!is_ntag()) {
+    if (!is_ntag_type(tag_type)) {
         default_p2[2] = 0;
         default_p2[3] = 0;
     }
@@ -1236,7 +1298,7 @@ bool nfc_tag_mf0_ntag_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     int first_cfg_page = get_first_cfg_page_by_tag_type(tag_type);
     if (first_cfg_page != 0) {
         p_ntag_information->memory[first_cfg_page][CONF_AUTH0_BYTE] = 0xFF; // set AUTH to 0xFF
-        *(uint32_t *)p_ntag_information->memory[first_cfg_page + CONF_PWD_PAGE_OFFSET] = 0xFFFFFFFF; // set PWD to FFFFFFFF
+        memset(p_ntag_information->memory[first_cfg_page + CONF_PWD_PAGE_OFFSET], 0xFF, 4);
 
         switch (tag_type) {
             case TAG_TYPE_MF0UL11:
@@ -1258,7 +1320,7 @@ bool nfc_tag_mf0_ntag_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     if (version_page > 0) {
         uint8_t *version_data = &p_ntag_information->memory[version_page][0];
 
-        switch (m_tag_type) {
+        switch (tag_type) {
             case TAG_TYPE_MF0UL11:
                 version_data[6] = MF0UL11_VERSION_STORAGE_SIZE;
                 version_data[2] = MF0ULx1_VERSION_PRODUCT_TYPE;
@@ -1371,7 +1433,8 @@ nfc_tag_mf0_ntag_write_mode_t nfc_tag_mf0_ntag_get_write_mode(void) {
 }
 
 nfc_tag_mf0_ntag_auth_log_t *mf0_get_auth_log(uint32_t *count) {
-    *count = m_auth_log.count;
+    ensure_auth_log_valid();
+    if (count != NULL) *count = m_auth_log.count;
     return m_auth_log.logs;
 }
 
@@ -1386,9 +1449,11 @@ bool nfc_tag_mf0_ntag_is_detection_enable(void) {
 }
 
 void nfc_tag_mf0_ntag_detection_log_clear(void) {
+    ensure_auth_log_valid();
     m_auth_log.count = 0;
 }
 
 uint32_t nfc_tag_mf0_ntag_detection_log_count(void) {
+    ensure_auth_log_valid();
     return m_auth_log.count;
 }

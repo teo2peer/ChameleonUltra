@@ -8,6 +8,9 @@
 #define GOERTZEL(FREQ, SAMPLE_RATE) (2.0 * cos((2.0 * PI * FREQ) / (SAMPLE_RATE)))
 
 float goertzel_mag(float coef, uint16_t samples[], int n) {
+    if (samples == NULL || n <= 0) {
+        return 0;
+    }
     float z1 = 0;
     float z2 = 0;
     for (int i = 0; i < n; i++) {
@@ -29,6 +32,9 @@ void fsk_free(fsk_t *m) {
  * multiple protocols with different speeds.
  */
 bool fsk_feed(fsk_t *m, uint16_t sample, bool *bit) {
+    if (m == NULL || bit == NULL || m->bitrate == 0 || m->bitrate > FSK_MAX_BITRATE) {
+        return false;
+    }
     m->samples[m->c++] = sample;
     if (m->c < m->bitrate) {
         return false;

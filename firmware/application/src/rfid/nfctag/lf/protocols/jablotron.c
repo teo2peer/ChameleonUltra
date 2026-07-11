@@ -98,7 +98,14 @@ static uint8_t jablotron_period(uint8_t interval) {
 
 static jablotron_codec *jablotron_alloc(void) {
     jablotron_codec *codec = malloc(sizeof(jablotron_codec));
+    if (codec == NULL) {
+        return NULL;
+    }
     codec->modem = malloc(sizeof(diphase));
+    if (codec->modem == NULL) {
+        free(codec);
+        return NULL;
+    }
     codec->modem->rp = jablotron_period;
     return codec;
 }
@@ -181,7 +188,7 @@ static bool jablotron_decoder_feed(jablotron_codec *d, uint16_t interval) {
 /*
  * Diphase modulator: encode raw 64-bit frame into PWM sequence.
  *
- * Each bit produces two half-bit PWM entries.  counter_top = 31 gives
+ * Each bit produces two half-bit PWM entries. counter_top = 32 gives
  * 32 ticks per entry at NRF_PWM_CLK_125kHz = 32 carrier cycles per
  * half-bit = exactly RF/64 per bit.
  *
@@ -200,6 +207,9 @@ static bool jablotron_decoder_feed(jablotron_codec *d, uint16_t interval) {
  * simultaneous compare-match and counter-wrap.
  */
 static const nrf_pwm_sequence_t *jablotron_modulator(jablotron_codec *d, uint8_t *buf) {
+    if (!jablotron_data_valid(buf)) {
+        return NULL;
+    }
     uint64_t raw = jablotron_raw_data(buf);
     bool level = false;  // carries across both passes
 
@@ -212,8 +222,8 @@ static const nrf_pwm_sequence_t *jablotron_modulator(jablotron_codec *d, uint8_t
             level = !level;
 
             // First half-bit
-            m_jablotron_pwm_seq_vals[out].channel_0 = level ? 32 : 0;
-            m_jablotron_pwm_seq_vals[out].counter_top = 31;
+            m_jablotron_pwm_seq_vals[out].channel_0 = level ? 33 : 0;
+            m_jablotron_pwm_seq_vals[out].counter_top = 32;
             out++;
 
             // Mid-bit transition for bit 0
@@ -222,8 +232,8 @@ static const nrf_pwm_sequence_t *jablotron_modulator(jablotron_codec *d, uint8_t
             }
 
             // Second half-bit
-            m_jablotron_pwm_seq_vals[out].channel_0 = level ? 32 : 0;
-            m_jablotron_pwm_seq_vals[out].counter_top = 31;
+            m_jablotron_pwm_seq_vals[out].channel_0 = level ? 33 : 0;
+            m_jablotron_pwm_seq_vals[out].counter_top = 32;
             out++;
         }
     }
@@ -245,7 +255,14 @@ const protocol jablotron = {
         },
 };
 
+bool jablotron_data_valid(const uint8_t *uid) {
+    return uid != NULL && (uid[0] & 0x80u) == 0;
+}
+
 uint8_t jablotron_t55xx_writer(uint8_t *uid, uint32_t *blks) {
+    if (!jablotron_data_valid(uid) || blks == NULL) {
+        return 0;
+    }
     uint64_t raw = jablotron_raw_data(uid);
     blks[0] = T5577_JABLOTRON_CONFIG;
     blks[1] = raw >> 32;

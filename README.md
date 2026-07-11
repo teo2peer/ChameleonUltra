@@ -21,6 +21,8 @@ Lazada One, Singapore: [Aliexpress by RRG](https://proxgrind.aliexpress.com/stor
 # What is it and how to use ?
 
 Read the [available documentation](https://github.com/RfidResearchGroup/ChameleonUltra/wiki).
+This fork's local additions are indexed in [`docs/README.md`](docs/README.md),
+including the [BLE audit and explorer guide](docs/ble-audit.md).
 
 # Compatible applications
 

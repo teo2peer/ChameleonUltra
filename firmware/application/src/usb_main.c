@@ -1,6 +1,7 @@
 #include "usb_main.h"
 #include "syssleep.h"
 #include "dataframe.h"
+#include "netdata.h"
 
 #include "app_usbd.h"
 #include "app_usbd_cdc_acm.h"
@@ -42,6 +43,87 @@ volatile bool g_usb_port_opened = false;
 volatile bool g_usb_led_marquee_enable = true;
 static uint8_t cdc_data_buffer[NRF_DRV_USBD_EPSIZE];
 
+#define USB_TX_QUEUE_DEPTH 2
+typedef struct {
+    uint16_t length;
+    uint8_t data[NETDATA_MAX_FRAME_LENGTH];
+} usb_tx_entry_t;
+
+static usb_tx_entry_t m_usb_tx_queue[USB_TX_QUEUE_DEPTH];
+static uint8_t m_usb_tx_head;
+static uint8_t m_usb_tx_count;
+static bool m_usb_tx_active;
+static uint16_t m_usb_rx_length;
+static uint16_t m_usb_rx_offset;
+
+// Do not dispatch another command until its complete response can be retained.
+static bool usb_response_ready(void) {
+    return g_usb_connected && g_usb_port_opened && m_usb_tx_count < USB_TX_QUEUE_DEPTH;
+}
+
+static void usb_tx_clear(void) {
+    m_usb_tx_head = 0;
+    m_usb_tx_count = 0;
+    m_usb_tx_active = false;
+}
+
+static void usb_tx_start(void) {
+    if (m_usb_tx_active || m_usb_tx_count == 0 ||
+            !g_usb_connected || !g_usb_port_opened) {
+        return;
+    }
+
+    usb_tx_entry_t *entry = &m_usb_tx_queue[m_usb_tx_head];
+    ret_code_t err = app_usbd_cdc_acm_write(&m_app_cdc_acm, entry->data, entry->length);
+    if (err == NRF_SUCCESS) {
+        m_usb_tx_active = true;
+    } else if (err != NRF_ERROR_BUSY && err != NRF_ERROR_INVALID_STATE) {
+        NRF_LOG_WARNING("CDC ACM write deferred: 0x%x", err);
+    }
+}
+
+static void usb_rx_arm(void) {
+    if (!g_usb_port_opened || m_usb_rx_length != 0) {
+        return;
+    }
+
+    while (g_usb_port_opened && m_usb_rx_length == 0) {
+        ret_code_t err = app_usbd_cdc_acm_read_any(&m_app_cdc_acm, cdc_data_buffer,
+                                                    sizeof(cdc_data_buffer));
+        if (err == NRF_SUCCESS) {
+            m_usb_rx_length = app_usbd_cdc_acm_rx_size(&m_app_cdc_acm);
+            m_usb_rx_offset = data_frame_receive_from(cdc_data_buffer, m_usb_rx_length,
+                                                       DATA_FRAME_TRANSPORT_USB);
+            if (m_usb_rx_offset != m_usb_rx_length) {
+                return;
+            }
+            m_usb_rx_length = 0;
+            m_usb_rx_offset = 0;
+            continue;
+        }
+        if (err != NRF_ERROR_IO_PENDING && err != NRF_ERROR_BUSY &&
+                err != NRF_ERROR_INVALID_STATE) {
+            NRF_LOG_WARNING("CDC ACM read deferred: 0x%x", err);
+        }
+        return;
+    }
+}
+
+static void usb_rx_resume(void) {
+    if (m_usb_rx_length != 0) {
+        uint16_t consumed = data_frame_receive_from(cdc_data_buffer + m_usb_rx_offset,
+                                                     m_usb_rx_length - m_usb_rx_offset,
+                                                     DATA_FRAME_TRANSPORT_USB);
+        m_usb_rx_offset += consumed;
+        if (m_usb_rx_offset != m_usb_rx_length) {
+            return;
+        }
+        m_usb_rx_length = 0;
+        m_usb_rx_offset = 0;
+    }
+    usb_rx_arm();
+}
+
 /** @brief User event handler @ref app_usbd_cdc_acm_user_ev_handler_t */
 static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usbd_cdc_acm_user_event_t event) {
 
@@ -49,12 +131,13 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
 
     switch (event) {
         case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN: {
-            // Setup first transfer
-            ret_code_t ret = app_usbd_cdc_acm_read_any(&m_app_cdc_acm, cdc_data_buffer, sizeof(cdc_data_buffer));
-            UNUSED_VARIABLE(ret);
-
             NRF_LOG_INFO("CDC ACM port opened");
             g_usb_port_opened = true;
+            data_frame_reset_transport(DATA_FRAME_TRANSPORT_USB);
+            m_usb_rx_length = 0;
+            m_usb_rx_offset = 0;
+            usb_rx_arm();
+            usb_tx_start();
             break;
         }
 
@@ -62,19 +145,26 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
             NRF_LOG_INFO("CDC ACM port closed");
             g_usb_port_opened = false;
             g_usb_led_marquee_enable = true;
+            m_usb_rx_length = 0;
+            m_usb_rx_offset = 0;
+            data_frame_reset_transport(DATA_FRAME_TRANSPORT_USB);
+            usb_tx_clear();
             break;
 
         case APP_USBD_CDC_ACM_USER_EVT_TX_DONE:
+            if (m_usb_tx_active && m_usb_tx_count != 0) {
+                m_usb_tx_head = (m_usb_tx_head + 1) % USB_TX_QUEUE_DEPTH;
+                m_usb_tx_count--;
+            }
+            m_usb_tx_active = false;
+            usb_tx_start();
             break;
 
         case APP_USBD_CDC_ACM_USER_EVT_RX_DONE: {
             // Get amount of data transfered to process data
-            size_t size = app_usbd_cdc_acm_rx_size(&m_app_cdc_acm);
-            data_frame_receive(cdc_data_buffer, size);
-
-            // Setup next transfer
-            ret_code_t ret = app_usbd_cdc_acm_read_any(&m_app_cdc_acm, cdc_data_buffer, sizeof(cdc_data_buffer));
-            UNUSED_VARIABLE(ret);
+            m_usb_rx_length = app_usbd_cdc_acm_rx_size(&m_app_cdc_acm);
+            m_usb_rx_offset = 0;
+            usb_rx_resume();
             break;
         }
         default:
@@ -90,10 +180,14 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
 
         case APP_USBD_EVT_DRV_RESUME:
             NRF_LOG_INFO("USB RESUME");
+            usb_tx_start();
+            usb_rx_arm();
             break;
 
         case APP_USBD_EVT_STARTED:
             NRF_LOG_INFO("USB STARTED");
+            usb_tx_start();
+            usb_rx_arm();
             break;
 
         case APP_USBD_EVT_STOPPED:
@@ -115,6 +209,10 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
             NRF_LOG_INFO("USB power removed");
             g_usb_connected = false;
             g_usb_led_marquee_enable = false;
+            m_usb_rx_length = 0;
+            m_usb_rx_offset = 0;
+            data_frame_reset_transport(DATA_FRAME_TRANSPORT_USB);
+            usb_tx_clear();
             app_usbd_stop();
             break;
 
@@ -146,11 +244,35 @@ void usb_cdc_init(void) {
     app_usbd_class_inst_t const *class_cdc_acm = app_usbd_cdc_acm_class_inst_get(&m_app_cdc_acm);
     ret = app_usbd_class_append(class_cdc_acm);
     APP_ERROR_CHECK(ret);
+
+    data_frame_set_flow_callback(DATA_FRAME_TRANSPORT_USB, usb_rx_resume);
+    data_frame_set_ready_callback(DATA_FRAME_TRANSPORT_USB, usb_response_ready);
+}
+
+uint32_t usb_cdc_write_try(const void *p_buf, uint16_t length) {
+    if (p_buf == NULL || length == 0 || length > NETDATA_MAX_FRAME_LENGTH) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (!g_usb_connected || !g_usb_port_opened) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    if (m_usb_tx_count >= USB_TX_QUEUE_DEPTH) {
+        return NRF_ERROR_RESOURCES;
+    }
+
+    uint8_t tail = (m_usb_tx_head + m_usb_tx_count) % USB_TX_QUEUE_DEPTH;
+    memcpy(m_usb_tx_queue[tail].data, p_buf, length);
+    m_usb_tx_queue[tail].length = length;
+    m_usb_tx_count++;
+    usb_tx_start();
+    return NRF_SUCCESS;
 }
 
 void usb_cdc_write(const void *p_buf, uint16_t length) {
-    ret_code_t err_code = app_usbd_cdc_acm_write(&m_app_cdc_acm, p_buf, length);
-    APP_ERROR_CHECK(err_code);
+    ret_code_t err = usb_cdc_write_try(p_buf, length);
+    if (err != NRF_SUCCESS) {
+        NRF_LOG_WARNING("CDC ACM response not queued: 0x%x", err);
+    }
 }
 
 // override fputc to printf to cdc serial

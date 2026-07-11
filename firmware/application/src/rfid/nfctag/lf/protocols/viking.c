@@ -81,7 +81,14 @@ static uint8_t viking_period(uint8_t interval) {
 
 static viking_codec *viking_alloc(void) {
     viking_codec *codec = malloc(sizeof(viking_codec));
+    if (codec == NULL) {
+        return NULL;
+    }
     codec->modem = malloc(sizeof(manchester));
+    if (codec->modem == NULL) {
+        free(codec);
+        return NULL;
+    }
     codec->modem->rp = viking_period;
     return codec;
 };
@@ -150,6 +157,7 @@ static bool viking_decoder_feed(viking_codec *d, uint16_t interval) {
         interval -= VIKING_READ_TIME2_BASE;
         manchester_feed(d->modem, (uint8_t)VIKING_READ_TIME2_BASE, bits, &bitlen);
         if (bitlen == -1) {
+            manchester_reset(d->modem);
             d->raw = 0;
             d->raw_length = 0;
             return false;
@@ -163,13 +171,14 @@ static bool viking_decoder_feed(viking_codec *d, uint16_t interval) {
 
     manchester_feed(d->modem, (uint8_t)interval, bits, &bitlen);
     if (bitlen == -1) {
-        if (d->raw == 62) {
+        if (d->raw_length == 62) {
             if (viking_decode_feed(d, 1)) {
                 return true;
             }
         }
         d->raw = 0;
         d->raw_length = 0;
+        manchester_reset(d->modem);
         return false;
     }
     for (int i = 0; i < bitlen; i++) {

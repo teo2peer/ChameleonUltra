@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # flash_firmware.sh — build the ChameleonUltra application firmware and flash it
-# over USB DFU (app-only, signed with the repo key). Reusable.
+# over USB DFU (app-only, signed with an externally supplied key). Reusable.
 #
 #   ./flash_firmware.sh
 #
@@ -14,7 +14,7 @@ cd "$SCRIPT_DIR"
 
 APP_DIR="$SCRIPT_DIR/firmware/application"
 OBJ_DIR="$SCRIPT_DIR/firmware/objects"
-KEY="$SCRIPT_DIR/resource/dfu_key/chameleon.pem"
+KEY="${DFU_SIGNING_KEY:-}"
 ZIP="$OBJ_DIR/chameleon-dfu-app.zip"
 PYBIN="$SCRIPT_DIR/software/script/venv/bin/python3"
 [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
@@ -46,6 +46,24 @@ export GNU_VERSION="$(arm-none-eabi-gcc -dumpversion)"
 export GNU_PREFIX="arm-none-eabi"
 echo "==> Toolchain: $(command -v arm-none-eabi-gcc) (gcc ${GNU_VERSION})"
 
+if [ "${ALLOW_APP_ONLY_DFU:-0}" != "1" ]; then
+  echo "ERROR: app-only DFU is disabled until the enlarged FDS-aware bootloader is installed." >&2
+  echo "       Set ALLOW_APP_ONLY_DFU=1 only for a device already migrated to that bootloader." >&2
+  exit 1
+fi
+if [ -z "$KEY" ] || [ ! -r "$KEY" ]; then
+  echo "ERROR: set DFU_SIGNING_KEY to the external private key accepted by the bootloader." >&2
+  exit 1
+fi
+if ! [[ "${APPLICATION_VERSION:-}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: set APPLICATION_VERSION to a monotonic positive integer." >&2
+  exit 1
+fi
+export BOOTLOADER_VERSION="${BOOTLOADER_VERSION:-$APPLICATION_VERSION}"
+export HW_VERSION=0
+export DFU_SIGNING_KEY="$KEY"
+"$SCRIPT_DIR/.github/scripts/validate_firmware_release.sh" --device ultra --package
+
 # --- Build ---
 echo "==> Building application…"
 make -C "$APP_DIR" -j4 >/dev/null
@@ -55,7 +73,7 @@ echo "    application.hex: $(ls -lh "$OBJ_DIR/application.hex" | awk '{print $5}
 echo "==> Packaging DFU…"
 rm -f "$ZIP"
 nrfutil nrf5sdk-tools pkg generate --hw-version 0 --key-file "$KEY" \
-  --application "$OBJ_DIR/application.hex" --application-version 1 \
+  --application "$OBJ_DIR/application.hex" --application-version "$APPLICATION_VERSION" \
   --sd-req 0x0100 "$ZIP" >/dev/null
 echo "    $(basename "$ZIP")"
 

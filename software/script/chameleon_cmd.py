@@ -3,7 +3,17 @@ import ctypes
 from typing import Union
 
 import chameleon_com
-from chameleon_utils import expect_response, reconstruct_full_nt, parity_to_str
+from emv_trace import (
+    EmvTraceRequest,
+    download_emv_trace,
+    encode_get_request,
+    encode_meta_request,
+    encode_start_request,
+    parse_get_response,
+    parse_meta_response,
+    parse_start_response,
+)
+from chameleon_utils import expect_response, reconstruct_full_nt, parity_to_str, UnexpectedResponseError
 from chameleon_enum import Command, SlotNumber, Status, TagSenseType, TagSpecificType
 from chameleon_enum import ButtonPressFunction, ButtonType, MifareClassicDarksideStatus
 from chameleon_enum import MfcKeyType, MfcValueBlockOperator
@@ -12,6 +22,20 @@ CURRENT_VERSION_SETTINGS = 6
 
 new_key = b'\x20\x20\x66\x66'
 old_keys = [b'\x51\x24\x36\x48', b'\x19\x92\x04\x27']
+
+
+def _require_ble_length(resp, expected, label):
+    """Reject successful BLE replies that do not match their wire format."""
+    expected_lengths = (expected,) if isinstance(expected, int) else tuple(expected)
+    if len(resp.data) not in expected_lengths:
+        wanted = " or ".join(str(length) for length in expected_lengths)
+        raise ValueError(
+            f"malformed {label} response: expected {wanted} byte(s), got {len(resp.data)}")
+
+
+def _require_ble_uint(name, value, maximum, minimum=0):
+    if not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be {minimum}..{maximum}")
 
 
 class ChameleonCMD:
@@ -136,14 +160,16 @@ class ChameleonCMD:
         """
         return self.device.send_cmd_sync(Command.BLE_SCAN_STOP)
 
+    @expect_response(Status.SUCCESS)
     def ble_scan_get_count(self):
         """
         Number of distinct BLE devices seen so far in the current/last scan.
         """
         resp = self.device.send_cmd_sync(Command.BLE_SCAN_GET_COUNT)
-        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
-            return resp.data[0]
-        return 0
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 1, "BLE scan count")
+            resp.parsed = resp.data[0]
+        return resp
 
     @expect_response(Status.SUCCESS)
     def ble_scan_get_results(self, start_index: int = 0):
@@ -155,16 +181,21 @@ class ChameleonCMD:
 
         :return: list of dicts {addr(bytes, LE), addr_type(int), rssi(int), adv(bytes)}
         """
+        _require_ble_uint("start_index", start_index, 0xFF)
         data = struct.pack('!B', start_index)
         resp = self.device.send_cmd_sync(Command.BLE_SCAN_GET_RESULTS, data)
         if resp.status == Status.SUCCESS:
             offset = 0
             devices = []
-            while offset + 9 <= len(resp.data):
+            while offset < len(resp.data):
+                if len(resp.data) - offset < 9:
+                    raise ValueError("malformed BLE scan response: truncated record header")
                 addr = resp.data[offset:offset + 6]
                 offset += 6
                 addr_type, rssi, adv_len = struct.unpack_from('!BbB', resp.data, offset)
                 offset += 3
+                if len(resp.data) - offset < adv_len:
+                    raise ValueError("malformed BLE scan response: truncated advertising data")
                 adv = resp.data[offset:offset + adv_len]
                 offset += adv_len
                 devices.append({'addr': addr, 'addr_type': addr_type, 'rssi': rssi, 'adv': adv})
@@ -175,7 +206,8 @@ class ChameleonCMD:
     def ble_advertising_get(self):
         """Query whether the device is currently advertising."""
         resp = self.device.send_cmd_sync(Command.BLE_ADVERTISING_GET)
-        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 1, "BLE advertising state")
             resp.parsed = bool(resp.data[0])
         return resp
 
@@ -189,7 +221,8 @@ class ChameleonCMD:
         """
         data = struct.pack('!BB', 1 if enabled else 0, 1 if erase_bonds else 0)
         resp = self.device.send_cmd_sync(Command.BLE_ADVERTISING_SET, data)
-        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 1, "BLE advertising state")
             resp.parsed = bool(resp.data[0])
         return resp
 
@@ -218,7 +251,10 @@ class ChameleonCMD:
         :raises SerialProtocolError: if a link is active (DEVICE_MODE_ERROR).
         """
         if mode == 1:
-            if addr is None or len(addr) != 6:
+            if not isinstance(addr, (bytes, bytearray, memoryview)):
+                raise ValueError("mode 1 (static-random) requires a 6-byte addr")
+            addr = bytes(addr)
+            if len(addr) != 6:
                 raise ValueError("mode 1 (static-random) requires a 6-byte addr")
             data = struct.pack('!B', mode) + addr
         elif mode in (0, 2, 3):
@@ -235,7 +271,8 @@ class ChameleonCMD:
         :returns: dict {'addr_type': int, 'addr': bytes (6, LE)}.
         """
         resp = self.device.send_cmd_sync(Command.BLE_GET_ADDR)
-        if resp.status == Status.SUCCESS and len(resp.data) == 7:
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 7, "BLE address")
             resp.parsed = {
                 'addr_type': resp.data[0],
                 'addr': resp.data[1:7],
@@ -260,7 +297,8 @@ class ChameleonCMD:
                         'central_link': bool}.
         """
         resp = self.device.send_cmd_sync(Command.BLE_RADIO_GET)
-        if resp.status == Status.SUCCESS and len(resp.data) == 4:
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 4, "BLE radio state")
             resp.parsed = {
                 'on':           bool(resp.data[0]),
                 'advertising':  bool(resp.data[1]),
@@ -322,10 +360,9 @@ class ChameleonCMD:
     @expect_response(Status.SUCCESS)
     def ble_flood_count(self):
         resp = self.device.send_cmd_sync(Command.BLE_FLOOD_COUNT)
-        if resp.status == Status.SUCCESS and len(resp.data) == 4:
-            n = (resp.data[0] << 24) | (resp.data[1] << 16) | \
-                (resp.data[2] <<  8) |  resp.data[3]
-            resp.parsed = n
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 4, "BLE flood count")
+            resp.parsed, = struct.unpack('!I', resp.data)
         return resp
 
     @expect_response(Status.SUCCESS)
@@ -381,13 +418,20 @@ class ChameleonCMD:
                           2=random-private-resolvable,
                           3=random-private-non-resolvable). Default 0.
         """
-        data = struct.pack('!B', addr_type) + bytes(addr)
+        _require_ble_uint("addr_type", addr_type, 3)
+        if not isinstance(addr, (bytes, bytearray, memoryview)):
+            raise ValueError("addr must be a 6-byte value")
+        addr = bytes(addr)
+        if len(addr) != 6:
+            raise ValueError("addr must be a 6-byte value")
+        data = struct.pack('!B', addr_type) + addr
         return self.device.send_cmd_sync(Command.BLE_CONNECT, data)
 
     def ble_disconnect(self):
         """Disconnect from the target, freeing it to reconnect normally."""
         return self.device.send_cmd_sync(Command.BLE_DISCONNECT)
 
+    @expect_response(Status.SUCCESS)
     def ble_central_state(self):
         """
         Poll harness state. Returns a dict with conn_state, disc_state,
@@ -395,8 +439,13 @@ class ChameleonCMD:
         probe_state, probe_result.
         """
         resp = self.device.send_cmd_sync(Command.BLE_CENTRAL_STATE)
-        state = {}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 10:
+        if resp.status == Status.SUCCESS:
+            # Ten/twelve-byte prefixes are retained for older firmware. Current
+            # firmware appends operation state without changing that prefix.
+            if len(resp.data) not in (10, 12) and len(resp.data) < 21:
+                raise ValueError(
+                    "malformed BLE central state response: expected 10, 12, or at least 21 "
+                    f"bytes, got {len(resp.data)}")
             conn, disc, chars, fuzz, sent_hi, sent_lo, alive, reason, probe_state, probe_result = \
                 struct.unpack_from('!10B', resp.data, 0)
             state = {
@@ -409,7 +458,16 @@ class ChameleonCMD:
                 probe_index, probe_total = struct.unpack_from('!2B', resp.data, 10)
                 state['probe_index'] = probe_index
                 state['probe_total'] = probe_total
-        return state
+            if len(resp.data) >= 21:
+                state.update({
+                    'flood_state': resp.data[12],
+                    'flood_sent': struct.unpack_from('!I', resp.data, 13)[0],
+                    'read_state': resp.data[17],
+                    'write_state': resp.data[18],
+                    'notification_count': struct.unpack_from('!H', resp.data, 19)[0],
+                })
+            resp.parsed = state
+        return resp
 
     def ble_gatt_discover(self):
         """Start enumerating the connected target's GATT characteristics (async)."""
@@ -421,9 +479,12 @@ class ChameleonCMD:
         Fetch discovered characteristics. Wire per char:
         value_handle[2] | props[1] | uuid_type[1] | uuid[2] (big-endian).
         """
+        _require_ble_uint("start_index", start_index, 0xFF)
         data = struct.pack('!B', start_index)
         resp = self.device.send_cmd_sync(Command.BLE_GATT_GET_CHARS, data)
         if resp.status == Status.SUCCESS:
+            if len(resp.data) % 6:
+                raise ValueError("malformed BLE characteristic response: partial 6-byte record")
             offset = 0
             chars = []
             while offset + 6 <= len(resp.data):
@@ -438,36 +499,45 @@ class ChameleonCMD:
         """Start enumerating all descriptors of the connected target (async)."""
         return self.device.send_cmd_sync(Command.BLE_DESC_DISCOVER)
 
+    @expect_response(Status.SUCCESS)
     def ble_get_descs(self, start_index: int = 0):
         """
         Fetch discovered descriptors: dict {state, items:[{handle, uuid_type, uuid}]}.
         state: 0 idle, 1 discovering, 2 done, 3 error. Wire: state[1] then per
         descriptor handle[2] | uuid_type[1] | uuid[2] (big-endian).
         """
+        _require_ble_uint("start_index", start_index, 0xFF)
         resp = self.device.send_cmd_sync(Command.BLE_DESC_GET, struct.pack('!B', start_index))
-        out = {'state': 0, 'items': []}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+        if resp.status == Status.SUCCESS:
+            if len(resp.data) < 1 or (len(resp.data) - 1) % 5:
+                raise ValueError("malformed BLE descriptor response: invalid record length")
+            out = {'state': 0, 'items': []}
             out['state'] = resp.data[0]
             off = 1
             while off + 5 <= len(resp.data):
                 handle, uuid_type, uuid = struct.unpack_from('!HBH', resp.data, off)
                 off += 5
                 out['items'].append({'handle': handle, 'uuid_type': uuid_type, 'uuid': uuid})
-        return out
+            resp.parsed = out
+        return resp
 
     def ble_svc_discover(self):
         """Start discovering the connected target's primary services (async)."""
         return self.device.send_cmd_sync(Command.BLE_SVC_DISCOVER)
 
+    @expect_response(Status.SUCCESS)
     def ble_get_svcs(self, start_index: int = 0):
         """
         Fetch discovered primary services: dict {state, items:[{uuid_type, uuid,
         start, end}]}. Wire: state[1] then per service uuid_type[1] | uuid[2] |
         start_handle[2] | end_handle[2] (big-endian).
         """
+        _require_ble_uint("start_index", start_index, 0xFF)
         resp = self.device.send_cmd_sync(Command.BLE_SVC_GET, struct.pack('!B', start_index))
-        out = {'state': 0, 'items': []}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 1:
+        if resp.status == Status.SUCCESS:
+            if len(resp.data) < 1 or (len(resp.data) - 1) % 7:
+                raise ValueError("malformed BLE service response: invalid record length")
+            out = {'state': 0, 'items': []}
             out['state'] = resp.data[0]
             off = 1
             while off + 7 <= len(resp.data):
@@ -475,7 +545,8 @@ class ChameleonCMD:
                 off += 7
                 out['items'].append({'uuid_type': uuid_type, 'uuid': uuid,
                                      'start': start, 'end': end})
-        return out
+            resp.parsed = out
+        return resp
 
     def ble_devinfo_start(self):
         """
@@ -485,6 +556,7 @@ class ChameleonCMD:
         """
         return self.device.send_cmd_sync(Command.BLE_DEVICE_INFO)
 
+    @expect_response(Status.SUCCESS)
     def ble_get_devinfo(self):
         """
         Fetch collected device-info: dict {state, items:[{uuid, status, data}]}.
@@ -493,17 +565,27 @@ class ChameleonCMD:
         0xFF = characteristic absent, else the ATT read status (0 = ok).
         """
         resp = self.device.send_cmd_sync(Command.BLE_GET_DEVICE_INFO)
-        out = {'state': 0, 'items': []}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 2:
+        if resp.status == Status.SUCCESS:
+            if len(resp.data) < 2:
+                raise ValueError("malformed BLE device-info response: missing header")
+            out = {'state': resp.data[0], 'items': []}
+            count = resp.data[1]
             out['state'] = resp.data[0]
             off = 2  # skip state + count
-            while off + 4 <= len(resp.data):
+            for _ in range(count):
+                if len(resp.data) - off < 4:
+                    raise ValueError("malformed BLE device-info response: truncated record header")
                 uuid, st, ln = struct.unpack_from('!HBB', resp.data, off)
                 off += 4
+                if len(resp.data) - off < ln:
+                    raise ValueError("malformed BLE device-info response: truncated value")
                 val = bytes(resp.data[off:off + ln])
                 off += ln
                 out['items'].append({'uuid': uuid, 'status': st, 'data': val})
-        return out
+            if off != len(resp.data):
+                raise ValueError("malformed BLE device-info response: trailing bytes")
+            resp.parsed = out
+        return resp
 
     def ble_fuzz_start(self, value_handle: int, max_iterations: int = 0, interval_ms: int = 50):
         """
@@ -525,69 +607,87 @@ class ChameleonCMD:
 
     def ble_gatt_read_start(self, value_handle: int):
         """Initiate a GATT read of value_handle on the connected target (async)."""
+        _require_ble_uint("value_handle", value_handle, 0xFFFF, 1)
         return self.device.send_cmd_sync(Command.BLE_GATT_READ,
                                          struct.pack('!H', value_handle))
 
+    @expect_response(Status.SUCCESS)
     def ble_gatt_read_result(self):
         """
         Fetch the last GATT read result: dict {state, gatt_status, data}.
         state: 0 idle, 1 pending, 2 ready.
         """
         resp = self.device.send_cmd_sync(Command.BLE_GATT_GET_READ)
-        out = {'state': 0, 'gatt_status': 0, 'data': b''}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 3:
+        if resp.status == Status.SUCCESS:
+            if len(resp.data) < 3:
+                raise ValueError("malformed BLE read response: missing header")
             ln = resp.data[2]
-            out = {'state': resp.data[0], 'gatt_status': resp.data[1],
-                   'data': bytes(resp.data[3:3 + ln])}
-        return out
+            if len(resp.data) != 3 + ln:
+                raise ValueError("malformed BLE read response: value length mismatch")
+            resp.parsed = {'state': resp.data[0], 'gatt_status': resp.data[1],
+                           'data': bytes(resp.data[3:])}
+        return resp
 
     def ble_gatt_write_start(self, value_handle: int, data: bytes):
         """Write a value to a characteristic on the connected target (async)."""
+        _require_ble_uint("value_handle", value_handle, 0xFFFF, 1)
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ValueError("data must be a byte value")
+        data = bytes(data)
+        if not 1 <= len(data) <= 244:
+            raise ValueError("data length must be 1..244")
         return self.device.send_cmd_sync(Command.BLE_GATT_WRITE,
-                                         struct.pack('!H', value_handle) + bytes(data))
+                                          struct.pack('!H', value_handle) + data)
 
+    @expect_response(Status.SUCCESS)
     def ble_gatt_write_result(self):
         """
         Fetch the last GATT write result: dict {state, gatt_status}.
         state: 0 idle, 1 pending, 2 done.
         """
         resp = self.device.send_cmd_sync(Command.BLE_GET_WRITE)
-        out = {'state': 0, 'gatt_status': 0}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 2:
-            out = {'state': resp.data[0], 'gatt_status': resp.data[1]}
-        return out
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 2, "BLE write result")
+            resp.parsed = {'state': resp.data[0], 'gatt_status': resp.data[1]}
+        return resp
 
+    @expect_response(Status.SUCCESS)
     def ble_get_mtu(self):
         """Effective ATT MTU of the connected target link (23 if not negotiated)."""
         resp = self.device.send_cmd_sync(Command.BLE_GET_MTU)
-        if resp.status == Status.SUCCESS and len(resp.data) >= 2:
-            return (resp.data[0] << 8) | resp.data[1]
-        return 23
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 2, "BLE MTU")
+            resp.parsed, = struct.unpack('!H', resp.data)
+        return resp
 
     def ble_subscribe(self, cccd_handle: int, mode: int = 1):
         """
         Subscribe to notifications/indications on the connected target by writing
         its CCCD. mode: 0=off, 1=notifications, 2=indications.
         """
+        _require_ble_uint("cccd_handle", cccd_handle, 0xFFFF, 1)
+        _require_ble_uint("mode", mode, 2)
         data = struct.pack('!HB', cccd_handle, mode)
         return self.device.send_cmd_sync(Command.BLE_SUBSCRIBE, data)
 
     def ble_find_cccd_start(self, value_handle: int):
         """Start discovering the CCCD descriptor of a characteristic (async)."""
+        _require_ble_uint("value_handle", value_handle, 0xFFFE, 1)
         return self.device.send_cmd_sync(Command.BLE_FIND_CCCD,
                                          struct.pack('!H', value_handle))
 
+    @expect_response(Status.SUCCESS)
     def ble_get_cccd(self):
         """
         Fetch the CCCD lookup result: dict {state, handle}.
         state: 0 idle, 1 searching, 2 found, 3 not-found.
         """
         resp = self.device.send_cmd_sync(Command.BLE_GET_CCCD)
-        out = {'state': 0, 'handle': 0}
-        if resp.status == Status.SUCCESS and len(resp.data) >= 3:
-            out = {'state': resp.data[0],
-                   'handle': (resp.data[1] << 8) | resp.data[2]}
-        return out
+        if resp.status == Status.SUCCESS:
+            _require_ble_length(resp, 3, "BLE CCCD result")
+            resp.parsed = {'state': resp.data[0],
+                           'handle': (resp.data[1] << 8) | resp.data[2]}
+        return resp
 
     @expect_response(Status.SUCCESS)
     def ble_get_notifications(self, start_index: int = 0):
@@ -596,14 +696,19 @@ class ChameleonCMD:
 
         :return: list of dicts {handle, data}
         """
+        _require_ble_uint("start_index", start_index, 0xFFFF)
         data = struct.pack('!H', start_index)
         resp = self.device.send_cmd_sync(Command.BLE_GET_NOTIFICATIONS, data)
         if resp.status == Status.SUCCESS:
             offset = 0
             out = []
-            while offset + 3 <= len(resp.data):
+            while offset < len(resp.data):
+                if len(resp.data) - offset < 3:
+                    raise ValueError("malformed BLE notification response: truncated record header")
                 handle, ln = struct.unpack_from('!HB', resp.data, offset)
                 offset += 3
+                if len(resp.data) - offset < ln:
+                    raise ValueError("malformed BLE notification response: truncated value")
                 out.append({'handle': handle, 'data': bytes(resp.data[offset:offset + ln])})
                 offset += ln
             resp.parsed = out
@@ -615,15 +720,20 @@ class ChameleonCMD:
         Fetch the fuzz log. Wire per entry:
         index[2] | payload_len[1] | write_status[1] | data[min(payload_len, 16)].
         """
+        _require_ble_uint("start_index", start_index, 0xFFFF)
         data = struct.pack('!H', start_index)
         resp = self.device.send_cmd_sync(Command.BLE_FUZZ_GET_LOG, data)
         if resp.status == Status.SUCCESS:
             offset = 0
             entries = []
-            while offset + 4 <= len(resp.data):
+            while offset < len(resp.data):
+                if len(resp.data) - offset < 4:
+                    raise ValueError("malformed BLE fuzz-log response: truncated record header")
                 index, plen, wstatus = struct.unpack_from('!HBB', resp.data, offset)
                 offset += 4
                 dlen = min(plen, 16)
+                if len(resp.data) - offset < dlen:
+                    raise ValueError("malformed BLE fuzz-log response: truncated payload")
                 payload = resp.data[offset:offset + dlen]
                 offset += dlen
                 entries.append({'index': index, 'len': plen, 'status': wstatus, 'data': payload})
@@ -855,6 +965,49 @@ class ChameleonCMD:
             raise ValueError("EMV amount must be 6-byte n12 BCD")
         resp = self.device.send_cmd_sync(Command.HF14A_4_EMV_SCAN, bytes(amount), timeout=12)
         return resp
+
+    @expect_response([Status.HF_TAG_OK, Status.HF_TAG_NO])
+    def hf14a_4_emv_trace_start(self, request: EmvTraceRequest):
+        """Start a retained, versioned EMV trace session."""
+        payload = encode_start_request(request)
+        timeout = max(12, ((request.budget_ms or 12000) + 999) // 1000 + 5)
+        resp = self.device.send_cmd_sync(
+            Command.HF14A_4_EMV_TRACE_START, payload, timeout=timeout)
+        if resp.status in (Status.HF_TAG_OK, Status.HF_TAG_NO):
+            resp.parsed = parse_start_response(resp.data)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def hf14a_4_emv_trace_meta(self, scan_id: int):
+        """Read and validate metadata for a retained EMV trace session."""
+        resp = self.device.send_cmd_sync(
+            Command.HF14A_4_EMV_TRACE_META, encode_meta_request(scan_id))
+        if resp.status == Status.SUCCESS:
+            resp.parsed = parse_meta_response(resp.data, scan_id)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def hf14a_4_emv_trace_get(self, scan_id: int, start_record: int,
+                             max_payload: int = 4096):
+        """Read and validate one atomic-record page from a retained trace."""
+        resp = self.device.send_cmd_sync(
+            Command.HF14A_4_EMV_TRACE_GET,
+            encode_get_request(scan_id, start_record, max_payload))
+        if resp.status == Status.SUCCESS:
+            resp.parsed = parse_get_response(resp.data, scan_id, start_record)
+        return resp
+
+    def hf14a_4_emv_trace_download(self, request: EmvTraceRequest,
+                                   max_payload: int = 4096):
+        """Start, page, and integrity-check a complete retained EMV trace."""
+        start = self.hf14a_4_emv_trace_start(request)
+        return download_emv_trace(
+            start.scan_id,
+            self.hf14a_4_emv_trace_meta,
+            self.hf14a_4_emv_trace_get,
+            max_payload=max_payload,
+            start=start,
+        )
 
     def hf14a_4_desfire_scan(self):
         """
@@ -2244,13 +2397,12 @@ class ChameleonCMD:
         try:
             resp = self.device.send_cmd_sync(Command.GET_DEVICE_CAPABILITIES)
         except chameleon_com.CMDInvalidException:
-            print("Chameleon does not understand get_device_capabilities command. Please update firmware")
-            return chameleon_com.Response(cmd=Command.GET_DEVICE_CAPABILITIES,
-                                          status=Status.NOT_IMPLEMENTED)
-        else:
-            if resp.status == Status.SUCCESS:
-                resp.parsed = [x[0] for x in struct.iter_unpack('!H', resp.data)]
-            return resp
+            # Single, clear message; the caller's connect handler surfaces it.
+            raise UnexpectedResponseError(
+                "device does not understand GET_DEVICE_CAPABILITIES; please update firmware")
+        if resp.status == Status.SUCCESS:
+            resp.parsed = [x[0] for x in struct.iter_unpack('!H', resp.data)]
+        return resp
 
     @expect_response(Status.SUCCESS)
     def get_device_model(self):

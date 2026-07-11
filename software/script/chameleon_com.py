@@ -257,16 +257,16 @@ class ChameleonCom:
                                 except ValueError:
                                     command_string = f"{data_cmd} (unknown)"
                                 try:
-                                    status_string = str(Status(data_status))
+                                    status_string = str(Status(data_status)).ljust(30)
                                     if data_status == Status.SUCCESS:
-                                        status_string = color_string((CG, status_string.ljust(30)))
+                                        status_string = color_string((CG, status_string))
                                     else:
-                                        status_string = color_string((CR, status_string.ljust(30)))
+                                        status_string = color_string((CR, status_string))
                                 except ValueError:
-                                    status_string = f"{data_status:30x}"
-                                    response = data_response.hex() if data_response is not None else ""
-                                    print(
-                                        f"<={color_string((CC, command_string.ljust(40)), (CR, status_string), (CY, response))}")
+                                    status_string = color_string((CR, f"{data_status:#06x}".ljust(30)))
+                                response = data_response.hex() if data_response is not None else ""
+                                print(
+                                    f"<={color_string((CC, command_string.ljust(40)))} {status_string} {color_string((CY, response))}")
                             if data_cmd in self.wait_response_map:
                                 # call processor
                                 if 'callback' in self.wait_response_map[data_cmd]:
@@ -346,14 +346,17 @@ class ChameleonCom:
         :return:
         """
         while self.isOpen():
-            for task_cmd in self.wait_response_map.keys():
-                if time.time() > self.wait_response_map[task_cmd]['end_time']:
-                    if 'callback' in self.wait_response_map[task_cmd]:
-                        # not sync, call function to notify timeout.
-                        self.wait_response_map[task_cmd]['callback'](task_cmd, None, None)
+            # Iterate over a snapshot: other threads insert/delete/clear this map concurrently,
+            # so iterating the live dict can raise "dictionary changed size during iteration".
+            for task_cmd, task in list(self.wait_response_map.items()):
+                if time.time() > task['end_time']:
+                    if 'callback' in task:
+                        # not sync: notify timeout, then drop the entry so the callback fires once.
+                        task['callback'](task_cmd, None, None)
+                        self.wait_response_map.pop(task_cmd, None)
                     else:
                         # sync mode, set timeout flag
-                        self.wait_response_map[task_cmd]['is_timeout'] = True
+                        task['is_timeout'] = True
             time.sleep(THREAD_BLOCKING_TIMEOUT)
 
     def make_data_frame_bytes(self, cmd: int, data: Union[bytes, None] = None, status: int = 0) -> bytes:

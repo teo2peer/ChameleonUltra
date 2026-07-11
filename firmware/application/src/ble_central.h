@@ -57,17 +57,23 @@ uint16_t ble_central_copy_devinfo(uint8_t *out, uint16_t out_cap);
 // Read a characteristic value from the connected target (async — poll copy_read).
 uint32_t ble_central_gatt_read(uint16_t value_handle);
 // Serialize the last read result. Wire: state[1] | gatt_status[1] | len[1] | data[len].
-// state: 0 idle, 1 pending, 2 ready.
+// state: 0 idle, 1 pending, 2 ready, 3 failed.
 uint16_t ble_central_copy_read(uint8_t *out, uint16_t out_cap);
+
+// Maximum payload writable in a single GATT write (<= negotiated ATT_MTU - 3).
+// The command layer rejects longer writes rather than silently truncating them.
+#define BLE_CENTRAL_WRITE_MAX       244
 
 // Write a value to a characteristic (write-with-response; async — poll get_write_result).
 uint32_t ble_central_gatt_write(uint16_t value_handle, const uint8_t *data, uint8_t len);
 // Serialize the last write result. Wire: state[1] | gatt_status[1].
-// state: 0 idle, 1 pending, 2 done.
+// state: 0 idle, 1 pending, 2 done, 3 failed.
 uint16_t ble_central_get_write_result(uint8_t *out, uint16_t out_cap);
 
 // Effective ATT MTU of the target link (23 until negotiated / when not connected).
 uint16_t ble_central_mtu(void);
+// Current maximum single-write payload (negotiated ATT MTU - 3, capped by storage).
+uint16_t ble_central_write_max(void);
 
 // Central link state queries (used by ble_radio_set() to safely tear down the
 // link before / after a radio toggle).
@@ -126,8 +132,10 @@ uint32_t ble_central_flood_scan_buffer(uint16_t value_handle, uint8_t payload_si
 // Serialize harness state. Wire format:
 // conn_state[1] disc_state[1] char_count[1] fuzz_state[1] fuzz_sent[2 BE]
 // target_alive[1] last_disconnect_reason[1] probe_state[1] probe_result[1]
-// probe_index[1] probe_total[1].
-// conn_state: 0 idle, 1 connecting, 2 connected, 3 disconnected
+// probe_index[1] probe_total[1]. Newer firmware appends, when output capacity permits:
+// flood_state[1] flood_sent[4 BE] read_state[1] write_state[1] notif_count[2 BE].
+// conn_state: 0 idle, 1 connecting, 2 connected, 3 disconnected,
+// 4 cancelling (awaiting GAP timeout), 5 disconnecting (awaiting GAP disconnect)
 // disc_state: 0 idle, 1 discovering, 2 done, 3 error
 // fuzz_state: 0 idle, 1 running, 2 stopped/finished
 uint16_t ble_central_get_state(uint8_t *out, uint16_t out_cap);

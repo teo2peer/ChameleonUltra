@@ -1,5 +1,13 @@
 #include "fds_util.h"
+
+#include <limits.h>
+#include <string.h>
+
+#include "app_util_platform.h"
 #include "bsp_wdt.h"
+#include "nrf.h"
+#include "nrf_delay.h"
+#include "sdk_config.h"
 
 #define NRF_LOG_MODULE_NAME fds_sync
 #include "nrf_log.h"
@@ -7,318 +15,494 @@
 #include "nrf_log_default_backends.h"
 NRF_LOG_MODULE_REGISTER();
 
+#define FDS_SYNC_TIMEOUT_MS       15000U
+#define FDS_SYNC_WDT_FEED_MS      100U
+#define FDS_RECORD_OVERHEAD_WORDS 5U /* Three header words and two page-tag words. */
+#define FDS_MAX_RECORD_WORDS      (FDS_VIRTUAL_PAGE_SIZE - FDS_RECORD_OVERHEAD_WORDS)
 
-// current write record info
+typedef enum {
+    FDS_SYNC_OP_NONE,
+    FDS_SYNC_OP_INIT,
+    FDS_SYNC_OP_WRITE,
+    FDS_SYNC_OP_DELETE,
+    FDS_SYNC_OP_GC,
+} fds_sync_op_t;
+
 static struct {
-    uint32_t record_id; // record id, used for sync delete
-    uint16_t id;        // file id
-    uint16_t key;       // file key
-    bool success;       // task is success
-    bool waiting;       // task waiting done.
-    bool ignore_pm;     // ignore peer manager records, defaults to true, set to false by fds_wipe
-} fds_operation_info;
+    volatile bool busy;
+    volatile bool complete;
+    volatile bool timed_out;
+    volatile bool initialized;
+    volatile bool registered;
+    volatile bool ignore_pm;
+    volatile fds_sync_op_t pending;
+    volatile ret_code_t result;
+    volatile ret_code_t last_error;
+    volatile uint32_t record_id;
+    volatile uint16_t file_id;
+    volatile uint16_t record_key;
+} m_fds_state = {
+    .ignore_pm = true,
+    .last_error = FDS_ERR_NOT_INITIALIZED,
+};
 
+/* FDS retains the data pointer until its event arrives, including after our timeout. */
+static uint32_t m_write_buffer[FDS_MAX_RECORD_WORDS];
 
-/**
- *The query record exists, and get the handle of the record
- */
-static bool fds_find_record(uint16_t id, uint16_t key, fds_record_desc_t *desc) {
-    fds_find_token_t ftok;
-    memset(&ftok, 0x00, sizeof(fds_find_token_t));  // You need to be empty before use
-    if (fds_record_find(id, key, desc, &ftok) == NRF_SUCCESS) {
-        return true;
-    }
-    return false;
+static void fds_set_last_error(ret_code_t result) {
+    CRITICAL_REGION_ENTER();
+    m_fds_state.last_error = result;
+    CRITICAL_REGION_EXIT();
 }
 
-/**
- * @brief Determine whether the record exists.
- *
- * @param id record id
- * @param key record key
- * @return true on record exists
- * @return false on no found
- */
-bool fds_is_exists(uint16_t id, uint16_t key) {
+ret_code_t fds_util_last_error(void) {
+    ret_code_t result;
+    CRITICAL_REGION_ENTER();
+    result = m_fds_state.last_error;
+    CRITICAL_REGION_EXIT();
+    return result;
+}
+
+bool fds_util_is_ready(void) {
+    bool initialized;
+    CRITICAL_REGION_ENTER();
+    initialized = m_fds_state.initialized;
+    CRITICAL_REGION_EXIT();
+    return initialized;
+}
+
+static bool fds_lock(bool require_initialized) {
+    bool acquired = false;
+    ret_code_t result = NRF_SUCCESS;
+
+    /* A synchronous wait in an ISR can prevent the FDS completion interrupt. */
+    if (__get_IPSR() != 0U) {
+        fds_set_last_error(NRF_ERROR_INVALID_STATE);
+        return false;
+    }
+
+    CRITICAL_REGION_ENTER();
+    if (m_fds_state.busy) {
+        result = FDS_ERR_BUSY;
+    } else if (require_initialized && !m_fds_state.initialized) {
+        result = FDS_ERR_NOT_INITIALIZED;
+    } else {
+        m_fds_state.busy = true;
+        acquired = true;
+    }
+    m_fds_state.last_error = result;
+    CRITICAL_REGION_EXIT();
+    return acquired;
+}
+
+static void fds_finish(ret_code_t result) {
+    CRITICAL_REGION_ENTER();
+    m_fds_state.last_error = result;
+    if (m_fds_state.timed_out && m_fds_state.pending != FDS_SYNC_OP_NONE) {
+        /* Keep the lock and write buffer until the outstanding event arrives. */
+        m_fds_state.timed_out = true;
+    } else {
+        m_fds_state.pending = FDS_SYNC_OP_NONE;
+        m_fds_state.complete = false;
+        m_fds_state.timed_out = false;
+        m_fds_state.busy = false;
+    }
+    CRITICAL_REGION_EXIT();
+}
+
+static void fds_prepare_wait(fds_sync_op_t operation, uint16_t file_id,
+                             uint16_t record_key, uint32_t record_id) {
+    CRITICAL_REGION_ENTER();
+    m_fds_state.file_id = file_id;
+    m_fds_state.record_key = record_key;
+    m_fds_state.record_id = record_id;
+    m_fds_state.result = FDS_ERR_OPERATION_TIMEOUT;
+    m_fds_state.complete = false;
+    m_fds_state.timed_out = false;
+    __DMB();
+    m_fds_state.pending = operation;
+    CRITICAL_REGION_EXIT();
+}
+
+static void fds_cancel_wait(void) {
+    CRITICAL_REGION_ENTER();
+    m_fds_state.pending = FDS_SYNC_OP_NONE;
+    m_fds_state.complete = false;
+    CRITICAL_REGION_EXIT();
+}
+
+static ret_code_t fds_wait(void) {
+    for (uint32_t elapsed = 0; elapsed < FDS_SYNC_TIMEOUT_MS; elapsed++) {
+        bool complete;
+        ret_code_t result;
+
+        CRITICAL_REGION_ENTER();
+        complete = m_fds_state.complete;
+        result = m_fds_state.result;
+        CRITICAL_REGION_EXIT();
+        if (complete) {
+            return result;
+        }
+
+        /* The watchdog is initialized after the startup FDS reads. */
+        if ((elapsed % FDS_SYNC_WDT_FEED_MS) == 0U && NRF_WDT->RUNSTATUS != 0U) {
+            bsp_wdt_feed();
+        }
+        nrf_delay_ms(1);
+    }
+
+    /* Catch an event delivered at the timeout boundary. */
+    bool complete;
+    ret_code_t result;
+    CRITICAL_REGION_ENTER();
+    complete = m_fds_state.complete;
+    result = m_fds_state.result;
+    if (!complete) {
+        /* Resolve the timeout/event race before releasing the critical section. */
+        m_fds_state.timed_out = true;
+    }
+    CRITICAL_REGION_EXIT();
+    return complete ? result : FDS_ERR_OPERATION_TIMEOUT;
+}
+
+static ret_code_t fds_find_record(uint16_t id, uint16_t key, fds_record_desc_t *desc) {
+    fds_find_token_t token = {0};
+    return fds_record_find(id, key, desc, &token);
+}
+
+static ret_code_t fds_gc_locked(void) {
+    fds_prepare_wait(FDS_SYNC_OP_GC, 0, 0, 0);
+    ret_code_t result = fds_gc();
+    if (result != NRF_SUCCESS) {
+        fds_cancel_wait();
+        return result;
+    }
+    return fds_wait();
+}
+
+static ret_code_t fds_write_record_locked(uint16_t id, uint16_t key,
+                                           uint16_t data_length_words) {
     fds_record_desc_t record_desc;
-    if (fds_find_record(id, key, &record_desc)) {
+    ret_code_t find_result = fds_find_record(id, key, &record_desc);
+    bool update = find_result == NRF_SUCCESS;
+    if (!update && find_result != FDS_ERR_NOT_FOUND) {
+        return find_result;
+    }
+
+    fds_record_t record = {
+        .file_id = id,
+        .key = key,
+        .data = {
+            .p_data = m_write_buffer,
+            .length_words = data_length_words,
+        },
+    };
+
+    fds_prepare_wait(FDS_SYNC_OP_WRITE, id, key, 0);
+    ret_code_t result = update ? fds_record_update(&record_desc, &record)
+                               : fds_record_write(&record_desc, &record);
+    if (result != NRF_SUCCESS) {
+        fds_cancel_wait();
+        return result;
+    }
+    return fds_wait();
+}
+
+static ret_code_t fds_write_with_gc_locked(uint16_t id, uint16_t key,
+                                            uint16_t data_length_words) {
+    ret_code_t result = fds_write_record_locked(id, key, data_length_words);
+    if (result != FDS_ERR_NO_SPACE_IN_FLASH) {
+        return result;
+    }
+
+    NRF_LOG_INFO("FDS is full; running garbage collection before retry.");
+    result = fds_gc_locked();
+    if (result != NRF_SUCCESS) {
+        return result;
+    }
+    return fds_write_record_locked(id, key, data_length_words);
+}
+
+bool fds_is_exists(uint16_t id, uint16_t key) {
+    if (!fds_lock(true)) {
+        return false;
+    }
+
+    fds_record_desc_t record_desc;
+    ret_code_t result = fds_find_record(id, key, &record_desc);
+    bool exists = result == NRF_SUCCESS;
+    fds_finish(exists || result == FDS_ERR_NOT_FOUND ? NRF_SUCCESS : result);
+    return exists;
+}
+
+bool fds_read_sync(uint16_t id, uint16_t key, uint16_t *length, uint8_t *buffer) {
+    if (length == NULL || buffer == NULL) {
+        fds_set_last_error(NRF_ERROR_NULL);
+        return false;
+    }
+
+    uint16_t capacity = *length;
+    *length = 0;
+    if (!fds_lock(true)) {
+        return false;
+    }
+
+    fds_record_desc_t record_desc;
+    ret_code_t result = fds_find_record(id, key, &record_desc);
+    if (result != NRF_SUCCESS) {
+        fds_finish(result);
+        return false;
+    }
+
+    fds_flash_record_t flash_record;
+    result = fds_record_open(&record_desc, &flash_record);
+    if (result == FDS_ERR_CRC_CHECK_FAILED) {
+        /* Records made before CRC support have a zero CRC. Migrate them once. */
+        fds_header_t const *header = (fds_header_t const *)record_desc.p_record;
+        uint32_t record_bytes = (uint32_t)header->length_words * sizeof(uint32_t);
+        if (header->crc16 != 0U || header->file_id != id || header->record_key != key ||
+                header->length_words > FDS_MAX_RECORD_WORDS || record_bytes > capacity ||
+                record_bytes > UINT16_MAX) {
+            fds_finish(result);
+            return false;
+        }
+
+        memcpy(m_write_buffer, header + 1, record_bytes);
+        memcpy(buffer, m_write_buffer, record_bytes);
+        result = fds_write_with_gc_locked(id, key, header->length_words);
+        if (result == NRF_SUCCESS) {
+            *length = (uint16_t)record_bytes;
+            NRF_LOG_INFO("Migrated legacy CRC-less FDS record 0x%04x/0x%04x.", id, key);
+        }
+        fds_finish(result);
+        return result == NRF_SUCCESS;
+    }
+    if (result != NRF_SUCCESS) {
+        fds_finish(result);
+        return false;
+    }
+
+    uint32_t record_bytes = (uint32_t)flash_record.p_header->length_words * sizeof(uint32_t);
+    if (flash_record.p_header->length_words > FDS_MAX_RECORD_WORDS ||
+            record_bytes > capacity || record_bytes > UINT16_MAX) {
+        result = NRF_ERROR_DATA_SIZE;
+    } else {
+        memcpy(buffer, flash_record.p_data, record_bytes);
+    }
+
+    ret_code_t close_result = fds_record_close(&record_desc);
+    if (result == NRF_SUCCESS && close_result != NRF_SUCCESS) {
+        result = close_result;
+    }
+    if (result == NRF_SUCCESS) {
+        *length = (uint16_t)record_bytes;
+    }
+    fds_finish(result);
+    return result == NRF_SUCCESS;
+}
+
+bool fds_write_sync(uint16_t id, uint16_t key, uint16_t length, void *buffer) {
+    uint32_t data_length_words = ((uint32_t)length + sizeof(uint32_t) - 1U) / sizeof(uint32_t);
+    if (length > 0U && buffer == NULL) {
+        fds_set_last_error(NRF_ERROR_NULL);
+        return false;
+    }
+    if (data_length_words > FDS_MAX_RECORD_WORDS) {
+        fds_set_last_error(FDS_ERR_RECORD_TOO_LARGE);
+        return false;
+    }
+    if (!fds_lock(true)) {
+        return false;
+    }
+    if (length == 0U) {
+        fds_finish(NRF_SUCCESS);
         return true;
     }
-    return false;
+
+    uint32_t padded_length = data_length_words * sizeof(uint32_t);
+    memset(m_write_buffer, 0, padded_length);
+    memcpy(m_write_buffer, buffer, length);
+
+    ret_code_t result = fds_write_with_gc_locked(id, key, (uint16_t)data_length_words);
+    fds_finish(result);
+    return result == NRF_SUCCESS;
 }
 
-
-/**
- *Read record
- * Length: set it to max length (size of buffer)
- * After execution, length is updated to the real flash record size
- */
-bool fds_read_sync(uint16_t id, uint16_t key, uint16_t *length, uint8_t *buffer) {
-    ret_code_t          err_code;       //The results of the operation
-    fds_flash_record_t  flash_record;   // Pointing to the actual information in Flash
-    fds_record_desc_t   record_desc;    // Recorded handle
-    if (fds_find_record(id, key, &record_desc)) {
-        err_code = fds_record_open(&record_desc, &flash_record);            //Open the record so that it is marked as the open state
-        APP_ERROR_CHECK(err_code);
-        if (flash_record.p_header->length_words * 4 <= *length) {        // Read the data in Flash here to the given RAM
-            // Make sure that the buffer will not overflow, read this record
-            memcpy(buffer, flash_record.p_data, flash_record.p_header->length_words * 4);
-            NRF_LOG_INFO("FDS read success.");
-            *length = flash_record.p_header->length_words * 4;
-            return true;
-        } else {
-            NRF_LOG_INFO("FDS buffer too small, can't run memcpy, fds size = %d, buffer size = %d", flash_record.p_header->length_words * 4, *length);
-        }
-        err_code = fds_record_close(&record_desc);                          // Close the file after the operation is completed
-        APP_ERROR_CHECK(err_code);
+static ret_code_t fds_delete_record_locked(fds_record_desc_t *record_desc) {
+    uint32_t record_id;
+    ret_code_t result = fds_record_id_from_desc(record_desc, &record_id);
+    if (result != NRF_SUCCESS) {
+        return result;
     }
-    //If the correct data is not loaded, this record may not exist
-    *length = 0;
-    return false;
+    fds_prepare_wait(FDS_SYNC_OP_DELETE, 0, 0, record_id);
+    result = fds_record_delete(record_desc);
+    if (result != NRF_SUCCESS) {
+        fds_cancel_wait();
+        return result;
+    }
+    return fds_wait();
 }
 
-/**
- * There is no realization of the writing operation function of the GC process
- */
-static ret_code_t fds_write_record_nogc(uint16_t id, uint16_t key, uint16_t data_length_words, void *buffer) {
-    ret_code_t          err_code;       // The results of the operation
-    fds_record_desc_t   record_desc;    // Recorded handle
-    fds_record_t record = {             // The entity of the record is used for writing and updating the operation.
-        .file_id = id, .key = key,
-        .data = { .p_data = buffer, .length_words = data_length_words, }
-    };
-    if (fds_find_record(id, key, &record_desc)) {   // Find a record with specified characteristics
-        //If you can find this record, we can perform the update operation
-        NRF_LOG_INFO("Search FileID: 0x%04x, FileKey: 0x%04x is found, will update.", id, key);
-        err_code = fds_record_update(&record_desc, &record);
-        if (err_code != NRF_SUCCESS) {
-            NRF_LOG_INFO("Record update request failed!");
-        } // Don't NRF_LOG if request succeeded, it would be interrupted by NRF_LOG in record handler
-    } else {
-        // Unable to find effective records, we will write for the first time
-        NRF_LOG_INFO("Search FileID: 0x%04x, FileKey: 0x%04x no found, will create.", id, key);
-        err_code = fds_record_write(&record_desc, &record);
-        if (err_code != NRF_SUCCESS) {
-            NRF_LOG_INFO("Record creation request failed!");
-        } // Don't NRF_LOG if request succeeded, it would be interrupted by NRF_LOG in record handler
-    }
-    return err_code;
-}
-
-/**
- * Write record
- */
-bool fds_write_sync(uint16_t id, uint16_t key, uint16_t length, void *buffer) {
-    // Make only one task running
-    APP_ERROR_CHECK_BOOL(!fds_operation_info.waiting);
-    // write result
-    bool ret = true;
-    // write or update record info cache
-    fds_operation_info.id = id;
-    fds_operation_info.key = key;
-    fds_operation_info.success = false;
-    fds_operation_info.waiting = true;
-    // compute needed words
-    if (length == 0) {
-        return ret;
-    }
-    uint16_t data_length_words = ((length - 1) / 4) + 1;
-
-    // CCall the write implementation function without automatic GC
-    ret_code_t err_code = fds_write_record_nogc(id, key, data_length_words, buffer);
-    if (err_code == NRF_SUCCESS) {
-        while (!fds_operation_info.success) {
-            __NOP();
-        }; // Waiting for operation to complete
-    } else if (err_code == FDS_ERR_NO_SPACE_IN_FLASH) {   //Make sure there is space to operate, otherwise GC will be required
-        // The current error is an error with insufficient space. Maybe we need GC
-        NRF_LOG_INFO("FDS no space, gc auto start.");
-        fds_gc_sync();
-
-        // After the GC is completed, it can be re -operated
-        NRF_LOG_INFO("FDS auto gc success, write record continue.");
-        fds_operation_info.success = false;
-        err_code = fds_write_record_nogc(id, key, data_length_words, buffer);
-        if (err_code == NRF_SUCCESS) {
-            while (!fds_operation_info.success) {
-                __NOP();
-            }; // Waiting for operation to complete
-        } else if (err_code == FDS_ERR_NO_SPACE_IN_FLASH) {
-            //After gc once, I found that there is still no space, so it may be that the developer did not consider the space distribution and caused overflow
-            NRF_LOG_ERROR("FDS no space to write.");
-            ret = false;
-        } else {
-            //If it is not an error with insufficient space, then we need Catch the error, and we solve it during development
-            APP_ERROR_CHECK(err_code);
-        }
-    } else {
-        // Above
-        APP_ERROR_CHECK(err_code);
-    }
-
-    // task process finish
-    fds_operation_info.waiting = false;
-    return ret;
-}
-
-/*
- * Delete Record
- */
 int fds_delete_sync(uint16_t id, uint16_t key) {
-    int                 delete_count = 0;
-    fds_record_desc_t   record_desc;
-    ret_code_t          err_code;
-    while (fds_find_record(id, key, &record_desc)) {
-        fds_operation_info.success = false;
-        fds_record_id_from_desc(&record_desc, &fds_operation_info.record_id);
-        err_code = fds_record_delete(&record_desc);
-        APP_ERROR_CHECK(err_code);
-        delete_count++;
-        while (!fds_operation_info.success) {
-            __NOP();
-        }; //Waiting for operation to complete
+    if (!fds_lock(true)) {
+        return 0;
     }
-    return delete_count;
+
+    int delete_count = 0;
+    while (true) {
+        fds_record_desc_t record_desc;
+        ret_code_t result = fds_find_record(id, key, &record_desc);
+        if (result == FDS_ERR_NOT_FOUND) {
+            fds_finish(NRF_SUCCESS);
+            return delete_count;
+        }
+        if (result != NRF_SUCCESS) {
+            fds_finish(result);
+            return 0;
+        }
+
+        result = fds_delete_record_locked(&record_desc);
+        if (result != NRF_SUCCESS) {
+            fds_finish(result);
+            return 0;
+        }
+        delete_count++;
+    }
 }
 
 static bool is_peer_manager_record(uint16_t id_or_key) {
-    if (id_or_key > 0xBFFF) {
-        return true;
+    return id_or_key > 0xBFFFU;
+}
+
+static bool event_matches_locked(fds_evt_t const *event) {
+    switch (m_fds_state.pending) {
+        case FDS_SYNC_OP_INIT:
+            return event->id == FDS_EVT_INIT;
+        case FDS_SYNC_OP_WRITE:
+            return (event->id == FDS_EVT_WRITE || event->id == FDS_EVT_UPDATE) &&
+                   event->write.file_id == m_fds_state.file_id &&
+                   event->write.record_key == m_fds_state.record_key;
+        case FDS_SYNC_OP_DELETE:
+            return event->id == FDS_EVT_DEL_RECORD &&
+                   event->del.record_id == m_fds_state.record_id;
+        case FDS_SYNC_OP_GC:
+            return event->id == FDS_EVT_GC;
+        default:
+            return false;
+    }
+}
+
+static bool event_is_peer_manager_record(fds_evt_t const *event) {
+    if (event->id == FDS_EVT_WRITE || event->id == FDS_EVT_UPDATE) {
+        return is_peer_manager_record(event->write.file_id) ||
+               is_peer_manager_record(event->write.record_key);
+    }
+    if (event->id == FDS_EVT_DEL_RECORD || event->id == FDS_EVT_DEL_FILE) {
+        return is_peer_manager_record(event->del.file_id) ||
+               is_peer_manager_record(event->del.record_key);
     }
     return false;
 }
 
-/**
- *FDS event callback
- */
-static void fds_evt_handler(fds_evt_t const *p_evt) {
-    // Skip peermanager event
-    if (fds_operation_info.ignore_pm && (
-                is_peer_manager_record(p_evt->write.record_key)
-                || is_peer_manager_record(p_evt->write.file_id)
-                || is_peer_manager_record(p_evt->del.record_key)
-                || is_peer_manager_record(p_evt->del.file_id)
-            )
-       ) {
+static void fds_evt_handler(fds_evt_t const *event) {
+    bool matched;
+    bool ignored;
+
+    CRITICAL_REGION_ENTER();
+    matched = event_matches_locked(event);
+    ignored = m_fds_state.ignore_pm && event_is_peer_manager_record(event) && !matched;
+    if (!ignored) {
+        if (event->id == FDS_EVT_INIT) {
+            m_fds_state.initialized = event->result == NRF_SUCCESS;
+        }
+        if (matched) {
+            if (m_fds_state.timed_out) {
+                /* The caller already failed; only release retained resources now. */
+                m_fds_state.pending = FDS_SYNC_OP_NONE;
+                m_fds_state.complete = false;
+                m_fds_state.timed_out = false;
+                m_fds_state.busy = false;
+            } else {
+                m_fds_state.result = event->result;
+                __DMB();
+                m_fds_state.complete = true;
+            }
+        }
+    }
+    CRITICAL_REGION_EXIT();
+}
+
+void fds_util_init(void) {
+    if (!fds_lock(false)) {
+        return;
+    }
+    if (m_fds_state.initialized) {
+        fds_finish(NRF_SUCCESS);
         return;
     }
 
-    // To process fds event
-    switch (p_evt->id) {
-        case FDS_EVT_INIT: {
-            if (p_evt->result == NRF_SUCCESS) {
-                NRF_LOG_INFO("NRF52 FDS libraries init success.");
-            } else {
-                NRF_LOG_INFO("NRF52 FDS libraries init failed");
-                APP_ERROR_CHECK(p_evt->result);
-            }
+    ret_code_t result = NRF_SUCCESS;
+    if (!m_fds_state.registered) {
+        result = fds_register(fds_evt_handler);
+        if (result == NRF_SUCCESS) {
+            m_fds_state.registered = true;
         }
-        break;
-        case FDS_EVT_WRITE:
-        case FDS_EVT_UPDATE: {
-            if (p_evt->result == NRF_SUCCESS) {
-                NRF_LOG_INFO("Record change: FileID 0x%04x, RecordKey 0x%04x", p_evt->write.file_id, p_evt->write.record_key);
-                if (p_evt->write.file_id == fds_operation_info.id && p_evt->write.record_key == fds_operation_info.key) {
-                    // The logic above has ensured that the task we are currently writing is completed!
-                    NRF_LOG_INFO("Record change success");
-                    fds_operation_info.success = true;
-                } else NRF_LOG_INFO("Record change mismatch");
-            } else {
-                NRF_LOG_INFO("Record change failed");
-                APP_ERROR_CHECK(p_evt->result);
-            }
+    }
+    if (result == NRF_SUCCESS) {
+        fds_prepare_wait(FDS_SYNC_OP_INIT, 0, 0, 0);
+        result = fds_init();
+        if (result == NRF_SUCCESS) {
+            result = fds_wait();
+        } else {
+            fds_cancel_wait();
         }
-        break;
-        case FDS_EVT_DEL_RECORD: {
-            if (p_evt->result == NRF_SUCCESS) {
-                NRF_LOG_INFO(
-                    "Record remove: FileID: 0x%04x, RecordKey: 0x%04x, RecordID: %08x",
-                    p_evt->del.file_id, p_evt->del.record_key, p_evt->del.record_id
-                );
-                if (p_evt->del.record_id == fds_operation_info.record_id) {
-                    // Only check record id because fileID and recordKey aren't available
-                    // if deleting via fds_record_iterate. record id is guaranteed to be unique.
-                    NRF_LOG_INFO("Record delete success");
-                    fds_operation_info.success = true;
-                } else NRF_LOG_INFO("Record delete mismatch");
-            } else {
-                NRF_LOG_INFO("Record delete failed");
-                APP_ERROR_CHECK(p_evt->result);
-            }
-        }
-        break;
-        case FDS_EVT_GC: {
-            if (p_evt->result == NRF_SUCCESS) {
-                NRF_LOG_INFO("FDS gc success");
-                fds_operation_info.success = true;
-            } else {
-                NRF_LOG_INFO("FDS gc failed");
-                APP_ERROR_CHECK(p_evt->result);
-            }
-        }
-        break;
-        default: {
-            // nothing to do...
-        } break;
+    }
+    fds_finish(result);
+    if (result != NRF_SUCCESS) {
+        NRF_LOG_ERROR("FDS initialization failed: 0x%08x", result);
     }
 }
 
-/**
- *Initialize the FDS library of NRF52
- */
-void fds_util_init() {
-    fds_operation_info.ignore_pm = true;
-    // reset waiting flag
-    fds_operation_info.waiting = false;
-    //Register the incident first
-    ret_code_t err_code = fds_register(fds_evt_handler);
-    APP_ERROR_CHECK(err_code);
-    //Start the initialization FDS library
-    err_code = fds_init();
-    APP_ERROR_CHECK(err_code);
-}
-
-void fds_gc_sync(void) {
-    fds_operation_info.success = false;
-    ret_code_t err_code = fds_gc();
-    APP_ERROR_CHECK(err_code);
-    while (!fds_operation_info.success) {
-        __NOP();
-    };
-}
-
-static bool fds_next_record_delete_sync() {
-    fds_find_token_t  tok   = {0};
-    fds_record_desc_t desc  = {0};
-    if (fds_record_iterate(&desc, &tok) != NRF_SUCCESS) {
-        NRF_LOG_INFO("No more records to delete");
+bool fds_gc_sync(void) {
+    if (!fds_lock(true)) {
         return false;
     }
-
-    fds_record_id_from_desc(&desc, &fds_operation_info.record_id);
-    NRF_LOG_INFO("Deleting record with id=%08x", fds_operation_info.record_id);
-
-    fds_operation_info.success = false;
-    ret_code_t rc = fds_record_delete(&desc);
-    if (rc != NRF_SUCCESS) {
-        NRF_LOG_WARNING("Record id=%08x deletion failed with rc=%d!", fds_operation_info.record_id, rc);
-        return false;
-    }
-
-    while (!fds_operation_info.success) {
-        __NOP();
-    }
-
-    NRF_LOG_INFO("Record id=%08x deleted successfully", fds_operation_info.record_id);
-    return true;
+    ret_code_t result = fds_gc_locked();
+    fds_finish(result);
+    return result == NRF_SUCCESS;
 }
 
 bool fds_wipe(void) {
-    NRF_LOG_INFO("Full fds wipe requested");
-    fds_operation_info.ignore_pm = false;  // wipe should also delete peer manager files.
-    while (fds_next_record_delete_sync()) {
-        bsp_wdt_feed();
+    if (!fds_lock(true)) {
+        return false;
     }
-    fds_gc_sync();
-    return true;
+
+    bool previous_ignore_pm;
+    CRITICAL_REGION_ENTER();
+    previous_ignore_pm = m_fds_state.ignore_pm;
+    m_fds_state.ignore_pm = false;
+    CRITICAL_REGION_EXIT();
+
+    ret_code_t result = NRF_SUCCESS;
+    while (result == NRF_SUCCESS) {
+        fds_find_token_t token = {0};
+        fds_record_desc_t record_desc = {0};
+        result = fds_record_iterate(&record_desc, &token);
+        if (result == FDS_ERR_NOT_FOUND) {
+            result = NRF_SUCCESS;
+            break;
+        }
+        if (result == NRF_SUCCESS) {
+            result = fds_delete_record_locked(&record_desc);
+        }
+    }
+    if (result == NRF_SUCCESS) {
+        result = fds_gc_locked();
+    }
+
+    CRITICAL_REGION_ENTER();
+    m_fds_state.ignore_pm = previous_ignore_pm;
+    CRITICAL_REGION_EXIT();
+    fds_finish(result);
+    return result == NRF_SUCCESS;
 }
