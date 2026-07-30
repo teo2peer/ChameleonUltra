@@ -2,6 +2,11 @@
 #include "syssleep.h"
 #include "dataframe.h"
 #include "netdata.h"
+#include "keyboard_hid.h"
+#include "settings.h"
+#if defined(PROJECT_CHAMELEON_ULTRA)
+#include "iso_dep_session.h"
+#endif
 
 #include "app_usbd.h"
 #include "app_usbd_cdc_acm.h"
@@ -132,6 +137,9 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
     switch (event) {
         case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN: {
             NRF_LOG_INFO("CDC ACM port opened");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
+#endif
             g_usb_port_opened = true;
             data_frame_reset_transport(DATA_FRAME_TRANSPORT_USB);
             m_usb_rx_length = 0;
@@ -143,6 +151,9 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
 
         case APP_USBD_CDC_ACM_USER_EVT_PORT_CLOSE:
             NRF_LOG_INFO("CDC ACM port closed");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
+#endif
             g_usb_port_opened = false;
             g_usb_led_marquee_enable = true;
             m_usb_rx_length = 0;
@@ -184,6 +195,19 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
             usb_rx_arm();
             break;
 
+        case APP_USBD_EVT_DRV_RESET:
+            NRF_LOG_INFO("USB RESET");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
+#endif
+            keyboard_hid_usb_reset();
+            g_usb_port_opened = false;
+            m_usb_rx_length = 0;
+            m_usb_rx_offset = 0;
+            data_frame_reset_transport(DATA_FRAME_TRANSPORT_USB);
+            usb_tx_clear();
+            break;
+
         case APP_USBD_EVT_STARTED:
             NRF_LOG_INFO("USB STARTED");
             usb_tx_start();
@@ -192,6 +216,10 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
 
         case APP_USBD_EVT_STOPPED:
             NRF_LOG_INFO("USB STOPPED");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
+#endif
+            g_usb_port_opened = false;
             app_usbd_disable();
             break;
 
@@ -207,7 +235,12 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
         case APP_USBD_EVT_POWER_REMOVED:
             sleep_timer_start(SLEEP_DELAY_MS_USB_POWER_DISCONNECTED);
             NRF_LOG_INFO("USB power removed");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
+#endif
+            keyboard_hid_usb_reset();
             g_usb_connected = false;
+            g_usb_port_opened = false;
             g_usb_led_marquee_enable = false;
             m_usb_rx_length = 0;
             m_usb_rx_offset = 0;
@@ -244,6 +277,14 @@ void usb_cdc_init(void) {
     app_usbd_class_inst_t const *class_cdc_acm = app_usbd_cdc_acm_class_inst_get(&m_app_cdc_acm);
     ret = app_usbd_class_append(class_cdc_acm);
     APP_ERROR_CHECK(ret);
+
+    // Keyboard HID is opt-in: only expose the composite USB HID keyboard
+    // interface when the feature is enabled. A USB interface set is fixed at
+    // enumeration, so toggling the setting requires a device reboot to apply.
+    if (settings_get_keyboard_hid_enable_first_load()) {
+        ret = app_usbd_class_append(keyboard_hid_usb_class_instance());
+        APP_ERROR_CHECK(ret);
+    }
 
     data_frame_set_flow_callback(DATA_FRAME_TRANSPORT_USB, usb_rx_resume);
     data_frame_set_ready_callback(DATA_FRAME_TRANSPORT_USB, usb_response_ready);
@@ -301,4 +342,8 @@ int fputc(int ch, FILE *f){
 
 bool is_usb_working(void) {
     return g_usb_port_opened;
+}
+
+bool is_usb_tx_idle(void) {
+    return m_usb_tx_count == 0 && !m_usb_tx_active;
 }

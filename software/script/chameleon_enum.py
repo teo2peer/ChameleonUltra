@@ -60,6 +60,19 @@ class Command(enum.IntEnum):
     GET_SLEEP_TIMEOUT = 1039
     SET_SLEEP_TIMEOUT = 1040
 
+    KEYBOARD_UPLOAD_BEGIN = 1041
+    KEYBOARD_UPLOAD_CHUNK = 1042
+    KEYBOARD_UPLOAD_COMMIT = 1043
+    KEYBOARD_RUN = 1044
+    KEYBOARD_CANCEL = 1045
+    KEYBOARD_GET_STATUS = 1046
+    KEYBOARD_CLEAR = 1047
+    KEYBOARD_SET_TEMP_BLE_NAME = 1048
+    KEYBOARD_ARM_BLE = 1049
+    ACTIVE_SLOT_SNAPSHOT = 1050
+    GET_KEYBOARD_HID_ENABLE = 1051
+    SET_KEYBOARD_HID_ENABLE = 1052
+
     HF14A_SCAN = 2000
     MF1_DETECT_SUPPORT = 2001
     MF1_DETECT_PRNG = 2002
@@ -169,6 +182,10 @@ class Command(enum.IntEnum):
     HF14A_4_EMV_TRACE_META = 6008
     HF14A_4_EMV_TRACE_GET = 6009
     HF14A_4_DEBUG_COUNTERS = 6010
+    HF14A_4_READER_SESSION_START = 6011
+    HF14A_4_READER_SESSION_EXCHANGE = 6012
+    HF14A_4_READER_SESSION_STOP = 6013
+    HF14A_4_READER_SESSION_START_APPLE_TRANSIT = 6014
 
     EM410X_SET_EMU_ID = 5000
     EM410X_GET_EMU_ID = 5001
@@ -239,6 +256,9 @@ class Command(enum.IntEnum):
     BLE_KICK           = 7047
     BLE_ADV_FLOOD_START = 7050
     BLE_ADV_FLOOD_STOP  = 7051
+    BLE_ADV_LAB_START   = 7052
+    BLE_ADV_LAB_STATUS  = 7053
+    BLE_ADV_LAB_STOP    = 7054
 
 
 @enum.unique
@@ -660,6 +680,7 @@ class ButtonPressFunction(enum.IntEnum):
     CLONE = 3
     BATTERY = 4
     FIELDGEN = 5
+    READERKEYS = 6
 
     def __str__(self):
         if self == ButtonPressFunction.NONE:
@@ -674,6 +695,8 @@ class ButtonPressFunction(enum.IntEnum):
             return "Show Battery Level"
         elif self == ButtonPressFunction.FIELDGEN:
             return "Toggle NFC Field Generator"
+        elif self == ButtonPressFunction.READERKEYS:
+            return "Toggle reader-key capture"
         return "None"
 
 

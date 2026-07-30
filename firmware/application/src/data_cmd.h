@@ -48,6 +48,18 @@
 #define DATA_CMD_GET_ALL_SLOT_NICKS             (1038)
 #define DATA_CMD_GET_SLEEP_TIMEOUT              (1039)
 #define DATA_CMD_SET_SLEEP_TIMEOUT              (1040)
+#define DATA_CMD_KEYBOARD_UPLOAD_BEGIN          (1041)
+#define DATA_CMD_KEYBOARD_UPLOAD_CHUNK          (1042)
+#define DATA_CMD_KEYBOARD_UPLOAD_COMMIT         (1043)
+#define DATA_CMD_KEYBOARD_RUN                   (1044)
+#define DATA_CMD_KEYBOARD_CANCEL                (1045)
+#define DATA_CMD_KEYBOARD_GET_STATUS            (1046)
+#define DATA_CMD_KEYBOARD_CLEAR                 (1047)
+#define DATA_CMD_KEYBOARD_SET_TEMP_BLE_NAME     (1048)
+#define DATA_CMD_KEYBOARD_ARM_BLE               (1049)
+#define DATA_CMD_ACTIVE_SLOT_SNAPSHOT            (1050)
+#define DATA_CMD_GET_KEYBOARD_HID_ENABLE        (1051)
+#define DATA_CMD_SET_KEYBOARD_HID_ENABLE        (1052)
 
 //
 // ******************************************************************
@@ -189,6 +201,10 @@
 #define DATA_CMD_HF14A_4_EMV_TRACE_META         (6008)  /* get retained EMV trace metadata      */
 #define DATA_CMD_HF14A_4_EMV_TRACE_GET          (6009)  /* page retained EMV trace records      */
 #define DATA_CMD_HF14A_4_DEBUG_COUNTERS         (6010)  /* T=CL debug counters (diagnostics)    */
+#define DATA_CMD_HF14A_4_READER_SESSION_START   (6011)  /* select/RATS and open reader session  */
+#define DATA_CMD_HF14A_4_READER_SESSION_EXCHANGE (6012) /* exchange APDU in active session      */
+#define DATA_CMD_HF14A_4_READER_SESSION_STOP    (6013)  /* deselect and close reader session    */
+#define DATA_CMD_HF14A_4_READER_SESSION_START_APPLE_TRANSIT (6014) /* Apple Transit annotated START */
 
 #define DATA_CMD_EM410X_SET_EMU_ID              (5000)
 #define DATA_CMD_EM410X_GET_EMU_ID              (5001)
@@ -280,5 +296,11 @@
 #define DATA_CMD_BLE_KICK                       (7047)  /* scope[1]|cycles[1] — 1..10 disconnect cycles             */
 #define DATA_CMD_BLE_ADV_FLOOD_START            (7050)  /* scope[1]|fill_byte[1]|interval_units[1] — 2.4 GHz broadcast */
 #define DATA_CMD_BLE_ADV_FLOOD_STOP             (7051)  /* stop environment-wide broadcast spam                      */
+
+// Advertising lab. These commands create validated legacy AD structures
+// supplied by the host; no profile can force a peer to connect.
+#define DATA_CMD_BLE_ADV_LAB_START              (7052)  /* start vendor-neutral custom/raw/rotating advertisement     */
+#define DATA_CMD_BLE_ADV_LAB_STATUS             (7053)  /* read advertising-lab state                                 */
+#define DATA_CMD_BLE_ADV_LAB_STOP               (7054)  /* stop lab advertisement and restore normal advertising      */
 
 #endif

@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "fds_util.h"
 #include "bsp_time.h"
 #include "bsp_delay.h"
@@ -10,18 +12,23 @@
 #include "data_cmd.h"
 #include "app_cmd.h"
 #include "app_cmd_ble.h"
+#include "app_cmd_keyboard.h"
 #include "app_status.h"
 #include "tag_persistence.h"
 #include "nrf_pwr_mgmt.h"
 #include "settings.h"
+#include "device_settings_payload_internal.h"
 #include "delayed_reset.h"
 #include "netdata.h"
+#include "app_timer.h"
+#include "active_slot_snapshot_internal.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "bsp_wdt.h"
 #include "lf_reader_generic.h"
 #include "lf_em4x05_data.h"
 #include "rc522.h"
 #include "iso_dep_reader.h"
+#include "iso_dep_session.h"
 #include "emv_trace.h"
 #include "mf1_crapto1.h"
 #include "parity.h"
@@ -41,12 +48,59 @@ extern void nfc_tag_14a_set_sniff_passive(bool passive);
 #include "nrf_log_default_backends.h"
 NRF_LOG_MODULE_REGISTER();
 
+static active_slot_snapshot_transaction_t m_active_slot_snapshot;
+static uint32_t m_last_snapshot_revision;
 
-static void change_slot_auto(uint8_t slot_new) {
+static uint16_t active_slot_snapshot_block_count(tag_specific_type_t type) {
+    switch (type) {
+        case TAG_TYPE_MIFARE_Mini: return 20u;
+        case TAG_TYPE_MIFARE_1024: return 64u;
+        case TAG_TYPE_MIFARE_2048: return 128u;
+        case TAG_TYPE_MIFARE_4096: return 256u;
+        default: return 0u;
+    }
+}
+
+static uint32_t active_slot_snapshot_new_revision(void) {
+    uint32_t revision;
+    do {
+        revision = ((uint32_t)(unsigned int)rand() << 16) ^
+                   (uint32_t)(unsigned int)rand();
+    } while (revision == 0u || revision == m_last_snapshot_revision);
+    m_last_snapshot_revision = revision;
+    return revision;
+}
+
+void app_cmd_active_slot_snapshot_process(void) {
+    if (!m_active_slot_snapshot.active) return;
+    uint32_t now = app_timer_cnt_get();
+    uint32_t idle_elapsed = app_timer_cnt_diff_compute(
+                                now, m_active_slot_snapshot.last_activity);
+    uint32_t absolute_elapsed = app_timer_cnt_diff_compute(
+                                    now, m_active_slot_snapshot.started_at);
+    if (!active_slot_snapshot_transaction_expired(
+                &m_active_slot_snapshot, idle_elapsed, absolute_elapsed,
+                APP_TIMER_TICKS(ACTIVE_SLOT_SNAPSHOT_IDLE_LEASE_MS),
+                APP_TIMER_TICKS(ACTIVE_SLOT_SNAPSHOT_ABSOLUTE_LEASE_MS))) return;
+
+    active_slot_snapshot_transaction_clear(&m_active_slot_snapshot);
+    tag_emulation_snapshot_release();
+    NRF_LOG_WARNING("Active-slot snapshot lease expired.");
+}
+
+bool app_cmd_active_slot_snapshot_is_active(void) {
+    return m_active_slot_snapshot.active;
+}
+
+
+static bool change_slot_auto(uint8_t slot_new) {
     uint8_t slot_now = tag_emulation_get_slot();
     device_mode_t mode = get_device_mode();
-    tag_emulation_change_slot(slot_new, mode != DEVICE_MODE_READER);
+    if (!tag_emulation_change_slot(slot_new, mode != DEVICE_MODE_READER)) {
+        return false;
+    }
     apply_slot_change(slot_now, slot_new);
+    return true;
 }
 
 typedef struct {
@@ -182,16 +236,20 @@ static data_frame_tx_t *cmd_processor_reset_settings(uint16_t cmd, uint16_t stat
 }
 
 static data_frame_tx_t *cmd_processor_get_device_settings(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t settings[7 + BLE_PAIRING_KEY_LEN] = {};
-    settings[0] = SETTINGS_CURRENT_VERSION; // current version
-    settings[1] = settings_get_animation_config(); // animation mode
-    settings[2] = settings_get_button_press_config('A'); // short A button press mode
-    settings[3] = settings_get_button_press_config('B'); // short B button press mode
-    settings[4] = settings_get_long_button_press_config('A'); // long A button press mode
-    settings[5] = settings_get_long_button_press_config('B'); // long B button press mode
-    settings[6] = settings_get_ble_pairing_enable(); // is device require pairing
-    memcpy(settings + 7, settings_get_ble_connect_key(), BLE_PAIRING_KEY_LEN);
-    return data_frame_make(cmd, STATUS_SUCCESS, 7 + BLE_PAIRING_KEY_LEN, settings);
+    uint8_t settings[DEVICE_SETTINGS_V6_PAYLOAD_SIZE] = {};
+    device_settings_payload_v6(
+        settings,
+        SETTINGS_CURRENT_VERSION,
+        settings_get_animation_config(),
+        settings_get_button_press_config('A'),
+        settings_get_button_press_config('B'),
+        settings_get_long_button_press_config('A'),
+        settings_get_long_button_press_config('B'),
+        settings_get_ble_pairing_enable(),
+        settings_get_ble_connect_key(),
+        settings_get_sleep_timeout()
+    );
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(settings), settings);
 }
 
 static data_frame_tx_t *cmd_processor_set_animation_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -272,6 +330,21 @@ static data_frame_tx_t *cmd_processor_set_ble_pairing_enable(uint16_t cmd, uint1
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     settings_set_ble_pairing_enable(data[0]);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_get_keyboard_hid_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t is_enable = settings_get_keyboard_hid_enable();
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &is_enable);
+}
+
+static data_frame_tx_t *cmd_processor_set_keyboard_hid_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 1 || data[0] > 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    // Persisted by SAVE_SETTINGS; requires a reboot to (un)expose the USB HID
+    // interface and register/tear down the BLE HID service at boot.
+    settings_set_keyboard_hid_enable(data[0]);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
@@ -623,6 +696,7 @@ static data_frame_tx_t *cmd_processor_hf14a_set_field_on(uint16_t cmd, uint16_t 
         return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
     }
 
+    iso_dep_session_abort();
     // Reset and turn on the antenna
     pcd_14a_reader_reset();
     pcd_14a_reader_antenna_on();
@@ -637,8 +711,12 @@ static data_frame_tx_t *cmd_processor_hf14a_set_field_off(uint16_t cmd, uint16_t
         return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
     }
 
-    // Turn off the antenna
-    pcd_14a_reader_antenna_off();
+    // Turn off the antenna and invalidate any state tied to the powered card.
+    if (iso_dep_session_is_active()) {
+        iso_dep_session_abort();
+    } else {
+        pcd_14a_reader_antenna_off();
+    }
 
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
@@ -670,6 +748,11 @@ static data_frame_tx_t *cmd_processor_hf14a_raw(uint16_t cmd, uint16_t status, u
             (append_crc && (data_bitlength == 0u || (data_bitlength & 7u) != 0u))) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
+
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    /* Raw RF operations can reset, reselect, or power down the target. */
+    iso_dep_session_abort();
+#endif
 
     uint8_t tx[DEF_FIFO_LENGTH] = {0};
     if (data_bytes > 0u) memcpy(tx, &data[RAW_HEADER_LENGTH], data_bytes);
@@ -1073,8 +1156,8 @@ static data_frame_tx_t *cmd_processor_set_active_slot(uint16_t cmd, uint16_t sta
     if (length != 1 || data[0] >= TAG_MAX_SLOT_NUM) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    change_slot_auto(data[0]);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    status = change_slot_auto(data[0]) ? STATUS_SUCCESS : STATUS_FLASH_WRITE_FAIL;
+    return data_frame_make(cmd, status, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_set_slot_tag_type(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1107,8 +1190,9 @@ static data_frame_tx_t *cmd_processor_delete_slot_sense_type(uint16_t cmd, uint1
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
-    tag_emulation_delete_data(payload->num_slot, payload->sense_type);
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    status = tag_emulation_delete_data(payload->num_slot, payload->sense_type)
+             ? STATUS_SUCCESS : STATUS_FLASH_WRITE_FAIL;
+    return data_frame_make(cmd, status, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_set_slot_data_default(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1125,7 +1209,15 @@ static data_frame_tx_t *cmd_processor_set_slot_data_default(uint16_t cmd, uint16
     if (payload->num_slot >= TAG_MAX_SLOT_NUM || !is_tag_specific_type_valid(tag_type)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
-    status = tag_emulation_factory_data(payload->num_slot, tag_type) ? STATUS_SUCCESS : STATUS_NOT_IMPLEMENTED;
+    tag_slot_specific_type_t configured;
+    tag_emulation_get_specific_types_by_slot(payload->num_slot, &configured);
+    tag_specific_type_t configured_type = get_sense_type_from_tag_type(tag_type) == TAG_SENSE_HF
+                                          ? configured.tag_hf : configured.tag_lf;
+    if (configured_type != tag_type) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    status = tag_emulation_factory_data(payload->num_slot, tag_type)
+             ? STATUS_SUCCESS : STATUS_FLASH_WRITE_FAIL;
     return data_frame_make(cmd, status, 0, NULL);
 }
 
@@ -1145,8 +1237,9 @@ static data_frame_tx_t *cmd_processor_set_slot_enable(uint16_t cmd, uint16_t sta
     }
 
     uint8_t slot_now = payload->slot_index;
+    bool was_enabled = is_slot_enabled(slot_now, payload->sense_type);
     tag_emulation_slot_set_enable(slot_now, payload->sense_type, payload->enabled);
-    if ((!payload->enabled) &&
+    if (slot_now == tag_emulation_get_slot() && (!payload->enabled) &&
             (!is_slot_enabled(slot_now, payload->sense_type == TAG_SENSE_HF ? TAG_SENSE_LF : TAG_SENSE_HF))) {
         // HF and LF disabled, need to change slot
         uint8_t slot_prev = tag_emulation_slot_find_next(slot_now);
@@ -1154,16 +1247,25 @@ static data_frame_tx_t *cmd_processor_set_slot_enable(uint16_t cmd, uint16_t sta
         if (slot_prev == slot_now) {
             set_slot_light_color(RGB_MAGENTA);
         } else {
-            change_slot_auto(slot_prev);
+            if (!change_slot_auto(slot_prev)) {
+                tag_emulation_slot_set_enable(slot_now, payload->sense_type, was_enabled);
+                if (get_device_mode() != DEVICE_MODE_READER) {
+                    tag_emulation_sense_run();
+                }
+                return data_frame_make(cmd, STATUS_FLASH_WRITE_FAIL, 0, NULL);
+            }
         }
+    }
+    if (slot_now == tag_emulation_get_slot() && get_device_mode() != DEVICE_MODE_READER) {
+        tag_emulation_sense_switch(payload->sense_type, payload->enabled);
     }
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_slot_data_config_save(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
-    tag_emulation_save();
-    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+    status = tag_emulation_save() ? STATUS_SUCCESS : STATUS_FLASH_WRITE_FAIL;
+    return data_frame_make(cmd, status, 0, NULL);
 }
 
 static data_frame_tx_t *cmd_processor_get_active_slot(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1198,7 +1300,8 @@ static data_frame_tx_t *cmd_processor_wipe_fds(uint16_t cmd, uint16_t status, ui
 static bool get_active_em410x_type(tag_specific_type_t *tag_type_out, uint16_t *id_size_out) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
-    if (tag_types.tag_lf == TAG_TYPE_EM410X || tag_types.tag_lf == TAG_TYPE_EM410X_ELECTRA) {
+    if ((tag_types.tag_lf == TAG_TYPE_EM410X || tag_types.tag_lf == TAG_TYPE_EM410X_ELECTRA) &&
+            tag_emulation_is_active_type_loaded(tag_types.tag_lf)) {
         *tag_type_out = tag_types.tag_lf;
         *id_size_out = (tag_types.tag_lf == TAG_TYPE_EM410X_ELECTRA) ? LF_EM410X_ELECTRA_TAG_ID_SIZE : LF_EM410X_TAG_ID_SIZE;
         return true;
@@ -1265,7 +1368,8 @@ static data_frame_tx_t *cmd_processor_hidprox_set_emu_id(uint16_t cmd, uint16_t 
 static data_frame_tx_t *cmd_processor_hidprox_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
-    if (tag_types.tag_lf != TAG_TYPE_HID_PROX) {
+    if (tag_types.tag_lf != TAG_TYPE_HID_PROX ||
+            !tag_emulation_is_active_type_loaded(TAG_TYPE_HID_PROX)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, data);  // no data in slot, don't send garbage
     }
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_HID_PROX);
@@ -1285,7 +1389,8 @@ static data_frame_tx_t *cmd_processor_idteck_set_emu_id(uint16_t cmd, uint16_t s
 static data_frame_tx_t *cmd_processor_idteck_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
-    if (tag_types.tag_lf != TAG_TYPE_IDTECK) {
+    if (tag_types.tag_lf != TAG_TYPE_IDTECK ||
+            !tag_emulation_is_active_type_loaded(TAG_TYPE_IDTECK)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, data);
     }
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_IDTECK);
@@ -1319,7 +1424,8 @@ static data_frame_tx_t *cmd_processor_idteck_write_to_t55xx(uint16_t cmd, uint16
 static data_frame_tx_t *cmd_processor_ioprox_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
-    if (tag_types.tag_lf != TAG_TYPE_IOPROX) {
+    if (tag_types.tag_lf != TAG_TYPE_IOPROX ||
+            !tag_emulation_is_active_type_loaded(TAG_TYPE_IOPROX)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, data);  // no data in slot, don't send garbage
     }
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_IOPROX);
@@ -1334,7 +1440,8 @@ static data_frame_tx_t *cmd_processor_viking_set_emu_id(uint16_t cmd, uint16_t s
 static data_frame_tx_t *cmd_processor_viking_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
-    if (tag_types.tag_lf != TAG_TYPE_VIKING) {
+    if (tag_types.tag_lf != TAG_TYPE_VIKING ||
+            !tag_emulation_is_active_type_loaded(TAG_TYPE_VIKING)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, data);  // no data in slot, don't send garbage
     }
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_VIKING);
@@ -1349,7 +1456,8 @@ static data_frame_tx_t *cmd_processor_pac_set_emu_id(uint16_t cmd, uint16_t stat
 static data_frame_tx_t *cmd_processor_pac_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
-    if (tag_types.tag_lf != TAG_TYPE_PAC) {
+    if (tag_types.tag_lf != TAG_TYPE_PAC ||
+            !tag_emulation_is_active_type_loaded(TAG_TYPE_PAC)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, data);
     }
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_PAC);
@@ -1364,12 +1472,167 @@ static data_frame_tx_t *cmd_processor_jablotron_set_emu_id(uint16_t cmd, uint16_
 static data_frame_tx_t *cmd_processor_jablotron_get_emu_id(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     tag_slot_specific_type_t tag_types;
     tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &tag_types);
-    if (tag_types.tag_lf != TAG_TYPE_JABLOTRON) {
+    if (tag_types.tag_lf != TAG_TYPE_JABLOTRON ||
+            !tag_emulation_is_active_type_loaded(TAG_TYPE_JABLOTRON)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, data);
     }
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_JABLOTRON);
     return data_frame_make(cmd, STATUS_SUCCESS, LF_JABLOTRON_TAG_ID_SIZE, buffer->buffer);
 }
+
+static bool is_mf1_emulator_type(tag_specific_type_t type) {
+    return type == TAG_TYPE_MIFARE_Mini || type == TAG_TYPE_MIFARE_1024 ||
+           type == TAG_TYPE_MIFARE_2048 || type == TAG_TYPE_MIFARE_4096;
+}
+
+static void active_slot_snapshot_encode_u32(uint8_t *out, uint32_t value) {
+    out[0] = (uint8_t)(value >> 24);
+    out[1] = (uint8_t)(value >> 16);
+    out[2] = (uint8_t)(value >> 8);
+    out[3] = (uint8_t)value;
+}
+
+static data_frame_tx_t *cmd_processor_active_slot_snapshot(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (data == NULL || length < 2u || data[0] != ACTIVE_SLOT_SNAPSHOT_VERSION ||
+            data[1] > ACTIVE_SLOT_SNAPSHOT_OP_ABORT) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    data_frame_transport_t transport = data_frame_get_transport();
+    uint8_t operation = data[1];
+    if (operation == ACTIVE_SLOT_SNAPSHOT_OP_BEGIN) {
+        if (length != ACTIVE_SLOT_SNAPSHOT_BEGIN_REQUEST_SIZE) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+        if (m_active_slot_snapshot.active || transport == DATA_FRAME_TRANSPORT_NONE ||
+                get_device_mode() != DEVICE_MODE_TAG) {
+            return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+        }
+
+        uint8_t slot;
+        tag_specific_type_t tag_type;
+        uint32_t owner_generation;
+        uint32_t revision = active_slot_snapshot_new_revision();
+        if (!tag_emulation_snapshot_begin(&slot, &tag_type, &owner_generation) ||
+                owner_generation == 0u) {
+            return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+        }
+        if (!active_slot_snapshot_transaction_begin(
+                    &m_active_slot_snapshot, (uint8_t)transport, slot,
+                    (uint16_t)tag_type, revision, app_timer_cnt_get())) {
+            tag_emulation_snapshot_release();
+            return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+        }
+
+        uint8_t response[ACTIVE_SLOT_SNAPSHOT_BEGIN_RESPONSE_SIZE] = {
+            ACTIVE_SLOT_SNAPSHOT_VERSION,
+            ACTIVE_SLOT_SNAPSHOT_OP_BEGIN,
+            slot,
+            (uint8_t)((uint16_t)tag_type >> 8),
+            (uint8_t)tag_type,
+        };
+        active_slot_snapshot_encode_u32(&response[5], owner_generation);
+        active_slot_snapshot_encode_u32(&response[9], revision);
+        return data_frame_make(cmd, STATUS_SUCCESS, sizeof(response), response);
+    }
+
+    if (length != ACTIVE_SLOT_SNAPSHOT_END_REQUEST_SIZE) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t revision = cmd_read_u32be(&data[2]);
+    if (!active_slot_snapshot_transaction_matches(
+                &m_active_slot_snapshot, (uint8_t)transport, revision)) {
+        return data_frame_make(cmd, m_active_slot_snapshot.active
+                               ? STATUS_CMD_ERR : STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+
+    if (operation == ACTIVE_SLOT_SNAPSHOT_OP_SAVE_RELEASE) {
+        uint32_t now = app_timer_cnt_get();
+        uint32_t absolute_elapsed = app_timer_cnt_diff_compute(
+                                        now, m_active_slot_snapshot.started_at);
+        if (!active_slot_snapshot_transaction_begin_commit(
+                    &m_active_slot_snapshot, (uint8_t)transport, absolute_elapsed,
+                    APP_TIMER_TICKS(ACTIVE_SLOT_SNAPSHOT_ABSOLUTE_LEASE_MS),
+                    APP_TIMER_TICKS(ACTIVE_SLOT_SNAPSHOT_COMMIT_MAX_MS))) {
+            return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+        }
+        tag_snapshot_save_result_t result = tag_emulation_snapshot_save(
+                                                m_active_slot_snapshot.slot,
+                                                (tag_specific_type_t)m_active_slot_snapshot.tag_type);
+        active_slot_snapshot_transaction_finish_commit(
+            &m_active_slot_snapshot, (uint8_t)transport, app_timer_cnt_get());
+        if (result == TAG_SNAPSHOT_SAVE_FLASH_FAIL) {
+            return data_frame_make(cmd, STATUS_FLASH_WRITE_FAIL, 0, NULL);
+        }
+        if (result != TAG_SNAPSHOT_SAVE_OK) {
+            return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+        }
+    }
+
+    active_slot_snapshot_transaction_clear(&m_active_slot_snapshot);
+    tag_emulation_snapshot_release();
+    uint8_t response[ACTIVE_SLOT_SNAPSHOT_END_RESPONSE_SIZE] = {
+        ACTIVE_SLOT_SNAPSHOT_VERSION,
+        operation,
+    };
+    active_slot_snapshot_encode_u32(&response[2], revision);
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(response), response);
+}
+
+static bool is_mf0_ntag_emulator_type(tag_specific_type_t type) {
+    switch (type) {
+        case TAG_TYPE_MF0ICU1:
+        case TAG_TYPE_MF0ICU2:
+        case TAG_TYPE_MF0UL11:
+        case TAG_TYPE_MF0UL21:
+        case TAG_TYPE_NTAG_210:
+        case TAG_TYPE_NTAG_212:
+        case TAG_TYPE_NTAG_213:
+        case TAG_TYPE_NTAG_215:
+        case TAG_TYPE_NTAG_216:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static data_frame_tx_t *before_hf_emulator_loaded(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    tag_slot_specific_type_t types;
+    tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &types);
+    if (!tag_emulation_is_active_type_loaded(types.tag_hf)) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    return NULL;
+}
+
+static data_frame_tx_t *before_mf1_emulator_loaded(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    tag_slot_specific_type_t types;
+    tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &types);
+    if (!is_mf1_emulator_type(types.tag_hf) ||
+            !tag_emulation_is_active_type_loaded(types.tag_hf)) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    return NULL;
+}
+
+static data_frame_tx_t *before_mf0_ntag_emulator_loaded(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    tag_slot_specific_type_t types;
+    tag_emulation_get_specific_types_by_slot(tag_emulation_get_slot(), &types);
+    if (!is_mf0_ntag_emulator_type(types.tag_hf) ||
+            !tag_emulation_is_active_type_loaded(types.tag_hf)) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    return NULL;
+}
+
+#if defined(PROJECT_CHAMELEON_ULTRA)
+static data_frame_tx_t *before_hf14a_4_emulator_loaded(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!tag_emulation_is_active_type_loaded(TAG_TYPE_HF14A_4)) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    return NULL;
+}
+#endif
 
 static nfc_tag_14a_coll_res_reference_t *get_coll_res_data(bool write) {
     nfc_tag_14a_coll_res_reference_t *info;
@@ -1821,8 +2084,8 @@ static data_frame_tx_t *cmd_processor_delete_slot_tag_nick(uint16_t cmd, uint16_
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     get_fds_map_by_slot_sense_type_for_nick(slot, sense_type, &map_info);
-    bool ret = fds_delete_sync(map_info.id, map_info.key);
-    if (!ret) {
+    (void)fds_delete_sync(map_info.id, map_info.key);
+    if (fds_util_last_error() != NRF_SUCCESS) {
         return data_frame_make(cmd, STATUS_FLASH_WRITE_FAIL, 0, NULL);
     }
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
@@ -2003,6 +2266,7 @@ static data_frame_tx_t *before_reader_run(uint16_t cmd, uint16_t status, uint16_
 static data_frame_tx_t *before_hf_reader_run(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     data_frame_tx_t *ret = before_reader_run(cmd, status, length, data);
     if (ret == NULL) {
+        iso_dep_session_abort();
         pcd_14a_reader_reset();
         pcd_14a_reader_antenna_on();
         bsp_delay_ms(8);
@@ -2659,6 +2923,111 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
     }
     return data_frame_make(cmd, STATUS_HF_TAG_OK,
                            exchange.response_len, resp_chain);
+}
+
+static uint16_t iso_dep_session_failure_status(const iso_dep_result_t *result) {
+    if (result->error == ISO_DEP_ERR_CRC) return STATUS_HF_ERR_CRC;
+    if (result->error == ISO_DEP_ERR_TIMEOUT || result->rf_status == STATUS_HF_TAG_NO) {
+        return STATUS_HF_TAG_NO;
+    }
+    switch (result->rf_status) {
+        case STATUS_HF_ERR_STAT:
+        case STATUS_HF_ERR_CRC:
+        case STATUS_HF_COLLISION:
+        case STATUS_HF_ERR_BCC:
+        case STATUS_HF_ERR_PARITY:
+        case STATUS_HF_ERR_ATS:
+            return result->rf_status;
+        default:
+            return STATUS_HF_ERR_STAT;
+    }
+}
+
+static data_frame_tx_t *cmd_processor_hf14a_4_reader_session_start(
+    uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    iso_dep_session_abort();
+    if (!cmd_payload_empty(length)) {
+        pcd_14a_reader_polling_annotation_clear();
+        pcd_14a_reader_antenna_off();
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    picc_14a_tag_t tag;
+    uint32_t session_id;
+    status = cmd == DATA_CMD_HF14A_4_READER_SESSION_START_APPLE_TRANSIT ?
+             iso_dep_session_start_apple_transit(&tag, &session_id) :
+             iso_dep_session_start(&tag, &session_id);
+    if (status != STATUS_HF_TAG_OK) {
+        uint8_t diagnostics[2] = {
+            status == STATUS_HF_ERR_ATS ? 0x02u : 0x01u,
+            (uint8_t)status,
+        };
+        return data_frame_make(cmd, status, sizeof(diagnostics), diagnostics);
+    }
+
+    static uint8_t payload[4u + 1u + sizeof(tag.uid) + sizeof(tag.atqa) +
+                           sizeof(tag.sak) + 1u + sizeof(tag.ats)];
+    uint16_t offset = 0u;
+    payload[offset++] = (uint8_t)(session_id >> 24);
+    payload[offset++] = (uint8_t)(session_id >> 16);
+    payload[offset++] = (uint8_t)(session_id >> 8);
+    payload[offset++] = (uint8_t)session_id;
+    payload[offset++] = tag.uid_len;
+    memcpy(&payload[offset], tag.uid, tag.uid_len);
+    offset += tag.uid_len;
+    memcpy(&payload[offset], tag.atqa, sizeof(tag.atqa));
+    offset += sizeof(tag.atqa);
+    payload[offset++] = tag.sak;
+    payload[offset++] = tag.ats_len;
+    memcpy(&payload[offset], tag.ats, tag.ats_len);
+    offset += tag.ats_len;
+    return data_frame_make(cmd, STATUS_HF_TAG_OK, offset, payload);
+}
+
+static data_frame_tx_t *cmd_processor_hf14a_4_reader_session_exchange(
+    uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length < 5u || length > 4u + 512u || data == NULL) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (get_device_mode() != DEVICE_MODE_READER) {
+        iso_dep_session_abort();
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+
+    static uint8_t response[ISO_DEP_READER_MAX_APDU_RESPONSE];
+    iso_dep_result_t exchange;
+    iso_dep_session_exchange_status_t exchange_status = iso_dep_session_exchange(
+        cmd_read_u32be(data), &data[4], length - 4u,
+        response, sizeof(response), &exchange);
+    if (exchange_status == ISO_DEP_SESSION_EXCHANGE_INVALID) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (exchange_status == ISO_DEP_SESSION_EXCHANGE_RF_ERROR) {
+        uint8_t diagnostics[3] = {
+            (uint8_t)exchange.error,
+            exchange.rf_status,
+            exchange.wtx_count,
+        };
+        return data_frame_make(cmd, iso_dep_session_failure_status(&exchange),
+                               sizeof(diagnostics), diagnostics);
+    }
+    return data_frame_make(cmd, STATUS_HF_TAG_OK,
+                           exchange.response_len, response);
+}
+
+static data_frame_tx_t *cmd_processor_hf14a_4_reader_session_stop(
+    uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!cmd_payload_exact(length, data, 4u)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (get_device_mode() != DEVICE_MODE_READER) {
+        iso_dep_session_abort();
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    if (!iso_dep_session_stop(cmd_read_u32be(data))) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
 /* -----------------------------------------------------------------------
@@ -3515,9 +3884,21 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_DEVICE_CAPABILITIES,      NULL,                        cmd_processor_get_device_capabilities,       NULL                   },
     {    DATA_CMD_GET_BLE_PAIRING_ENABLE,       NULL,                        cmd_processor_get_ble_pairing_enable,        NULL                   },
     {    DATA_CMD_SET_BLE_PAIRING_ENABLE,       NULL,                        cmd_processor_set_ble_pairing_enable,        NULL                   },
+    {    DATA_CMD_GET_KEYBOARD_HID_ENABLE,      NULL,                        cmd_processor_get_keyboard_hid_enable,       NULL                   },
+    {    DATA_CMD_SET_KEYBOARD_HID_ENABLE,      NULL,                        cmd_processor_set_keyboard_hid_enable,       NULL                   },
     {    DATA_CMD_GET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_get_sleep_timeout,             NULL                   },
     {    DATA_CMD_SET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_set_sleep_timeout,             NULL                   },
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },
+    {    DATA_CMD_KEYBOARD_UPLOAD_BEGIN,        cmd_before_keyboard,         cmd_processor_keyboard_upload_begin,         NULL                   },
+    {    DATA_CMD_KEYBOARD_UPLOAD_CHUNK,        cmd_before_keyboard,         cmd_processor_keyboard_upload_chunk,         NULL                   },
+    {    DATA_CMD_KEYBOARD_UPLOAD_COMMIT,       cmd_before_keyboard,         cmd_processor_keyboard_upload_commit,        NULL                   },
+    {    DATA_CMD_KEYBOARD_RUN,                 cmd_before_keyboard,         cmd_processor_keyboard_run,                 NULL                   },
+    {    DATA_CMD_KEYBOARD_CANCEL,              cmd_before_keyboard,         cmd_processor_keyboard_cancel,              NULL                   },
+    {    DATA_CMD_KEYBOARD_GET_STATUS,          cmd_before_keyboard,         cmd_processor_keyboard_get_status,          NULL                   },
+    {    DATA_CMD_KEYBOARD_CLEAR,               cmd_before_keyboard,         cmd_processor_keyboard_clear,               NULL                   },
+    {    DATA_CMD_KEYBOARD_SET_TEMP_BLE_NAME,   cmd_before_keyboard,         cmd_processor_keyboard_set_temp_ble_name,   NULL                   },
+    {    DATA_CMD_KEYBOARD_ARM_BLE,             cmd_before_keyboard,         cmd_processor_keyboard_arm_ble,             NULL                   },
+    {    DATA_CMD_ACTIVE_SLOT_SNAPSHOT,          NULL,                        cmd_processor_active_slot_snapshot,          NULL                   },
 
     {    DATA_CMD_BLE_SCAN_START,               NULL,                        cmd_processor_ble_scan_start,                NULL                   },
     {    DATA_CMD_BLE_SCAN_STOP,                NULL,                        cmd_processor_ble_scan_stop,                 NULL                   },
@@ -3561,6 +3942,9 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_BLE_KICK,                     NULL,                        cmd_processor_ble_kick,                     NULL                   },
     {    DATA_CMD_BLE_ADV_FLOOD_START,          NULL,                        cmd_processor_ble_adv_flood_start,          NULL                   },
     {    DATA_CMD_BLE_ADV_FLOOD_STOP,           NULL,                        cmd_processor_ble_adv_flood_stop,           NULL                   },
+    {    DATA_CMD_BLE_ADV_LAB_START,            NULL,                        cmd_processor_ble_adv_lab_start,            NULL                   },
+    {    DATA_CMD_BLE_ADV_LAB_STATUS,           NULL,                        cmd_processor_ble_adv_lab_status,           NULL                   },
+    {    DATA_CMD_BLE_ADV_LAB_STOP,             NULL,                        cmd_processor_ble_adv_lab_stop,             NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
@@ -3615,51 +3999,51 @@ static cmd_data_map_t m_data_cmd_map[] = {
 
 #endif
 
-    {    DATA_CMD_HF14A_GET_ANTI_COLL_DATA,     NULL,                        cmd_processor_hf14a_get_anti_coll_data,      NULL                   },
-    {    DATA_CMD_HF14A_SET_ANTI_COLL_DATA,     NULL,                        cmd_processor_hf14a_set_anti_coll_data,      NULL                   },
+    {    DATA_CMD_HF14A_GET_ANTI_COLL_DATA,     before_hf_emulator_loaded,   cmd_processor_hf14a_get_anti_coll_data,      NULL                   },
+    {    DATA_CMD_HF14A_SET_ANTI_COLL_DATA,     before_hf_emulator_loaded,   cmd_processor_hf14a_set_anti_coll_data,      NULL                   },
 
-    {    DATA_CMD_MF1_WRITE_EMU_BLOCK_DATA,     NULL,                        cmd_processor_mf1_write_emu_block_data,      NULL                   },
-    {    DATA_CMD_MF1_SET_DETECTION_ENABLE,     NULL,                        cmd_processor_mf1_set_detection_enable,      NULL                   },
+    {    DATA_CMD_MF1_WRITE_EMU_BLOCK_DATA,     before_mf1_emulator_loaded,  cmd_processor_mf1_write_emu_block_data,      NULL                   },
+    {    DATA_CMD_MF1_SET_DETECTION_ENABLE,     before_mf1_emulator_loaded,  cmd_processor_mf1_set_detection_enable,      NULL                   },
     {    DATA_CMD_MF1_GET_DETECTION_COUNT,      NULL,                        cmd_processor_mf1_get_detection_count,       NULL                   },
     {    DATA_CMD_MF1_GET_DETECTION_LOG,        NULL,                        cmd_processor_mf1_get_detection_log,         NULL                   },
-    {    DATA_CMD_MF1_GET_DETECTION_ENABLE,     NULL,                        cmd_processor_mf1_get_detection_enable,      NULL                   },
-    {    DATA_CMD_MF1_READ_EMU_BLOCK_DATA,      NULL,                        cmd_processor_mf1_read_emu_block_data,       NULL                   },
-    {    DATA_CMD_MF1_GET_EMULATOR_CONFIG,      NULL,                        cmd_processor_mf1_get_emulator_config,       NULL                   },
-    {    DATA_CMD_MF1_GET_PRNG_TYPE,            NULL,                        cmd_processor_mf1_get_prng_type,             NULL                   },
-    {    DATA_CMD_MF1_SET_PRNG_TYPE,            NULL,                        cmd_processor_mf1_set_prng_type,             NULL                   },
-    {    DATA_CMD_MF1_SET_RANDOM_UID_MODE,      NULL,                        cmd_processor_mf1_set_random_uid_mode,       NULL                   },
-    {    DATA_CMD_MF1_GET_RANDOM_UID_MODE,      NULL,                        cmd_processor_mf1_get_random_uid_mode,       NULL                   },
+    {    DATA_CMD_MF1_GET_DETECTION_ENABLE,     before_mf1_emulator_loaded,  cmd_processor_mf1_get_detection_enable,      NULL                   },
+    {    DATA_CMD_MF1_READ_EMU_BLOCK_DATA,      before_mf1_emulator_loaded,  cmd_processor_mf1_read_emu_block_data,       NULL                   },
+    {    DATA_CMD_MF1_GET_EMULATOR_CONFIG,      before_mf1_emulator_loaded,  cmd_processor_mf1_get_emulator_config,       NULL                   },
+    {    DATA_CMD_MF1_GET_PRNG_TYPE,            before_mf1_emulator_loaded,  cmd_processor_mf1_get_prng_type,             NULL                   },
+    {    DATA_CMD_MF1_SET_PRNG_TYPE,            before_mf1_emulator_loaded,  cmd_processor_mf1_set_prng_type,             NULL                   },
+    {    DATA_CMD_MF1_SET_RANDOM_UID_MODE,      before_mf1_emulator_loaded,  cmd_processor_mf1_set_random_uid_mode,       NULL                   },
+    {    DATA_CMD_MF1_GET_RANDOM_UID_MODE,      before_mf1_emulator_loaded,  cmd_processor_mf1_get_random_uid_mode,       NULL                   },
     {    DATA_CMD_MF1_SET_READER_KEYS_ANIM,     NULL,                        cmd_processor_mf1_set_reader_keys_anim,      NULL                   },
-    {    DATA_CMD_MF1_GET_GEN1A_MODE,           NULL,                        cmd_processor_mf1_get_gen1a_mode,            NULL                   },
-    {    DATA_CMD_MF1_SET_GEN1A_MODE,           NULL,                        cmd_processor_mf1_set_gen1a_mode,            NULL                   },
-    {    DATA_CMD_MF1_GET_GEN2_MODE,            NULL,                        cmd_processor_mf1_get_gen2_mode,             NULL                   },
-    {    DATA_CMD_MF1_SET_GEN2_MODE,            NULL,                        cmd_processor_mf1_set_gen2_mode,             NULL                   },
-    {    DATA_CMD_MF1_GET_BLOCK_ANTI_COLL_MODE, NULL,                        cmd_processor_mf1_get_block_anti_coll_mode,  NULL                   },
-    {    DATA_CMD_MF1_SET_BLOCK_ANTI_COLL_MODE, NULL,                        cmd_processor_mf1_set_block_anti_coll_mode,  NULL                   },
-    {    DATA_CMD_MF1_GET_WRITE_MODE,           NULL,                        cmd_processor_mf1_get_write_mode,            NULL                   },
-    {    DATA_CMD_MF1_SET_WRITE_MODE,           NULL,                        cmd_processor_mf1_set_write_mode,            NULL                   },
-    {    DATA_CMD_MF1_GET_FIELD_OFF_DO_RESET,   NULL,                        cmd_processor_mf1_get_field_off_do_reset,    NULL                   },
-    {    DATA_CMD_MF1_SET_FIELD_OFF_DO_RESET,   NULL,                        cmd_processor_mf1_set_field_off_do_reset,    NULL                   },
+    {    DATA_CMD_MF1_GET_GEN1A_MODE,           before_mf1_emulator_loaded,  cmd_processor_mf1_get_gen1a_mode,            NULL                   },
+    {    DATA_CMD_MF1_SET_GEN1A_MODE,           before_mf1_emulator_loaded,  cmd_processor_mf1_set_gen1a_mode,            NULL                   },
+    {    DATA_CMD_MF1_GET_GEN2_MODE,            before_mf1_emulator_loaded,  cmd_processor_mf1_get_gen2_mode,             NULL                   },
+    {    DATA_CMD_MF1_SET_GEN2_MODE,            before_mf1_emulator_loaded,  cmd_processor_mf1_set_gen2_mode,             NULL                   },
+    {    DATA_CMD_MF1_GET_BLOCK_ANTI_COLL_MODE, before_mf1_emulator_loaded,  cmd_processor_mf1_get_block_anti_coll_mode,  NULL                   },
+    {    DATA_CMD_MF1_SET_BLOCK_ANTI_COLL_MODE, before_mf1_emulator_loaded,  cmd_processor_mf1_set_block_anti_coll_mode,  NULL                   },
+    {    DATA_CMD_MF1_GET_WRITE_MODE,           before_mf1_emulator_loaded,  cmd_processor_mf1_get_write_mode,            NULL                   },
+    {    DATA_CMD_MF1_SET_WRITE_MODE,           before_mf1_emulator_loaded,  cmd_processor_mf1_set_write_mode,            NULL                   },
+    {    DATA_CMD_MF1_GET_FIELD_OFF_DO_RESET,   before_mf1_emulator_loaded,  cmd_processor_mf1_get_field_off_do_reset,    NULL                   },
+    {    DATA_CMD_MF1_SET_FIELD_OFF_DO_RESET,   before_mf1_emulator_loaded,  cmd_processor_mf1_set_field_off_do_reset,    NULL                   },
 
-    {    DATA_CMD_MF0_NTAG_GET_UID_MAGIC_MODE,    NULL,                      cmd_processor_mf0_ntag_get_uid_mode,         NULL                   },
-    {    DATA_CMD_MF0_NTAG_SET_UID_MAGIC_MODE,    NULL,                      cmd_processor_mf0_ntag_set_uid_mode,         NULL                   },
-    {    DATA_CMD_MF0_NTAG_READ_EMU_PAGE_DATA,    NULL,                      cmd_processor_mf0_ntag_read_emu_page_data,   NULL                   },
-    {    DATA_CMD_MF0_NTAG_WRITE_EMU_PAGE_DATA,   NULL,                      cmd_processor_mf0_ntag_write_emu_page_data,  NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_VERSION_DATA,      NULL,                      cmd_processor_mf0_ntag_get_version_data,     NULL                   },
-    {    DATA_CMD_MF0_NTAG_SET_VERSION_DATA,      NULL,                      cmd_processor_mf0_ntag_set_version_data,     NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_SIGNATURE_DATA,    NULL,                      cmd_processor_mf0_ntag_get_signature_data,   NULL                   },
-    {    DATA_CMD_MF0_NTAG_SET_SIGNATURE_DATA,    NULL,                      cmd_processor_mf0_ntag_set_signature_data,   NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_COUNTER_DATA,      NULL,                      cmd_processor_mf0_ntag_get_counter_data,     NULL                   },
-    {    DATA_CMD_MF0_NTAG_SET_COUNTER_DATA,      NULL,                      cmd_processor_mf0_ntag_set_counter_data,     NULL                   },
-    {    DATA_CMD_MF0_NTAG_RESET_AUTH_CNT,        NULL,                      cmd_processor_mf0_ntag_reset_auth_cnt,       NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_PAGE_COUNT,        NULL,                      cmd_processor_mf0_ntag_get_emu_page_count,   NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_WRITE_MODE,        NULL,                      cmd_processor_mf0_ntag_get_write_mode,       NULL                   },
-    {    DATA_CMD_MF0_NTAG_SET_WRITE_MODE,        NULL,                      cmd_processor_mf0_ntag_set_write_mode,       NULL                   },
-    {    DATA_CMD_MF0_NTAG_SET_DETECTION_ENABLE,  NULL,                      cmd_processor_mf0_ntag_set_detection_enable, NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_DETECTION_COUNT,   NULL,                      cmd_processor_mf0_ntag_get_detection_count,  NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_DETECTION_LOG,     NULL,                      cmd_processor_mf0_ntag_get_detection_log,    NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_DETECTION_ENABLE,  NULL,                      cmd_processor_mf0_ntag_get_detection_enable, NULL                   },
-    {    DATA_CMD_MF0_NTAG_GET_EMULATOR_CONFIG,   NULL,                      cmd_processor_mf0_get_emulator_config,       NULL                   },
+    {    DATA_CMD_MF0_NTAG_GET_UID_MAGIC_MODE,    before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_get_uid_mode,         NULL              },
+    {    DATA_CMD_MF0_NTAG_SET_UID_MAGIC_MODE,    before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_set_uid_mode,         NULL              },
+    {    DATA_CMD_MF0_NTAG_READ_EMU_PAGE_DATA,    before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_read_emu_page_data,   NULL              },
+    {    DATA_CMD_MF0_NTAG_WRITE_EMU_PAGE_DATA,   before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_write_emu_page_data,  NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_VERSION_DATA,      before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_get_version_data,     NULL              },
+    {    DATA_CMD_MF0_NTAG_SET_VERSION_DATA,      before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_set_version_data,     NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_SIGNATURE_DATA,    before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_get_signature_data,   NULL              },
+    {    DATA_CMD_MF0_NTAG_SET_SIGNATURE_DATA,    before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_set_signature_data,   NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_COUNTER_DATA,      before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_get_counter_data,     NULL              },
+    {    DATA_CMD_MF0_NTAG_SET_COUNTER_DATA,      before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_set_counter_data,     NULL              },
+    {    DATA_CMD_MF0_NTAG_RESET_AUTH_CNT,        before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_reset_auth_cnt,       NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_PAGE_COUNT,        before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_get_emu_page_count,   NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_WRITE_MODE,        before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_get_write_mode,       NULL              },
+    {    DATA_CMD_MF0_NTAG_SET_WRITE_MODE,        before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_set_write_mode,       NULL              },
+    {    DATA_CMD_MF0_NTAG_SET_DETECTION_ENABLE,  before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_set_detection_enable, NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_DETECTION_COUNT,   NULL,                            cmd_processor_mf0_ntag_get_detection_count,  NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_DETECTION_LOG,     NULL,                            cmd_processor_mf0_ntag_get_detection_log,    NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_DETECTION_ENABLE,  before_mf0_ntag_emulator_loaded, cmd_processor_mf0_ntag_get_detection_enable, NULL              },
+    {    DATA_CMD_MF0_NTAG_GET_EMULATOR_CONFIG,   before_mf0_ntag_emulator_loaded, cmd_processor_mf0_get_emulator_config,       NULL              },
 
     {    DATA_CMD_EM410X_SET_EMU_ID,              NULL,                      cmd_processor_em410x_set_emu_id,             NULL                   },
     {    DATA_CMD_EM410X_GET_EMU_ID,              NULL,                      cmd_processor_em410x_get_emu_id,             NULL                   },
@@ -3677,17 +4061,21 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_IDTECK_GET_EMU_ID,              NULL,                      cmd_processor_idteck_get_emu_id,             NULL                   },
 #if defined(PROJECT_CHAMELEON_ULTRA)
     /* ISO14443-4 T=CL emulation */
-    {    DATA_CMD_HF14A_4_APDU_RECV,              NULL,                        cmd_processor_hf14a_4_apdu_recv,             NULL                   },
-    {    DATA_CMD_HF14A_4_APDU_SEND,              NULL,                        cmd_processor_hf14a_4_apdu_send,             NULL                   },
-    {    DATA_CMD_HF14A_4_SET_ANTI_COLL,          NULL,                        cmd_processor_hf14a_4_set_anti_coll,         NULL                   },
-    {    DATA_CMD_HF14A_4_STATIC_RESP,            NULL,                        cmd_processor_hf14a_4_static_resp,           NULL                   },
+    {    DATA_CMD_HF14A_4_APDU_RECV,              before_hf14a_4_emulator_loaded, cmd_processor_hf14a_4_apdu_recv,          NULL                   },
+    {    DATA_CMD_HF14A_4_APDU_SEND,              before_hf14a_4_emulator_loaded, cmd_processor_hf14a_4_apdu_send,          NULL                   },
+    {    DATA_CMD_HF14A_4_SET_ANTI_COLL,          before_hf14a_4_emulator_loaded, cmd_processor_hf14a_4_set_anti_coll,      NULL                   },
+    {    DATA_CMD_HF14A_4_STATIC_RESP,            before_hf14a_4_emulator_loaded, cmd_processor_hf14a_4_static_resp,        NULL                   },
     {    DATA_CMD_HF14A_4_READER_APDU,            before_hf_reader_run,        cmd_processor_hf14a_4_reader_apdu,           NULL                   },
     {    DATA_CMD_HF14A_4_EMV_SCAN,               before_hf_reader_run,        cmd_processor_hf14a_4_emv_scan,              after_hf_reader_run    },
     {    DATA_CMD_HF14A_4_DESFIRE_SCAN,           before_hf_reader_run,        cmd_processor_hf14a_4_desfire_scan,          after_hf_reader_run    },
     {    DATA_CMD_HF14A_4_EMV_TRACE_START,        before_hf_reader_run,        cmd_processor_hf14a_4_emv_trace_start,       after_hf_reader_run    },
     {    DATA_CMD_HF14A_4_EMV_TRACE_META,         NULL,                        cmd_processor_hf14a_4_emv_trace_meta,        NULL                   },
     {    DATA_CMD_HF14A_4_EMV_TRACE_GET,          NULL,                        cmd_processor_hf14a_4_emv_trace_get,         NULL                   },
-    {    DATA_CMD_HF14A_4_DEBUG_COUNTERS,         NULL,                        cmd_processor_hf14a_4_debug_counters,        NULL                   },
+    {    DATA_CMD_HF14A_4_DEBUG_COUNTERS,         NULL,                        cmd_processor_hf14a_4_debug_counters,         NULL                   },
+    {    DATA_CMD_HF14A_4_READER_SESSION_START,   before_reader_run,           cmd_processor_hf14a_4_reader_session_start,  NULL                   },
+    {    DATA_CMD_HF14A_4_READER_SESSION_START_APPLE_TRANSIT, before_reader_run, cmd_processor_hf14a_4_reader_session_start, NULL                  },
+    {    DATA_CMD_HF14A_4_READER_SESSION_EXCHANGE, NULL,                       cmd_processor_hf14a_4_reader_session_exchange, NULL                  },
+    {    DATA_CMD_HF14A_4_READER_SESSION_STOP,    NULL,                        cmd_processor_hf14a_4_reader_session_stop,   NULL                   },
     /* HF14A scan keeping field alive */
     {    DATA_CMD_HF14A_SCAN_KEEP,                before_hf_reader_run,        cmd_processor_hf14a_scan_keep,               NULL                   },
 #endif
@@ -3730,12 +4118,46 @@ static void auto_response_data(data_frame_tx_t *resp) {
 void on_data_frame_received(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     data_frame_tx_t *response = NULL;
     bool is_cmd_support = false;
-    if (data_frame_get_transport() == DATA_FRAME_TRANSPORT_BLE &&
-            settings_get_ble_pairing_enable_first_load() &&
+    data_frame_transport_t transport = data_frame_get_transport();
+    if (transport == DATA_FRAME_TRANSPORT_BLE &&
+            settings_get_ble_pairing_enable() &&
             !ble_command_link_authorized()) {
         response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
         auto_response_data(response);
         return;
+    }
+    app_cmd_active_slot_snapshot_process();
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    if (iso_dep_session_is_active() &&
+            !iso_dep_session_is_current_transport_owner()) {
+        response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+        auto_response_data(response);
+        return;
+    }
+#endif
+    if (m_active_slot_snapshot.active) {
+        if ((uint8_t)transport != m_active_slot_snapshot.owner) {
+            response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+            auto_response_data(response);
+            return;
+        }
+        if (cmd != DATA_CMD_ACTIVE_SLOT_SNAPSHOT) {
+            uint16_t block_count = active_slot_snapshot_block_count(
+                                       (tag_specific_type_t)m_active_slot_snapshot.tag_type);
+            if (!active_slot_snapshot_is_read_command(cmd)) {
+                response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+                auto_response_data(response);
+                return;
+            }
+            if (!active_slot_snapshot_read_request_valid(
+                        cmd, length, data, block_count)) {
+                response = data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+                auto_response_data(response);
+                return;
+            }
+            active_slot_snapshot_transaction_refresh(
+                &m_active_slot_snapshot, (uint8_t)transport, app_timer_cnt_get());
+        }
     }
     for (int i = 0; i < ARRAY_SIZE(m_data_cmd_map); i++) {
         if (m_data_cmd_map[i].cmd == cmd) {

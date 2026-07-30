@@ -55,14 +55,31 @@ from crypto1 import Crypto1
 from emv_trace import (
     ApduPayload,
     AppPayload,
+    BEHAVIOR_ADAPTIVE_PROFILES,
+    BEHAVIOR_DIRECT_AID_FALLBACK,
+    BEHAVIOR_REACQUIRE_PROFILES,
     EmvTraceError,
     EmvTraceRequest,
     OPT_INCLUDE_RF,
     OPT_MAXIMUM_PROCESSING,
     OPT_PDOL_FALLBACK,
     OPT_RECORD_GRID,
+    OPT_EXPRESS_TRANSIT,
     OPT_TIMING,
     OPT_TRANSACTION_LOG,
+    PROFILE_APPLE_TRANSIT,
+    PROFILE_AUTO,
+    PROFILE_BROAD_MOBILE,
+    PROFILE_CUSTOM,
+    PROFILE_MINIMAL_ONLINE,
+    PROFILE_MSD_QVSDC,
+    PROFILE_ONLINE_NO_ODA,
+    PROFILE_QVSDC_ONLINE,
+    PROFILE_SWEEP,
+    POLLING_BALANCED,
+    POLLING_DEFAULT,
+    POLLING_FAST,
+    POLLING_PATIENT,
     TRACE_APP_LIMIT,
     TRACE_RESPONSE_TRUNCATED,
     TRACE_RF_TRUNCATED,
@@ -70,6 +87,8 @@ from emv_trace import (
     TRACE_TRANSPORT_ERROR,
     trace_to_json,
 )
+from keyboard_layout import LAYOUT_CHOICES
+from keyboard_script import compile_script
 
 # NXP IDs based on https://www.nxp.com/docs/en/application-note/AN10833.pdf
 type_id_SAK_dict = {
@@ -915,9 +934,11 @@ root = CLITree(root=True)
 hw = root.subgroup("hw", "Hardware-related commands")
 hw_slot = hw.subgroup("slot", "Emulation slots commands")
 hw_settings = hw.subgroup("settings", "Chameleon settings commands")
+hw_keyboard = hw.subgroup("keyboard", "USB/BLE keyboard script commands")
 
 hf = root.subgroup("hf", "High Frequency commands")
 hf_14a = hf.subgroup("14a", "ISO14443-a commands")
+hf_14a_session = hf_14a.subgroup("session", "Stateful real-card ISO-DEP session commands")
 hf_mf = hf.subgroup("mf", "MIFARE Classic commands")
 hf_mf_readerkeys = hf_mf.subgroup("readerkeys", "Capture reader keys (MFKey32) by emulating a card")
 hf_mfu = hf.subgroup("mfu", "MIFARE Ultralight / NTAG commands")
@@ -1734,6 +1755,135 @@ class BLEBroadcast(DeviceRequiredUnit):
               f"Use 'ble broadcast --stop' to halt.")
 
 
+@ble.command("adv-lab")
+class BLEAdvertisingLab(DeviceRequiredUnit):
+    """Run vendor-neutral custom, rotating-name, or raw BLE advertisements."""
+
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.add_argument("action", choices=("start", "status", "stop"))
+        parser.add_argument("--raw", action="store_true",
+                            help="Use --adv/--scan-response as complete legacy AD structures.")
+        parser.add_argument("--pairing-profile", choices=("apple", "android"),
+                            help="Build a pairing-discovery sheet advertisement preset.")
+        parser.add_argument("--model-id",
+                            help="Optional 0x-prefixed model code/ID for --pairing-profile.")
+        parser.add_argument("--adv", default="",
+                            help="Raw advertisement hex for --raw mode.")
+        parser.add_argument("--scan-response", default="",
+                            help="Raw scan-response hex for --raw mode.")
+        parser.add_argument("--name", action="append", default=[],
+                            help="Local name; repeat to rotate names.")
+        parser.add_argument("--name-target", choices=("adv", "scan"), default="adv")
+        parser.add_argument("--mode", choices=("connectable", "scannable", "non-scannable"),
+                            default="scannable")
+        parser.add_argument("--flags", default="0x06")
+        parser.add_argument("--service-uuid",
+                            help="Optional operator-supplied 16-bit service UUID.")
+        parser.add_argument("--service-data-uuid",
+                            help="Optional 16-bit UUID for a Service Data AD structure.")
+        parser.add_argument("--service-data", default="",
+                            help="Service Data bytes as hex; requires --service-data-uuid.")
+        parser.add_argument("--company-id",
+                            help="Optional operator-supplied Bluetooth company ID.")
+        parser.add_argument("--manufacturer-data", default="",
+                            help="Manufacturer bytes as hex; requires --company-id.")
+        parser.add_argument("--interval-ms", type=int, default=250)
+        parser.add_argument("--rotation-ms", type=int, default=1000)
+        parser.add_argument("--duration-ms", type=int, default=0)
+        parser.add_argument("--max-events", type=int, default=0)
+        return parser
+
+    @staticmethod
+    def _hex(value: str) -> bytes:
+        compact = re.sub(r"[\s:]", "", value)
+        if not compact:
+            return b""
+        if len(compact) % 2 or re.search(r"[^0-9a-fA-F]", compact):
+            raise ValueError("hex data must contain complete hexadecimal bytes")
+        return bytes.fromhex(compact)
+
+    @staticmethod
+    def _number(value: str, field: str) -> int:
+        try:
+            return int(value, 0)
+        except ValueError as error:
+            raise ValueError(f"{field} must be a decimal or 0x-prefixed value") from error
+
+    @staticmethod
+    def _print_status(state: dict):
+        labels = {0: "idle", 1: "configured", 2: "advertising",
+                  3: "connected", 4: "error"}
+        reasons = {0: "none", 1: "host stop", 2: "duration",
+                   3: "event limit", 4: "peer connected", 7: "error"}
+        print(f"Advertising lab: {labels.get(state['state'], state['state'])}; "
+              f"profile={state['profile']}, mode={state['mode']}, "
+              f"packets={state['advertising_length']}/{state['scan_response_length']} bytes, "
+              f"name={state['active_name_index']}, rotations={state['rotation_count']}, "
+              f"reason={reasons.get(state['reason'], state['reason'])}")
+
+    def on_exec(self, args: argparse.Namespace):
+        try:
+            if args.action == "status":
+                self._print_status(self.cmd.ble_adv_lab_status())
+                return
+            if args.action == "stop":
+                self._print_status(self.cmd.ble_adv_lab_stop())
+                return
+
+            mode = {"connectable": 0, "scannable": 1,
+                    "non-scannable": 2}[args.mode]
+            if args.pairing_profile:
+                if args.raw or args.name or args.adv or args.scan_response:
+                    raise ValueError("--pairing-profile cannot be combined with raw data or names")
+                if args.pairing_profile == "apple":
+                    model = (0x0E20 if args.model_id is None else
+                             self._number(args.model_id, "--model-id"))
+                    advertising, scan_response = chameleon_cmd.build_ble_apple_proximity_profile(model)
+                    mode = 2
+                else:
+                    model = (0x2D7A23 if args.model_id is None else
+                             self._number(args.model_id, "--model-id"))
+                    advertising, scan_response = chameleon_cmd.build_ble_fast_pair_profile(model)
+                    mode = 0
+                profile = 3
+            elif args.raw:
+                if args.name:
+                    raise ValueError("--raw cannot be combined with --name")
+                advertising = self._hex(args.adv)
+                scan_response = self._hex(args.scan_response)
+                profile = 3
+            else:
+                if args.adv or args.scan_response:
+                    raise ValueError("--adv and --scan-response require --raw")
+                service_uuid = (None if args.service_uuid is None else
+                                self._number(args.service_uuid, "--service-uuid"))
+                service_data_uuid = (
+                    None if args.service_data_uuid is None else
+                    self._number(args.service_data_uuid, "--service-data-uuid"))
+                company_id = (None if args.company_id is None else
+                              self._number(args.company_id, "--company-id"))
+                advertising, scan_response = chameleon_cmd.build_ble_advertising_profile(
+                    flags=self._number(args.flags, "--flags"),
+                    service_uuid=service_uuid,
+                    service_data_uuid=service_data_uuid,
+                    service_data=self._hex(args.service_data),
+                    company_id=company_id,
+                    manufacturer_data=self._hex(args.manufacturer_data))
+                profile = 2 if len(args.name) > 1 else 1
+            name_target = 0 if not args.name else (1 if args.name_target == "adv" else 2)
+            rotation_ms = args.rotation_ms if len(args.name) > 1 else 0
+            state = self.cmd.ble_adv_lab_start(
+                advertising, scan_response, names=args.name,
+                name_target=name_target, interval_ms=args.interval_ms,
+                rotation_ms=rotation_ms, duration_ms=args.duration_ms,
+                max_advertising_events=args.max_events, mode=mode,
+                profile=profile)
+            self._print_status(state)
+        except (ValueError, UnexpectedResponseError) as error:
+            print(f"Advertising lab error: {error}")
+
+
 @ble.command("discover")
 class BLEDiscover(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -2349,6 +2499,172 @@ class HWVersion(DeviceRequiredUnit):
         print(f" - Chameleon {model}, Version: {fw_version} ({git_version})")
 
 
+def _compile_keyboard_file(path, layout="us"):
+    return compile_script(Path(path).read_text(encoding="utf-8"), layout)
+
+
+@hw_keyboard.command("compile")
+class HWKeyboardCompile(BaseCLIUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Compile a strict keyboard script"
+        parser.add_argument("script", type=Path, help="Keyboard script source")
+        parser.add_argument("--out", type=Path, help="Write compiled bytecode")
+        parser.add_argument(
+            "--layout", choices=LAYOUT_CHOICES, default="us",
+            help="Target host keyboard layout (default: us)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        program = _compile_keyboard_file(args.script, args.layout)
+        if args.out is None:
+            print(program.hex())
+        else:
+            args.out.write_bytes(program)
+            print(f" - Wrote {len(program)} byte(s) to {args.out}")
+
+
+@hw_keyboard.command("upload")
+class HWKeyboardUpload(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Compile, upload, and commit a keyboard script"
+        parser.add_argument("script", type=Path, help="Keyboard script source")
+        parser.add_argument(
+            "--layout", choices=LAYOUT_CHOICES, default="us",
+            help="Target host keyboard layout (default: us)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        program = _compile_keyboard_file(args.script, args.layout)
+        committed = self.cmd.keyboard_upload(program)
+        print(
+            f" - Uploaded {committed['length']} byte(s), "
+            f"commit {committed['commit_id']}, CRC32 {committed['crc32']:08x}")
+
+
+@hw_keyboard.command("status")
+class HWKeyboardStatus(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Show keyboard script and execution status"
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        status = self.cmd.keyboard_get_status()
+        print(
+            f" - State: {status['state_name']}; commit: {status['commit_id']}; "
+            f"upload: {status['received']}/{status['expected']}; "
+            f"run: {status['pc']}/{status['length']}; "
+            f"outputs: 0x{status['outputs']:02x}; error: {status['error']}; "
+            f"CRC32: {status['crc32']:08x}")
+
+
+@hw_keyboard.command("run")
+class HWKeyboardRun(DeviceRequiredUnit):
+    OUTPUTS = {"usb": 1, "ble": 2, "both": 3}
+
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Run the committed keyboard script"
+        parser.add_argument(
+            "--output", required=True, choices=tuple(self.OUTPUTS),
+            help="Keyboard output transport")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        status = self.cmd.keyboard_get_status()
+        run = self.cmd.keyboard_run(status["commit_id"], self.OUTPUTS[args.output])
+        print(
+            f" - Run {run['run_id']} requested on {args.output}; "
+            "command transport is USB or authenticated BLE")
+
+
+@hw_keyboard.command("cancel")
+class HWKeyboardCancel(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Cancel keyboard script execution"
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        self.cmd.keyboard_cancel()
+        print(" - Keyboard execution cancelled")
+
+
+@hw_keyboard.command("name")
+class HWKeyboardName(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Set a volatile BLE keyboard name"
+        parser.add_argument(
+            "name", nargs="?",
+            help="UTF-8 BLE name (omit to restore the board default)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        effective = self.cmd.keyboard_set_temporary_ble_name(args.name)
+        print(f" - Temporary BLE name: {effective}")
+
+
+@hw_keyboard.command("arm")
+class HWKeyboardArm(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Advertise and run once when a consenting BLE HID host connects")
+        parser.add_argument(
+            "--name",
+            help="Temporary advertised name (default: restore board name)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        status = self.cmd.keyboard_get_status()
+        effective = self.cmd.keyboard_set_temporary_ble_name(args.name)
+        armed = self.cmd.keyboard_arm_ble(status["commit_id"])
+        print(
+            f" - Armed run {armed['run_id']} as {effective}; waiting for an "
+            "encrypted BLE HID host (the host must explicitly connect/pair)")
+
+
+@hw_keyboard.command("clear")
+class HWKeyboardClear(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Clear staged and committed keyboard scripts"
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        self.cmd.keyboard_clear()
+        print(" - Keyboard script storage cleared")
+
+
+@hw_keyboard.command("enable")
+class HWKeyboardEnable(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Show or set the opt-in keyboard HID feature. It is OFF by default "
+            "so an idle device exposes no USB HID interface and forces no BLE "
+            "pairing. Changing it is persisted and needs a device reboot to "
+            "apply (USB re-enumeration + BLE HID service registration).")
+        parser.add_argument(
+            "state", nargs="?", choices=("on", "off"),
+            help="Enable or disable the feature (omit to show current state)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.state is None:
+            enabled = self.cmd.get_keyboard_hid_enable()
+            print(f" - Keyboard HID feature: {'enabled' if enabled else 'disabled'}")
+            return
+        enabled = args.state == "on"
+        self.cmd.set_keyboard_hid_enable(enabled)
+        self.cmd.save_settings()
+        print(f" - Keyboard HID feature {'enabled' if enabled else 'disabled'} and saved")
+        print(" - Reboot the device for the change to take effect")
+
+
 @hf_14a.command("config")
 class HF14AConfig(DeviceRequiredUnit):
     class Config(Enum):
@@ -2519,6 +2835,79 @@ class HF14AField(ReaderRequiredUnit):
         else:
             self.cmd.hf14a_set_field_off()
             print("HF field OFF")
+
+
+def _iso_dep_session_id_arg(value):
+    try:
+        session_id = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("session ID must be an integer") from exc
+    if not 1 <= session_id <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("session ID must be 1..0xffffffff")
+    return session_id
+
+
+def _iso_dep_apdu_arg(value):
+    compact = value.replace(" ", "")
+    if (not compact or len(compact) % 2 != 0 or
+            re.fullmatch(r"[0-9a-fA-F]+", compact) is None):
+        raise argparse.ArgumentTypeError("APDU must be an even-length hex string")
+    apdu = bytes.fromhex(compact)
+    if len(apdu) > 512:
+        raise argparse.ArgumentTypeError("APDU must contain at most 512 bytes")
+    return apdu
+
+
+@hf_14a_session.command("start")
+class HF14AReaderSessionStart(ReaderRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Select a real ISO-DEP card and start a persistent session"
+        parser.add_argument(
+            "--express-transit", action="store_true",
+            help="use the Apple Transit polling annotation during selection")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.express_transit:
+            info = self.cmd.hf14a_4_reader_session_start_apple_transit()
+        else:
+            info = self.cmd.hf14a_4_reader_session_start()
+        print(f"Session ID: {info['session_id']} (0x{info['session_id']:08X})")
+        print(f"UID: {info['uid'].hex().upper()}")
+        print(f"ATQA: {info['atqa'].hex().upper()}  SAK: {info['sak']:02X}")
+        print(f"ATS: {info['ats'].hex().upper()}")
+
+
+@hf_14a_session.command("exchange")
+class HF14AReaderSessionExchange(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Exchange one APDU in an active real-card ISO-DEP session"
+        parser.add_argument("session_id", type=_iso_dep_session_id_arg,
+                            help="Session ID from start (decimal or 0x-prefixed)")
+        parser.add_argument("apdu", type=_iso_dep_apdu_arg,
+                            help="Raw command APDU as 2..1024 hex characters")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        response = self.cmd.hf14a_4_reader_session_exchange(
+            args.session_id, args.apdu)
+        print(response.hex(" ").upper())
+
+
+@hf_14a_session.command("stop")
+class HF14AReaderSessionStop(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Deselect and stop the matching real-card ISO-DEP session"
+        parser.add_argument("session_id", type=_iso_dep_session_id_arg,
+                            help="Session ID from start (decimal or 0x-prefixed)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        self.cmd.hf14a_4_reader_session_stop(args.session_id)
+        print("ISO-DEP session stopped")
 
 
 @hf_mf.command("nested")
@@ -10730,6 +11119,22 @@ class EMVScan(DeviceRequiredUnit):
                             help='Transaction currency code (default: 000)')
         parser.add_argument('--cryptogram', choices=('none', 'aac', 'tc', 'arqc'),
                             default=None, help='GENERATE AC type (default: ARQC with --amount, otherwise none)')
+        parser.add_argument('--express-transit', action='store_true',
+                            help='Use Apple ECP2 polling while the RF field remains active')
+        parser.add_argument('--terminal-profile', choices=(
+            'auto', 'apple-transit', 'online-no-oda', 'broad-mobile',
+            'qvsdc-online', 'minimal-online', 'msd-qvsdc', 'custom', 'sweep'),
+            default=None, help='Extended terminal TTQ profile; sweep retries only GPO condition failures')
+        parser.add_argument('--ttq', default='', metavar='<8 hex digits>',
+                            help='Custom TTQ, required with --terminal-profile custom')
+        parser.add_argument('--polling-profile', choices=('default', 'fast', 'balanced', 'patient'),
+                            default='default', help='ECP polling timing strategy')
+        parser.add_argument('--direct-aid-fallback', action='store_true',
+                            help='Probe a bounded known payment-AID list only when PPSE is unavailable or empty')
+        parser.add_argument('--adaptive-profiles', action='store_true',
+                            help='Order compatibility-sweep profiles by detected payment scheme')
+        parser.add_argument('--reacquire-profiles', action='store_true',
+                            help='Cycle RF and reacquire the target between rejected sweep profiles')
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -10781,12 +11186,47 @@ class EMVScan(DeviceRequiredUnit):
                     flags |= OPT_TRANSACTION_LOG
                 if args.pdol_fallback:
                     flags |= OPT_PDOL_FALLBACK
+                if args.express_transit:
+                    flags |= OPT_EXPRESS_TRANSIT
                 country = _emv_numeric_bcd(args.country, 2, 'country')
                 currency = _emv_numeric_bcd(args.currency, 2, 'currency')
                 date = _emv_numeric_bcd(datetime.now().strftime('%y%m%d'), 3, 'date')
                 cryptogram_name = args.cryptogram or ('arqc' if args.amount else 'none')
                 cryptogram = {'none': 0xFF, 'aac': 0x00, 'tc': 0x40, 'arqc': 0x80}[
                     cryptogram_name]
+                profiles = {
+                    'auto': PROFILE_AUTO,
+                    'apple-transit': PROFILE_APPLE_TRANSIT,
+                    'online-no-oda': PROFILE_ONLINE_NO_ODA,
+                    'broad-mobile': PROFILE_BROAD_MOBILE,
+                    'qvsdc-online': PROFILE_QVSDC_ONLINE,
+                    'minimal-online': PROFILE_MINIMAL_ONLINE,
+                    'msd-qvsdc': PROFILE_MSD_QVSDC,
+                    'custom': PROFILE_CUSTOM,
+                    'sweep': PROFILE_SWEEP,
+                }
+                terminal_profile = profiles.get(args.terminal_profile)
+                if args.ttq:
+                    if args.terminal_profile != 'custom' or not re.fullmatch(r'[0-9a-fA-F]{8}', args.ttq):
+                        raise ValueError('--ttq requires --terminal-profile custom and exactly 8 hex digits')
+                    custom_ttq = bytes.fromhex(args.ttq)
+                else:
+                    if args.terminal_profile == 'custom':
+                        raise ValueError('--terminal-profile custom requires --ttq')
+                    custom_ttq = b'\x00' * 4
+                polling_profile = {
+                    'default': POLLING_DEFAULT,
+                    'fast': POLLING_FAST,
+                    'balanced': POLLING_BALANCED,
+                    'patient': POLLING_PATIENT,
+                }[args.polling_profile]
+                behavior = 0
+                if args.direct_aid_fallback:
+                    behavior |= BEHAVIOR_DIRECT_AID_FALLBACK
+                if args.adaptive_profiles:
+                    behavior |= BEHAVIOR_ADAPTIVE_PROFILES
+                if args.reacquire_profiles:
+                    behavior |= BEHAVIOR_REACQUIRE_PROFILES
                 request = EmvTraceRequest(
                     flags=flags,
                     max_aids=args.max_aids,
@@ -10798,6 +11238,10 @@ class EMVScan(DeviceRequiredUnit):
                     currency=currency,
                     date=date,
                     cryptogram_type=cryptogram,
+                    terminal_profile=terminal_profile,
+                    custom_ttq=custom_ttq,
+                    polling_profile=polling_profile,
+                    behavior=behavior,
                 )
                 if not 48 <= args.max_payload <= 4096:
                     raise ValueError('max-payload must be 48..4096')

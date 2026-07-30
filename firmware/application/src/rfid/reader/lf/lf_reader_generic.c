@@ -22,7 +22,14 @@ NRF_LOG_MODULE_REGISTER();
  */
 #define CIRCULAR_BUFFER_SIZE (6144)
 static circular_buffer cb;
-static nrf_saadc_value_t m_sample_storage[CIRCULAR_BUFFER_SIZE + 1];
+// Placed in the retained NOINIT RAM region (0x20038000, otherwise mostly unused)
+// to reclaim ~12 KB from the contended application RAM. This is safe because the
+// buffer is pure scratch: raw_read_to_buffer() calls cb_init_static() (which
+// resets the circular buffer to empty) before any read, and cb_pop_front() only
+// ever returns slots previously written by cb_push_back(). Its content is never
+// read before being written, so skipping zero-initialization is harmless.
+static __attribute__((section(".noinit_lf"))) nrf_saadc_value_t
+    m_sample_storage[CIRCULAR_BUFFER_SIZE + 1];
 
 static void saadc_cb(nrf_saadc_value_t *vals, size_t size) {
     for (int i = 0; i < size; i++) {

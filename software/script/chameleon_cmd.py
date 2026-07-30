@@ -1,6 +1,7 @@
 import struct
 import ctypes
-from typing import Union
+import zlib
+from typing import Optional, Union
 
 import chameleon_com
 from emv_trace import (
@@ -19,9 +20,53 @@ from chameleon_enum import ButtonPressFunction, ButtonType, MifareClassicDarksid
 from chameleon_enum import MfcKeyType, MfcValueBlockOperator
 
 CURRENT_VERSION_SETTINGS = 6
+ACTIVE_SLOT_SNAPSHOT_VERSION = 2
+ACTIVE_SLOT_SNAPSHOT_BEGIN = 0
+ACTIVE_SLOT_SNAPSHOT_SAVE_RELEASE = 1
+ACTIVE_SLOT_SNAPSHOT_ABORT = 2
+ACTIVE_SLOT_SNAPSHOT_SAVE_TIMEOUT_SECONDS = 55
 
 new_key = b'\x20\x20\x66\x66'
 old_keys = [b'\x51\x24\x36\x48', b'\x19\x92\x04\x27']
+
+
+def _require_snapshot_revision(revision):
+    if (isinstance(revision, bool) or not isinstance(revision, int) or
+            not 1 <= revision <= 0xFFFFFFFF):
+        raise ValueError("snapshot revision must be a nonzero 32-bit integer")
+
+
+def _parse_snapshot_end(resp, operation, revision):
+    if len(resp.data) != 6:
+        raise UnexpectedResponseError(
+            f"malformed active-slot snapshot response: expected 6 bytes, got {len(resp.data)}")
+    version, response_operation, response_revision = struct.unpack("!BBI", resp.data)
+    if (version != ACTIVE_SLOT_SNAPSHOT_VERSION or
+            response_operation != operation or response_revision != revision):
+        raise UnexpectedResponseError(
+            "malformed active-slot snapshot response: transaction identity mismatch")
+    return response_revision
+
+
+def _close_snapshot_device(device):
+    close = getattr(device, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _abort_snapshot_revision(device, revision):
+    payload = struct.pack(
+        "!BBI", ACTIVE_SLOT_SNAPSHOT_VERSION,
+        ACTIVE_SLOT_SNAPSHOT_ABORT, revision)
+    resp = device.send_cmd_sync(
+        Command.ACTIVE_SLOT_SNAPSHOT, payload, timeout=5)
+    if resp.status != Status.SUCCESS:
+        raise UnexpectedResponseError(
+            f"active-slot snapshot ABORT failed with status {resp.status}")
+    _parse_snapshot_end(resp, ACTIVE_SLOT_SNAPSHOT_ABORT, revision)
 
 
 def _require_ble_length(resp, expected, label):
@@ -33,9 +78,210 @@ def _require_ble_length(resp, expected, label):
             f"malformed {label} response: expected {wanted} byte(s), got {len(resp.data)}")
 
 
+def _require_iso_dep_session_id(session_id):
+    if (isinstance(session_id, bool) or not isinstance(session_id, int) or
+            not 1 <= session_id <= 0xFFFFFFFF):
+        raise ValueError("session_id must be a nonzero 32-bit integer")
+
+
+def _require_iso_dep_apdu(apdu):
+    if not isinstance(apdu, (bytes, bytearray, memoryview)):
+        raise ValueError("APDU must be bytes")
+    apdu = bytes(apdu)
+    if not 1 <= len(apdu) <= 512:
+        raise ValueError("APDU must contain 1..512 bytes")
+    return apdu
+
+
+def _parse_iso_dep_session_start(resp):
+    data = bytes(resp.data)
+    if len(data) < 9:
+        raise ValueError("malformed ISO-DEP session START response: too short")
+    session_id, uid_len = struct.unpack_from("!IB", data)
+    if session_id == 0:
+        raise ValueError("malformed ISO-DEP session START response: zero session ID")
+    if uid_len not in (4, 7, 10):
+        raise ValueError(
+            f"malformed ISO-DEP session START response: invalid UID length {uid_len}")
+    fixed_end = 5 + uid_len + 2 + 1 + 1
+    if len(data) < fixed_end:
+        raise ValueError("malformed ISO-DEP session START response: truncated metadata")
+    uid = data[5:5 + uid_len]
+    atqa = data[5 + uid_len:7 + uid_len]
+    sak = data[7 + uid_len]
+    ats_len = data[8 + uid_len]
+    if ats_len < 2 or len(data) != fixed_end + ats_len:
+        raise ValueError("malformed ISO-DEP session START response: invalid ATS length")
+    if not sak & 0x20:
+        raise ValueError("malformed ISO-DEP session START response: target is not ISO-DEP")
+    return {
+        "session_id": session_id,
+        "uid": uid,
+        "atqa": atqa,
+        "sak": sak,
+        "ats": data[fixed_end:],
+    }
+
+
+def validate_ble_advertising_data(data, *, scan_response=False):
+    """Validate complete legacy BLE AD structures, not arbitrary RF frames."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ValueError("advertising data must be bytes")
+    data = bytes(data)
+    if len(data) > 31:
+        raise ValueError("legacy advertising data must be at most 31 bytes")
+    offset = 0
+    has_name = False
+    while offset < len(data):
+        field_length = data[offset]
+        if field_length == 0 or offset + 1 + field_length > len(data):
+            raise ValueError("advertising data contains a truncated AD structure")
+        field_type = data[offset + 1]
+        if scan_response and field_type == 0x01:
+            raise ValueError("flags are not valid in scan-response data")
+        if field_type in (0x08, 0x09):
+            if has_name:
+                raise ValueError("advertising data contains multiple local names")
+            has_name = True
+        offset += field_length + 1
+    return has_name
+
+
+def build_ble_advertising_profile(*, flags=0x06, service_uuid=None,
+                                  service_data_uuid=None, service_data=b'',
+                                  company_id=None, manufacturer_data=b''):
+    """Build a neutral legacy profile; identifiers are always operator supplied."""
+    if not 0 <= flags <= 0xFF:
+        raise ValueError("flags must be 0..255")
+    advertising = bytearray((2, 0x01, flags))
+    scan_response = bytearray()
+    if service_uuid is not None:
+        if not 0 <= service_uuid <= 0xFFFF:
+            raise ValueError("service_uuid must be 0..65535")
+        advertising.extend((3, 0x03, service_uuid & 0xFF,
+                            (service_uuid >> 8) & 0xFF))
+    service_data = bytes(service_data)
+    if service_data_uuid is None:
+        if service_data:
+            raise ValueError("service_data_uuid is required with service_data")
+    else:
+        if not 0 <= service_data_uuid <= 0xFFFF:
+            raise ValueError("service_data_uuid must be 0..65535")
+        if len(service_data) > 27:
+            raise ValueError("service_data must be at most 27 bytes")
+        value = bytes((service_data_uuid & 0xFF,
+                       (service_data_uuid >> 8) & 0xFF)) + service_data
+        scan_response.extend((len(value) + 1, 0x16))
+        scan_response.extend(value)
+    manufacturer_data = bytes(manufacturer_data)
+    if company_id is None:
+        if manufacturer_data:
+            raise ValueError("company_id is required with manufacturer_data")
+    else:
+        if not 0 <= company_id <= 0xFFFF:
+            raise ValueError("company_id must be 0..65535")
+        if len(manufacturer_data) > 27:
+            raise ValueError("manufacturer_data must be at most 27 bytes")
+        value = bytes((company_id & 0xFF, (company_id >> 8) & 0xFF)) + manufacturer_data
+        scan_response.extend((len(value) + 1, 0xFF))
+        scan_response.extend(value)
+    validate_ble_advertising_data(advertising)
+    validate_ble_advertising_data(scan_response, scan_response=True)
+    return bytes(advertising), bytes(scan_response)
+
+
+def build_ble_apple_proximity_profile(model_code=0x0E20):
+    """Build a reverse-engineered Apple Continuity proximity-pairing record."""
+    if not 0 <= model_code <= 0xFFFF:
+        raise ValueError("model_code must be 0..65535")
+    payload = bytes((
+        0x1E, 0xFF, 0x4C, 0x00, 0x07, 0x19, 0x07,
+        (model_code >> 8) & 0xFF, model_code & 0xFF,
+        0x75, 0xAA, 0x30, 0x01, 0x00, 0x00,
+        0x45, 0x12, 0x12, 0x12,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ))
+    validate_ble_advertising_data(payload)
+    return payload, b''
+
+
+def build_ble_fast_pair_profile(model_id=0x2D7A23, tx_power=-20):
+    """Build a discoverable Google Fast Pair model-ID advertisement record."""
+    if not 0 <= model_id <= 0xFFFFFF:
+        raise ValueError("model_id must be 0..16777215")
+    if not -127 <= tx_power <= 20:
+        raise ValueError("tx_power must be -127..20 dBm")
+    payload = bytes((
+        0x02, 0x01, 0x06,
+        0x03, 0x03, 0x2C, 0xFE,
+        0x06, 0x16, 0x2C, 0xFE,
+        (model_id >> 16) & 0xFF, (model_id >> 8) & 0xFF, model_id & 0xFF,
+        0x02, 0x0A, tx_power & 0xFF,
+    ))
+    validate_ble_advertising_data(payload)
+    return payload, b''
+
+
+def _parse_ble_adv_lab_status(resp):
+    _require_ble_length(resp, 20, "BLE advertising lab status")
+    data = resp.data
+    if data[0] != 1:
+        raise ValueError(f"unsupported BLE advertising lab status version {data[0]}")
+    if (data[1] not in (0, 2, 3, 4) or data[2] > 3 or data[3] > 2 or
+            data[4] not in (0, 1, 2, 3, 4, 7) or data[6] > 32 or
+            data[7] > 31 or data[8] > 31 or
+            (data[6] == 0 and data[5] != 0xFF) or
+            (data[6] != 0 and (data[5] == 0xFF or data[5] >= data[6]))):
+        raise ValueError("malformed BLE advertising lab status values")
+    return {
+        'state': data[1],
+        'running': data[1] == 2,
+        'connected': data[1] == 3,
+        'profile': data[2],
+        'mode': data[3],
+        'reason': data[4],
+        'active_name_index': None if data[5] == 0xFF else data[5],
+        'name_count': data[6],
+        'advertising_length': data[7],
+        'scan_response_length': data[8],
+        'interval_units': struct.unpack('!H', data[9:11])[0],
+        'rotation_ms': struct.unpack('!H', data[11:13])[0],
+        'duration_units': struct.unpack('!H', data[13:15])[0],
+        'max_advertising_events': data[15],
+        'rotation_count': struct.unpack('!I', data[16:20])[0],
+    }
+
+
 def _require_ble_uint(name, value, maximum, minimum=0):
     if not isinstance(value, int) or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be {minimum}..{maximum}")
+
+
+KEYBOARD_PROTOCOL_VERSION = 1
+KEYBOARD_MAX_PROGRAM_BYTES = 4096
+KEYBOARD_MAX_CHUNK_BYTES = 4089
+KEYBOARD_OUTPUT_USB = 0x01
+KEYBOARD_OUTPUT_BLE = 0x02
+KEYBOARD_OUTPUT_BOTH = KEYBOARD_OUTPUT_USB | KEYBOARD_OUTPUT_BLE
+
+
+def _require_keyboard_uint(name, value, maximum, minimum=0):
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be {minimum}..{maximum}")
+
+
+def _parse_keyboard_response(resp, fmt, label, fields, versioned=False):
+    expected = struct.calcsize(fmt)
+    if len(resp.data) != expected:
+        raise ValueError(
+            f"malformed keyboard {label} response: expected {expected} byte(s), "
+            f"got {len(resp.data)}")
+    values = struct.unpack(fmt, resp.data)
+    if versioned and values[0] != KEYBOARD_PROTOCOL_VERSION:
+        raise ValueError(
+            f"malformed keyboard {label} response: unsupported version {values[0]}")
+    return dict(zip(fields, values))
 
 
 class ChameleonCMD:
@@ -98,6 +344,101 @@ class ChameleonCMD:
             resp.parsed, = struct.unpack('!?', resp.data)
         return resp
 
+    @expect_response(Status.SUCCESS)
+    def active_slot_snapshot_begin(self):
+        """Freeze and identify the exact active MIFARE Classic slot."""
+        payload = struct.pack(
+            "!BB", ACTIVE_SLOT_SNAPSHOT_VERSION, ACTIVE_SLOT_SNAPSHOT_BEGIN)
+        resp = self.device.send_cmd_sync(Command.ACTIVE_SLOT_SNAPSHOT, payload)
+        if resp.status == Status.SUCCESS:
+            try:
+                if len(resp.data) < 13:
+                    raise UnexpectedResponseError(
+                        "malformed active-slot snapshot BEGIN response: revision unavailable")
+                revision, = struct.unpack_from("!I", resp.data, 9)
+                if revision == 0:
+                    raise UnexpectedResponseError(
+                        "malformed active-slot snapshot BEGIN response: zero revision")
+                if len(resp.data) != 13:
+                    raise UnexpectedResponseError(
+                        "malformed active-slot snapshot BEGIN response: "
+                        f"expected 13 bytes, got {len(resp.data)}")
+                version, operation, slot, tag_type, owner_generation, _ = \
+                    struct.unpack("!BBBHII", resp.data)
+                mifare_types = {
+                    TagSpecificType.MIFARE_Mini,
+                    TagSpecificType.MIFARE_1024,
+                    TagSpecificType.MIFARE_2048,
+                    TagSpecificType.MIFARE_4096,
+                }
+                try:
+                    parsed_type = TagSpecificType(tag_type)
+                except ValueError as error:
+                    raise UnexpectedResponseError(
+                        "malformed active-slot snapshot BEGIN response: "
+                        f"unknown tag type {tag_type}") from error
+                if (version != ACTIVE_SLOT_SNAPSHOT_VERSION or
+                        operation != ACTIVE_SLOT_SNAPSHOT_BEGIN or slot > 7 or
+                        parsed_type not in mifare_types or owner_generation == 0):
+                    raise UnexpectedResponseError(
+                        "malformed active-slot snapshot BEGIN response")
+            except UnexpectedResponseError:
+                revision = struct.unpack_from("!I", resp.data, 9)[0] \
+                    if len(resp.data) >= 13 else 0
+                if revision != 0:
+                    try:
+                        _abort_snapshot_revision(self.device, revision)
+                    except Exception:
+                        _close_snapshot_device(self.device)
+                else:
+                    _close_snapshot_device(self.device)
+                raise
+            resp.parsed = {
+                "version": version,
+                "slot": slot,
+                "tag_type": parsed_type,
+                "owner_generation": owner_generation,
+                "revision": revision,
+            }
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def active_slot_snapshot_save_release(self, revision):
+        """Force-persist the frozen HF dump and restore field sensing."""
+        _require_snapshot_revision(revision)
+        payload = struct.pack(
+            "!BBI", ACTIVE_SLOT_SNAPSHOT_VERSION,
+            ACTIVE_SLOT_SNAPSHOT_SAVE_RELEASE, revision)
+        try:
+            resp = self.device.send_cmd_sync(
+                Command.ACTIVE_SLOT_SNAPSHOT, payload,
+                timeout=ACTIVE_SLOT_SNAPSHOT_SAVE_TIMEOUT_SECONDS)
+        except TimeoutError:
+            _close_snapshot_device(self.device)
+            raise
+        if resp.status == Status.SUCCESS:
+            try:
+                resp.parsed = _parse_snapshot_end(
+                    resp, ACTIVE_SLOT_SNAPSHOT_SAVE_RELEASE, revision)
+            except UnexpectedResponseError:
+                _close_snapshot_device(self.device)
+                raise
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def active_slot_snapshot_abort(self, revision):
+        """Discard the frozen transaction without writing flash."""
+        _require_snapshot_revision(revision)
+        payload = struct.pack(
+            "!BBI", ACTIVE_SLOT_SNAPSHOT_VERSION,
+            ACTIVE_SLOT_SNAPSHOT_ABORT, revision)
+        resp = self.device.send_cmd_sync(
+            Command.ACTIVE_SLOT_SNAPSHOT, payload, timeout=5)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_snapshot_end(
+                resp, ACTIVE_SLOT_SNAPSHOT_ABORT, revision)
+        return resp
+
     def is_device_reader_mode(self) -> bool:
         """
             Get device mode, reader or tag.
@@ -120,6 +461,188 @@ class ChameleonCMD:
         :return:
         """
         self.change_device_mode(reader_mode)
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_upload_begin(self, total_length: int, crc32: int):
+        """Start a version-1 keyboard bytecode upload."""
+        _require_keyboard_uint(
+            "total_length", total_length, KEYBOARD_MAX_PROGRAM_BYTES, 1)
+        _require_keyboard_uint("crc32", crc32, 0xFFFFFFFF)
+        payload = struct.pack(
+            "!BHI", KEYBOARD_PROTOCOL_VERSION, total_length, crc32)
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_UPLOAD_BEGIN, payload)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_keyboard_response(
+                resp, "!BIHH", "upload-begin",
+                ("version", "upload_id", "next_offset", "max_chunk"),
+                versioned=True)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_upload_chunk(self, upload_id: int, offset: int, data: bytes):
+        """Upload one chunk; the seven-byte header leaves 4089 data bytes."""
+        _require_keyboard_uint("upload_id", upload_id, 0xFFFFFFFF)
+        _require_keyboard_uint("offset", offset, KEYBOARD_MAX_PROGRAM_BYTES)
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ValueError("data must be a byte value")
+        data = bytes(data)
+        if not 1 <= len(data) <= KEYBOARD_MAX_CHUNK_BYTES:
+            raise ValueError(
+                f"data length must be 1..{KEYBOARD_MAX_CHUNK_BYTES}")
+        if offset + len(data) > KEYBOARD_MAX_PROGRAM_BYTES:
+            raise ValueError("chunk extends beyond the 4096-byte program limit")
+        payload = struct.pack(
+            "!BIH", KEYBOARD_PROTOCOL_VERSION, upload_id, offset) + data
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_UPLOAD_CHUNK, payload)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_keyboard_response(
+                resp, "!IH", "upload-chunk", ("upload_id", "next_offset"))
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_upload_commit(self, upload_id: int):
+        """Validate and atomically commit a completed upload."""
+        _require_keyboard_uint("upload_id", upload_id, 0xFFFFFFFF)
+        payload = struct.pack("!BI", KEYBOARD_PROTOCOL_VERSION, upload_id)
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_UPLOAD_COMMIT, payload)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_keyboard_response(
+                resp, "!IHI", "upload-commit",
+                ("commit_id", "length", "crc32"))
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_run(self, commit_id: int, outputs: int):
+        """Request execution over USB or an authenticated BLE connection."""
+        _require_keyboard_uint("commit_id", commit_id, 0xFFFFFFFF, 1)
+        _require_keyboard_uint("outputs", outputs, 3, 1)
+        payload = struct.pack(
+            "!BIB", KEYBOARD_PROTOCOL_VERSION, commit_id, outputs)
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_RUN, payload)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_keyboard_response(
+                resp, "!I", "run", ("run_id",))
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_set_temporary_ble_name(self, name: Optional[str] = None):
+        """Set a volatile BLE name, or restore the board default with None."""
+        if name is None:
+            encoded = b""
+        elif not isinstance(name, str):
+            raise ValueError("name must be text or None")
+        else:
+            encoded = name.encode("utf-8")
+        if len(encoded) > 26 or any(byte < 0x20 or byte == 0x7F for byte in encoded):
+            raise ValueError(
+                "BLE name must encode to at most 26 bytes without control characters")
+        payload = bytes((KEYBOARD_PROTOCOL_VERSION, len(encoded))) + encoded
+        resp = self.device.send_cmd_sync(
+            Command.KEYBOARD_SET_TEMP_BLE_NAME, payload)
+        if resp.status == Status.SUCCESS:
+            if len(resp.data) < 2 or resp.data[0] != KEYBOARD_PROTOCOL_VERSION or \
+                    resp.data[1] != len(resp.data) - 2:
+                raise ValueError("malformed keyboard BLE-name response")
+            try:
+                resp.parsed = resp.data[2:].decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    "malformed keyboard BLE-name response: invalid UTF-8") from error
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_arm_ble(self, commit_id: int):
+        """Advertise and run once when an authenticated BLE HID host connects."""
+        _require_keyboard_uint("commit_id", commit_id, 0xFFFFFFFF, 1)
+        payload = struct.pack("!BI", KEYBOARD_PROTOCOL_VERSION, commit_id)
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_ARM_BLE, payload)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_keyboard_response(
+                resp, "!I", "arm", ("run_id",))
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_cancel(self):
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_CANCEL)
+        if resp.status == Status.SUCCESS and resp.data:
+            raise ValueError(
+                "malformed keyboard cancel response: expected 0 byte(s), "
+                f"got {len(resp.data)}")
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_get_status(self):
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_GET_STATUS)
+        if resp.status == Status.SUCCESS:
+            parsed = _parse_keyboard_response(
+                resp, "!BBBBIIIHHHHI", "status",
+                ("version", "state", "error", "outputs", "upload_id",
+                 "commit_id", "run_id", "expected", "received", "pc",
+                 "length", "crc32"), versioned=True)
+            states = (
+                "empty", "uploading", "ready", "running", "complete",
+                "cancelled", "error", "armed")
+            if parsed["state"] >= len(states):
+                raise ValueError(
+                    f"malformed keyboard status response: invalid state {parsed['state']}")
+            if parsed["outputs"] & ~0x03:
+                raise ValueError(
+                    "malformed keyboard status response: invalid output mask "
+                    f"{parsed['outputs']}")
+            if parsed["error"] > 13:
+                raise ValueError(
+                    f"malformed keyboard status response: invalid error {parsed['error']}")
+            if parsed["received"] > parsed["expected"]:
+                raise ValueError(
+                    "malformed keyboard status response: received exceeds expected")
+            if parsed["pc"] > parsed["length"]:
+                raise ValueError(
+                    "malformed keyboard status response: pc exceeds length")
+            if parsed["expected"] > KEYBOARD_MAX_PROGRAM_BYTES or \
+                    parsed["length"] > KEYBOARD_MAX_PROGRAM_BYTES:
+                raise ValueError(
+                    "malformed keyboard status response: length exceeds limit")
+            parsed["state_name"] = states[parsed["state"]]
+            resp.parsed = parsed
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def keyboard_clear(self):
+        resp = self.device.send_cmd_sync(Command.KEYBOARD_CLEAR)
+        if resp.status == Status.SUCCESS and resp.data:
+            raise ValueError(
+                "malformed keyboard clear response: expected 0 byte(s), "
+                f"got {len(resp.data)}")
+        return resp
+
+    def keyboard_upload(self, program: bytes):
+        """Upload and commit bytecode, checking every acknowledged field."""
+        if not isinstance(program, (bytes, bytearray, memoryview)):
+            raise ValueError("program must be a byte value")
+        program = bytes(program)
+        if not 1 <= len(program) <= KEYBOARD_MAX_PROGRAM_BYTES:
+            raise ValueError("program length must be 1..4096")
+        crc32 = zlib.crc32(program) & 0xFFFFFFFF
+
+        begun = self.keyboard_upload_begin(len(program), crc32)
+        if begun["next_offset"] != 0 or begun["max_chunk"] != KEYBOARD_MAX_CHUNK_BYTES:
+            raise ValueError("keyboard upload-begin metadata mismatch")
+        upload_id = begun["upload_id"]
+        offset = 0
+        while offset < len(program):
+            chunk = program[offset:offset + KEYBOARD_MAX_CHUNK_BYTES]
+            acknowledged = self.keyboard_upload_chunk(upload_id, offset, chunk)
+            next_offset = offset + len(chunk)
+            if (acknowledged["upload_id"] != upload_id or
+                    acknowledged["next_offset"] != next_offset):
+                raise ValueError("keyboard upload-chunk metadata mismatch")
+            offset = next_offset
+
+        committed = self.keyboard_upload_commit(upload_id)
+        if (committed["length"] != len(program) or
+                committed["crc32"] != crc32):
+            raise ValueError("keyboard upload-commit metadata mismatch")
+        return committed
 
     @expect_response(Status.HF_TAG_OK)
     def hf14a_scan(self):
@@ -405,6 +928,88 @@ class ChameleonCMD:
     @expect_response(Status.SUCCESS)
     def ble_adv_flood_stop(self):
         return self.device.send_cmd_sync(Command.BLE_ADV_FLOOD_STOP)
+
+    @expect_response(Status.SUCCESS)
+    def ble_adv_lab_start(self, advertising_data=b'', scan_response_data=b'', *,
+                          names=(), name_target=0, interval_ms=250,
+                          rotation_ms=0, duration_ms=0, max_advertising_events=0,
+                          mode=1, profile=None):
+        advertising_data = bytes(advertising_data)
+        scan_response_data = bytes(scan_response_data)
+        adv_has_name = validate_ble_advertising_data(advertising_data)
+        scan_has_name = validate_ble_advertising_data(
+            scan_response_data, scan_response=True)
+        if adv_has_name and scan_has_name:
+            raise ValueError("local names cannot appear in both packets")
+        names = tuple(names)
+        if profile is None:
+            profile = 2 if len(names) > 1 else 1
+        if profile not in (1, 2, 3) or mode not in (0, 1, 2):
+            raise ValueError("profile and mode must be supported advertising-lab values")
+        if name_target not in (0, 1, 2):
+            raise ValueError("name_target must be 0, 1, or 2")
+        if not 20 <= interval_ms <= 10240 or (mode != 0 and interval_ms < 100):
+            raise ValueError("interval_ms is outside the selected mode's range")
+        if duration_ms and (duration_ms % 10 or not 10 <= duration_ms <= 655350):
+            raise ValueError("duration_ms must be 0 or a 10ms multiple up to 655350")
+        if not 0 <= max_advertising_events <= 255:
+            raise ValueError("max_advertising_events must be 0..255")
+        if len(names) > 32:
+            raise ValueError("at most 32 names may be rotated")
+        if ((profile == 1 and len(names) > 1) or
+                (profile == 2 and not names) or
+                (profile == 3 and names)):
+            raise ValueError("profile does not match the supplied name list")
+        if not names and (name_target != 0 or rotation_ms != 0):
+            raise ValueError("name_target and rotation_ms require at least one name")
+        if names and name_target == 0:
+            raise ValueError("names require name_target 1 (advertisement) or 2 (scan response)")
+        if names and (adv_has_name or scan_has_name):
+            raise ValueError("base data must not contain a local name when names are supplied")
+        if mode == 2 and (scan_response_data or name_target == 2):
+            raise ValueError("non-scannable mode cannot use scan-response data")
+        interval_units = (interval_ms * 1000 + 624) // 625
+        effective_interval_ms = (interval_units * 625 + 999) // 1000
+        if len(names) > 1 and not max(100, effective_interval_ms) <= rotation_ms <= 65535:
+            raise ValueError("rotation_ms must be at least 100 and the advertising interval")
+        if len(names) <= 1 and rotation_ms != 0:
+            raise ValueError("rotation_ms must be 0 unless multiple names are supplied")
+        encoded_names = bytearray()
+        target_length = len(advertising_data if name_target == 1 else scan_response_data)
+        for name in names:
+            try:
+                encoded = name.encode('utf-8')
+            except UnicodeEncodeError as error:
+                raise ValueError("names must contain valid UTF-8") from error
+            if not encoded or len(encoded) > 26 or any(byte < 0x20 or byte == 0x7F for byte in encoded):
+                raise ValueError("names must be 1..26 UTF-8 bytes without control characters")
+            if target_length + len(encoded) + 2 > 31:
+                raise ValueError("a name does not fit in its selected legacy packet")
+            encoded_names.append(len(encoded))
+            encoded_names.extend(encoded)
+        payload = struct.pack(
+            '!BBBBHHHBBBB', 1, profile, mode, name_target, interval_units,
+            rotation_ms, duration_ms // 10, max_advertising_events,
+            len(advertising_data), len(scan_response_data), len(names))
+        payload += advertising_data + scan_response_data + encoded_names
+        resp = self.device.send_cmd_sync(Command.BLE_ADV_LAB_START, payload)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_ble_adv_lab_status(resp)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def ble_adv_lab_status(self):
+        resp = self.device.send_cmd_sync(Command.BLE_ADV_LAB_STATUS)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_ble_adv_lab_status(resp)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def ble_adv_lab_stop(self):
+        resp = self.device.send_cmd_sync(Command.BLE_ADV_LAB_STOP)
+        if resp.status == Status.SUCCESS:
+            resp.parsed = _parse_ble_adv_lab_status(resp)
+        return resp
 
     # --- Directed BLE GATT fuzzing harness (central role) -------------------
     # Point-to-point against ONE target the operator specifies by address or broadcast if selected.
@@ -946,6 +1551,66 @@ class ChameleonCMD:
         """
         return self.device.send_cmd_sync(
             Command.HF14A_4_READER_APDU, bytes(apdu), timeout=3)
+
+    def _send_iso_dep_session_command(self, command, data, timeout):
+        try:
+            return self.device.send_cmd_sync(command, data, timeout=timeout)
+        except TimeoutError:
+            # No transaction ID exists, so reconnect before any same-ID retry.
+            try:
+                self.device.close()
+            except Exception:
+                pass
+            raise
+
+    def _hf14a_4_reader_session_start(self, command):
+        resp = self._send_iso_dep_session_command(command, b'', 6)
+        if resp.status == Status.HF_TAG_OK:
+            resp.parsed = _parse_iso_dep_session_start(resp)
+        return resp
+
+    @expect_response(Status.HF_TAG_OK)
+    def hf14a_4_reader_session_start(self):
+        """Select one real ISO-DEP target and open a stateful APDU session."""
+        return self._hf14a_4_reader_session_start(
+            Command.HF14A_4_READER_SESSION_START)
+
+    @expect_response(Status.HF_TAG_OK)
+    def hf14a_4_reader_session_start_apple_transit(self):
+        """Open a session using the Apple Transit polling annotation."""
+        return self._hf14a_4_reader_session_start(
+            Command.HF14A_4_READER_SESSION_START_APPLE_TRANSIT)
+
+    @expect_response(Status.HF_TAG_OK)
+    def hf14a_4_reader_session_exchange(self, session_id: int, apdu: bytes):
+        """Exchange one raw APDU without reselecting or resetting the target."""
+        _require_iso_dep_session_id(session_id)
+        apdu = _require_iso_dep_apdu(apdu)
+        resp = self._send_iso_dep_session_command(
+            Command.HF14A_4_READER_SESSION_EXCHANGE,
+            struct.pack("!I", session_id) + apdu,
+            10)
+        if resp.status == Status.HF_TAG_OK:
+            if not 2 <= len(resp.data) <= 512:
+                raise ValueError(
+                    "malformed ISO-DEP session EXCHANGE response: "
+                    f"expected 2..512 bytes, got {len(resp.data)}")
+            resp.parsed = bytes(resp.data)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def hf14a_4_reader_session_stop(self, session_id: int):
+        """Deselect and close the matching real-card ISO-DEP session."""
+        _require_iso_dep_session_id(session_id)
+        resp = self._send_iso_dep_session_command(
+            Command.HF14A_4_READER_SESSION_STOP,
+            struct.pack("!I", session_id), 6)
+        if resp.status == Status.SUCCESS:
+            if resp.data:
+                raise ValueError(
+                    "malformed ISO-DEP session STOP response: expected no data")
+            resp.parsed = True
+        return resp
 
     def hf14a_4_emv_scan(self, amount: bytes = b''):
         """
@@ -2434,6 +3099,11 @@ class ChameleonCMD:
         """
         resp = self.device.send_cmd_sync(Command.GET_DEVICE_SETTINGS)
         if resp.status == Status.SUCCESS:
+            expected_size = struct.calcsize('!BBBBBBB6sB')
+            if len(resp.data) != expected_size:
+                raise UnexpectedResponseError(
+                    f"GET_DEVICE_SETTINGS v6 expected {expected_size} bytes, "
+                    f"got {len(resp.data)}")
             if resp.data[0] > CURRENT_VERSION_SETTINGS:
                 raise ValueError("Settings version in app older than Chameleon. "
                                  "Please upgrade client")
@@ -2543,6 +3213,28 @@ class ChameleonCMD:
     def set_ble_pairing_enable(self, enabled: bool):
         data = struct.pack('!B', enabled)
         return self.device.send_cmd_sync(Command.SET_BLE_PAIRING_ENABLE, data)
+
+    @expect_response(Status.SUCCESS)
+    def get_keyboard_hid_enable(self):
+        """
+        Is the keyboard HID feature (USB + BLE) enabled?
+
+        :return: True if enabled, False otherwise
+        """
+        resp = self.device.send_cmd_sync(Command.GET_KEYBOARD_HID_ENABLE)
+        if resp.status == Status.SUCCESS:
+            resp.parsed, = struct.unpack('!?', resp.data)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def set_keyboard_hid_enable(self, enabled: bool):
+        """
+        Enable/disable the opt-in keyboard HID feature. Persisted by
+        save_settings(); requires a device reboot to (un)expose the USB HID
+        interface and register/tear down the BLE HID service.
+        """
+        data = struct.pack('!B', enabled)
+        return self.device.send_cmd_sync(Command.SET_KEYBOARD_HID_ENABLE, data)
 
     @expect_response(Status.SUCCESS)
     def mf1_get_field_off_do_reset(self):

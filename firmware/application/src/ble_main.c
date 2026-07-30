@@ -28,6 +28,11 @@
 #include "hw_connect.h"
 #include "settings.h"
 #include "rgb_marquee.h"
+#include "keyboard_hid.h"
+#include "keyboard_payload.h"
+#if defined(PROJECT_CHAMELEON_ULTRA)
+#include "iso_dep_session.h"
+#endif
 
 #define NRF_LOG_MODULE_NAME ble_main
 #include "nrf_log.h"
@@ -59,8 +64,8 @@ NRF_LOG_MODULE_REGISTER();
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
 #define APP_ADV_INTERVAL                64                                          /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
 
-#define MIN_CONN_INTERVAL               MSEC_TO_UNITS(20, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
-#define MAX_CONN_INTERVAL               MSEC_TO_UNITS(75, UNIT_1_25_MS)             /**< Maximum acceptable connection interval (75 ms), Connection interval uses 1.25 ms units. */
+#define MIN_CONN_INTERVAL               MSEC_TO_UNITS(7.5, UNIT_1_25_MS)            /**< Minimum acceptable connection interval (7.5 ms), Connection interval uses 1.25 ms units. */
+#define MAX_CONN_INTERVAL               MSEC_TO_UNITS(15, UNIT_1_25_MS)             /**< Maximum acceptable connection interval (15 ms), Connection interval uses 1.25 ms units. */
 #define SLAVE_LATENCY                   0                                           /**< Slave latency. */
 #define CONN_SUP_TIMEOUT                MSEC_TO_UNITS(4000, UNIT_10_MS)             /**< Connection supervisory timeout (4 seconds), Supervision Timeout uses 10 ms units. */
 #define FIRST_CONN_PARAMS_UPDATE_DELAY  APP_TIMER_TICKS(5000)                       /**< Time from initiating event (connect or start of notification) to first time sd_ble_gap_conn_param_update is called (5 seconds). */
@@ -104,17 +109,67 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 {
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE},
     {BLE_UUID_BATTERY_SERVICE, BLE_UUID_TYPE_BLE},
+    // Keep the HID UUID LAST: advertised only when the keyboard feature is on
+    // (see adv_uuids_count()). Reordering breaks that gating.
+    {BLE_UUID_HUMAN_INTERFACE_DEVICE_SERVICE, BLE_UUID_TYPE_BLE},
 };
+
+// Number of service UUIDs to advertise. The trailing HID UUID is only exposed
+// when the opt-in keyboard feature is enabled, so an idle device advertises the
+// exact same set it did before the HID service existed. Uses the boot-time
+// value so advertising always matches the HID service actually registered at
+// boot (toggling the setting requires a reboot to take effect).
+static uint8_t adv_uuids_count(void) {
+    uint8_t count = sizeof(m_adv_uuids) / sizeof(m_adv_uuids[0]);
+    if (!settings_get_keyboard_hid_enable_first_load()) {
+        count--;
+    }
+    return count;
+}
 volatile bool g_is_ble_connected = false;
 volatile bool g_is_low_battery_shutdown = false;
 volatile bool g_is_ble_advertising = false;
 static volatile bool g_ble_radio_on = true;
 static ble_opt_t m_static_pin_option;
+static uint8_t m_peripheral_name[BLE_TEMPORARY_NAME_MAX_LENGTH] = DEVICE_NAME_STR;
+static uint8_t m_peripheral_name_length = sizeof(DEVICE_NAME_STR) - 1u;
 
 #define BLE_ADV_FLOOD_MAX_INTERVAL_MS 10240u
 static volatile uint8_t m_adv_flood_state = 0;
 static uint8_t m_adv_flood_payload[31];
 static uint16_t m_adv_flood_interval = 0;
+
+static volatile uint8_t m_adv_lab_state;
+static uint8_t m_adv_lab_profile;
+static uint8_t m_adv_lab_mode;
+static uint8_t m_adv_lab_reason;
+static uint8_t m_adv_lab_name_target;
+static uint8_t m_adv_lab_name_index = 0xffu;
+static uint8_t m_adv_lab_name_count;
+static uint8_t m_adv_lab_name_lengths[BLE_ADV_LAB_MAX_NAMES];
+static uint8_t m_adv_lab_names[BLE_ADV_LAB_MAX_NAMES][BLE_ADV_LAB_MAX_NAME_LENGTH];
+static uint8_t m_adv_lab_base_adv[31];
+static uint8_t m_adv_lab_base_scan[31];
+static uint8_t m_adv_lab_base_adv_length;
+static uint8_t m_adv_lab_base_scan_length;
+static uint8_t m_adv_lab_adv[2][31];
+static uint8_t m_adv_lab_scan[2][31];
+static uint8_t m_adv_lab_active_buffer;
+static uint16_t m_adv_lab_interval_units;
+static uint16_t m_adv_lab_rotation_ms;
+static uint16_t m_adv_lab_duration_units;
+static uint8_t m_adv_lab_max_events;
+static uint32_t m_adv_lab_rotation_count;
+static uint32_t m_adv_lab_rotation_period_ticks;
+static uint32_t m_adv_lab_rotation_elapsed_ticks;
+static uint32_t m_adv_lab_rotation_last_tick;
+static bool m_adv_lab_restore_normal;
+static bool m_adv_lab_restart_after_disconnect;
+static ble_adv_modes_config_t m_adv_lab_saved_modes;
+static bool m_peer_delete_pending;
+
+static void adv_lab_restore_modes(bool allow_disconnect_restart);
+static uint32_t adv_lab_finish(uint8_t reason, bool restore_normal);
 
 #define NUS_TX_QUEUE_DEPTH 2
 typedef struct {
@@ -129,6 +184,7 @@ static uint8_t m_nus_tx_count;
 static uint16_t m_nus_tx_offset;
 static volatile bool m_nus_tx_sending;
 static volatile bool m_nus_tx_pending;
+static volatile bool m_nus_hvn_inflight;
 static volatile uint32_t m_nus_tx_generation;
 static bool m_nus_comm_started;
 static uint8_t m_nus_rx_pending[BLE_NUS_MAX_DATA_LEN];
@@ -172,7 +228,8 @@ static void gap_params_init(void) {
 
     BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
 
-    err_code = sd_ble_gap_device_name_set(&sec_mode, (const uint8_t *) DEVICE_NAME_STR, strlen(DEVICE_NAME_STR));
+    err_code = sd_ble_gap_device_name_set(&sec_mode, m_peripheral_name,
+                                          m_peripheral_name_length);
     APP_ERROR_CHECK(err_code);
 
     memset(&gap_conn_params, 0, sizeof(gap_conn_params));
@@ -224,6 +281,7 @@ static void nus_tx_clear(void) {
     m_nus_tx_head = 0;
     m_nus_tx_count = 0;
     m_nus_tx_offset = 0;
+    m_nus_hvn_inflight = false;
     CRITICAL_REGION_EXIT();
 }
 
@@ -265,6 +323,7 @@ static void nus_tx_send(void) {
             break;
         }
         if (err == NRF_SUCCESS) {
+            m_nus_hvn_inflight = true;
             m_nus_tx_offset += chunk_len;
             if (m_nus_tx_offset == entry->length) {
                 entry->valid = false;
@@ -346,6 +405,9 @@ static void nus_data_handler(ble_nus_evt_t *p_evt) {
         return;
     }
     if (p_evt->type == BLE_NUS_EVT_COMM_STOPPED) {
+#if defined(PROJECT_CHAMELEON_ULTRA)
+        iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
+#endif
         m_nus_comm_started = false;
         m_nus_rx_length = 0;
         m_nus_rx_offset = 0;
@@ -365,6 +427,10 @@ static void nus_data_handler(ble_nus_evt_t *p_evt) {
         m_nus_rx_offset = 0;
         nus_rx_resume();
     } else if (p_evt->type == BLE_NUS_EVT_TX_RDY) {
+        uint8_t nested = 0;
+        app_util_critical_region_enter(&nested);
+        m_nus_hvn_inflight = false;
+        app_util_critical_region_exit(nested);
         nus_tx_send();
     }
 }
@@ -417,6 +483,15 @@ void nus_data_response(uint8_t *p_data, uint16_t length) {
 
 bool is_nus_working(void) {
     return g_is_ble_connected && m_nus_comm_started;
+}
+
+bool is_nus_tx_idle(void) {
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    bool idle = m_nus_tx_count == 0 && !m_nus_tx_sending &&
+                !m_nus_tx_pending && !m_nus_hvn_inflight;
+    app_util_critical_region_exit(nested);
+    return idle;
 }
 
 /**@brief Function for handling Queued Write Module errors.
@@ -527,6 +602,16 @@ static void services_init(void) {
 
     err_code = ble_bas_init(&m_bas, &bas_init_obj);
     APP_ERROR_CHECK(err_code);
+
+    // Keyboard HID is opt-in: only register the GATT service at boot when the
+    // feature is enabled, and never assert on failure. A full attribute table
+    // (NRF_ERROR_NO_MEM) must not turn into a boot loop that breaks USB and BLE.
+    if (settings_get_keyboard_hid_enable_first_load()) {
+        uint32_t hid_err = keyboard_hid_ble_ensure_registered();
+        if (hid_err != NRF_SUCCESS) {
+            NRF_LOG_ERROR("Keyboard HID service registration failed: 0x%08x", hid_err);
+        }
+    }
 }
 
 /**@brief Function for handling an event from the Connection Parameters Module.
@@ -607,6 +692,8 @@ static void on_adv_evt(ble_adv_evt_t ble_adv_evt) {
 static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
     ret_code_t err_code;
 
+    keyboard_hid_on_ble_evt(p_ble_evt);
+
     switch (p_ble_evt->header.evt_id) {
         case BLE_GAP_EVT_CONNECTED:
             // Only the peripheral (app/NUS) link is handled here. Central links
@@ -616,6 +703,9 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
                 ble_scan_mark_inactive();
                 break;
             }
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
+#endif
             sleep_timer_stop();
 
             NRF_LOG_INFO("Connected");
@@ -630,6 +720,12 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             nus_tx_clear();
             data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
             g_is_ble_advertising = false;
+            if (m_adv_lab_state == 2u) {
+                m_adv_lab_state = 3u;
+                m_adv_lab_reason = 4u;
+                rgb_marquee_set_ble_active_anim(false);
+                adv_lab_restore_modes(m_adv_lab_restore_normal);
+            }
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
@@ -639,6 +735,9 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
                 break;
             }
             NRF_LOG_INFO("Disconnected");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
+#endif
             // LED indication will be changed when advertising starts.
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             g_is_ble_connected = false;
@@ -648,6 +747,21 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             m_nus_rx_offset = 0;
             nus_tx_clear();
             data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
+            if (m_adv_lab_state == 3u) {
+                m_advertising.adv_modes_config = m_adv_lab_saved_modes;
+                m_adv_lab_state = 0u;
+                if (m_adv_lab_restart_after_disconnect && g_ble_radio_on) {
+                    m_adv_lab_restart_after_disconnect = false;
+                    advertising_start(false);
+                }
+            }
+            if (keyboard_payload_is_armed() && g_ble_radio_on) {
+                uint32_t advertise_error = ble_keyboard_advertising_start();
+                if (advertise_error != NRF_SUCCESS) {
+                    NRF_LOG_WARNING("Failed to restart armed keyboard advertising: 0x%x",
+                                    advertise_error);
+                }
+            }
             if (!g_ble_radio_on) {
                 advertising_stop();
             }
@@ -655,6 +769,15 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             // automatic restart through on_adv_evt().
             // call sleep_timer_start *after* unsetting g_is_ble_connected
             sleep_timer_start(SLEEP_DELAY_MS_BLE_DISCONNECTED);
+            break;
+
+        case BLE_GAP_EVT_ADV_SET_TERMINATED:
+            if (m_adv_lab_state == 2u) {
+                uint8_t reason =
+                    p_ble_evt->evt.gap_evt.params.adv_set_terminated.reason ==
+                    BLE_GAP_EVT_ADV_SET_TERMINATED_REASON_LIMIT_REACHED ? 3u : 2u;
+                (void)adv_lab_finish(reason, true);
+            }
             break;
 
         case BLE_GAP_EVT_PHY_UPDATE_REQUEST: {
@@ -675,7 +798,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             }
             // Pairing not supported? No, is supported now, hahahaha...
             // But... the pairing is enable?
-            if (settings_get_ble_pairing_enable_first_load()) {
+            if (settings_get_ble_pairing_enable()) {
                 NRF_LOG_DEBUG("Pairing is enable, The BLE_GAP_EVT_SEC_PARAMS_REQUEST event is handled by the pairing manager.");
             } else {
                 err_code = sd_ble_gap_sec_params_reply(p_ble_evt->evt.gap_evt.conn_handle, BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP, NULL, NULL);
@@ -808,7 +931,7 @@ static void advertising_init(void) {
     init.advdata.include_appearance = false;
     init.advdata.flags              = BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
 
-    init.srdata.uuids_complete.uuid_cnt = sizeof(m_adv_uuids) / sizeof(m_adv_uuids[0]);
+    init.srdata.uuids_complete.uuid_cnt = adv_uuids_count();
     init.srdata.uuids_complete.p_uuids  = m_adv_uuids;
 
     init.config.ble_adv_fast_enabled  = true;
@@ -820,6 +943,141 @@ static void advertising_init(void) {
     APP_ERROR_CHECK(err_code);
 
     ble_advertising_conn_cfg_tag_set(&m_advertising, APP_BLE_CONN_CFG_TAG);
+}
+
+static bool valid_utf8_name(const uint8_t *name, uint8_t length) {
+    uint8_t index = 0u;
+    while (index < length) {
+        uint8_t first = name[index++];
+        if (first < 0x20u || first == 0x7fu) return false;
+        if (first < 0x80u) continue;
+
+        uint8_t continuation;
+        uint32_t codepoint;
+        if ((first & 0xe0u) == 0xc0u) {
+            continuation = 1u;
+            codepoint = first & 0x1fu;
+            if (codepoint < 2u) return false;
+        } else if ((first & 0xf0u) == 0xe0u) {
+            continuation = 2u;
+            codepoint = first & 0x0fu;
+        } else if ((first & 0xf8u) == 0xf0u) {
+            continuation = 3u;
+            codepoint = first & 0x07u;
+        } else {
+            return false;
+        }
+        if ((uint16_t)index + continuation > length) return false;
+        while (continuation-- > 0u) {
+            uint8_t next = name[index++];
+            if ((next & 0xc0u) != 0x80u) return false;
+            codepoint = (codepoint << 6u) | (next & 0x3fu);
+        }
+        if ((codepoint < 0x800u && first >= 0xe0u) ||
+                (codepoint < 0x10000u && first >= 0xf0u) ||
+                (codepoint >= 0xd800u && codepoint <= 0xdfffu) ||
+                codepoint > 0x10ffffu) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint32_t normal_advertising_data_update(void) {
+    if (m_adv_flood_state != 0u || ble_adv_lab_is_active()) return NRF_ERROR_BUSY;
+
+    ble_advdata_t advdata;
+    ble_advdata_t srdata;
+    memset(&advdata, 0, sizeof(advdata));
+    memset(&srdata, 0, sizeof(srdata));
+    advdata.name_type = BLE_ADVDATA_FULL_NAME;
+    advdata.include_appearance = false;
+    advdata.flags = BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
+    srdata.uuids_complete.uuid_cnt = adv_uuids_count();
+    srdata.uuids_complete.p_uuids = m_adv_uuids;
+
+    uint8_t buffer = m_advertising.adv_data.adv_data.p_data ==
+                     m_advertising.enc_advdata[0] ? 1u : 0u;
+    ble_gap_adv_data_t next = {
+        .adv_data = {
+            .p_data = m_advertising.enc_advdata[buffer],
+            .len = BLE_GAP_ADV_SET_DATA_SIZE_MAX,
+        },
+        .scan_rsp_data = {
+            .p_data = m_advertising.enc_scan_rsp_data[buffer],
+            .len = BLE_GAP_ADV_SET_DATA_SIZE_MAX,
+        },
+    };
+    uint32_t error = ble_advdata_encode(&advdata, next.adv_data.p_data,
+                                        &next.adv_data.len);
+    if (error != NRF_SUCCESS) return error;
+    error = ble_advdata_encode(&srdata, next.scan_rsp_data.p_data,
+                               &next.scan_rsp_data.len);
+    if (error != NRF_SUCCESS) return error;
+
+    if (g_is_ble_advertising) {
+        error = sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, &next, NULL);
+        if (error != NRF_SUCCESS) return error;
+    }
+    m_advertising.adv_data = next;
+    m_advertising.p_adv_data = &m_advertising.adv_data;
+    return NRF_SUCCESS;
+}
+
+uint32_t ble_peripheral_name_set_temporary(const uint8_t *name, uint8_t length) {
+    const uint8_t *effective = name;
+    uint8_t effective_length = length;
+    if (length == 0u) {
+        effective = (const uint8_t *)DEVICE_NAME_STR;
+        effective_length = sizeof(DEVICE_NAME_STR) - 1u;
+    } else if (name == NULL || length > BLE_TEMPORARY_NAME_MAX_LENGTH ||
+               !valid_utf8_name(name, length)) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (m_adv_flood_state != 0u || ble_adv_lab_is_active()) return NRF_ERROR_BUSY;
+
+    uint8_t previous[BLE_TEMPORARY_NAME_MAX_LENGTH];
+    uint8_t previous_length = m_peripheral_name_length;
+    memcpy(previous, m_peripheral_name, previous_length);
+
+    ble_gap_conn_sec_mode_t sec_mode;
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
+    uint32_t error = sd_ble_gap_device_name_set(&sec_mode, effective,
+                                                effective_length);
+    if (error != NRF_SUCCESS) return error;
+    memcpy(m_peripheral_name, effective, effective_length);
+    m_peripheral_name_length = effective_length;
+    error = normal_advertising_data_update();
+    if (error != NRF_SUCCESS) {
+        (void)sd_ble_gap_device_name_set(&sec_mode, previous, previous_length);
+        memcpy(m_peripheral_name, previous, previous_length);
+        m_peripheral_name_length = previous_length;
+        (void)normal_advertising_data_update();
+    }
+    return error;
+}
+
+uint8_t ble_peripheral_name_get(uint8_t *name) {
+    if (name != NULL) memcpy(name, m_peripheral_name, m_peripheral_name_length);
+    return m_peripheral_name_length;
+}
+
+uint32_t ble_keyboard_advertising_start(void) {
+    if (!g_ble_radio_on || m_adv_flood_state != 0u || ble_adv_lab_is_active()) {
+        return NRF_ERROR_INVALID_STATE;
+    }
+    if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
+        return NRF_SUCCESS;
+    }
+    if (g_is_ble_advertising) {
+        g_is_ble_advertising = false;
+        uint32_t error = ble_advertising_restart_without_whitelist(&m_advertising);
+        return error == NRF_SUCCESS && g_is_ble_advertising
+               ? NRF_SUCCESS : NRF_ERROR_INVALID_STATE;
+    }
+    m_advertising.whitelist_temporarily_disabled = true;
+    advertising_start(false);
+    return g_is_ble_advertising ? NRF_SUCCESS : NRF_ERROR_INVALID_STATE;
 }
 
 /**@brief Clear bond information from persistent storage.
@@ -856,6 +1114,9 @@ void advertising_start(bool erase_bonds) {
     if (!g_ble_radio_on) {
         return;
     }
+    if (ble_adv_lab_is_active()) {
+        return;
+    }
     if (g_is_ble_advertising && !erase_bonds) {
         return;
     }
@@ -864,12 +1125,13 @@ void advertising_start(bool erase_bonds) {
         advertising_stop();
     }
 
-    if (erase_bonds == true && settings_get_ble_pairing_enable_first_load()) {
+    if (erase_bonds == true && settings_get_ble_pairing_enable()) {
         // Advertising is started by PM_EVT_PEERS_DELETE_SUCCEEDED event.
         // So we don't call `ble_advertising_start()` after `delete_bonds_all()`.
+        m_peer_delete_pending = true;
         delete_bonds_all();
     } else {
-        if (settings_get_ble_pairing_enable_first_load()) {
+        if (settings_get_ble_pairing_enable()) {
             whitelist_set(PM_PEER_ID_LIST_SKIP_NO_ID_ADDR);
         }
         ret_code_t ret = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
@@ -897,12 +1159,19 @@ void advertising_stop(void) {
 }
 
 bool is_ble_advertising(void) {
-    return g_is_ble_advertising || m_adv_flood_state != 0;
+    return g_is_ble_advertising || m_adv_flood_state != 0 ||
+           m_adv_lab_state == 2u;
 }
 
 bool ble_command_link_authorized(void) {
     return m_conn_handle != BLE_CONN_HANDLE_INVALID && m_nus_comm_started &&
            ble_conn_state_encrypted(m_conn_handle);
+}
+
+bool ble_keyboard_link_authorized(void) {
+    return ble_command_link_authorized() &&
+           ble_conn_state_mitm_protected(m_conn_handle) &&
+           ble_conn_state_lesc(m_conn_handle);
 }
 
 /**@brief Function for handling Peer Manager events.
@@ -920,6 +1189,13 @@ static void pm_evt_handler(pm_evt_t const *p_evt) {
             break;
 
         case PM_EVT_PEERS_DELETE_SUCCEEDED:
+            m_peer_delete_pending = false;
+            advertising_start(false);
+            break;
+
+        case PM_EVT_PEERS_DELETE_FAILED:
+            m_peer_delete_pending = false;
+            NRF_LOG_WARNING("Failed to delete BLE peers; advertising with existing bonds");
             advertising_start(false);
             break;
 
@@ -1119,6 +1395,7 @@ static void cache_original_address(void) {
 }
 
 uint32_t ble_addr_set(uint8_t mode, const uint8_t *addr_le) {
+    if (ble_adv_lab_is_active()) return NRF_ERROR_BUSY;
     cache_original_address();
 
     if (g_is_ble_connected || ble_central_is_connected() || ble_central_is_connecting()) {
@@ -1244,6 +1521,10 @@ uint32_t ble_radio_set(uint8_t on) {
             return NRF_SUCCESS;
         }
         g_ble_radio_on = true;
+        if (m_adv_lab_state == 3u) {
+            m_adv_lab_restart_after_disconnect = true;
+            return NRF_SUCCESS;
+        }
         // Restore peripheral advertising if it was running before. We don't
         // know the operator's pre-toggle intent (erase_bonds or not), so we
         // pick the non-destructive restart.
@@ -1256,7 +1537,12 @@ uint32_t ble_radio_set(uint8_t on) {
     // Mark the policy off before stopping GAP procedures so asynchronous
     // disconnect/bond events cannot restart advertising during shutdown.
     g_ble_radio_on = false;
-    uint32_t err = ble_adv_flood_stop();
+    uint32_t err = ble_adv_lab_stop();
+    if (err != NRF_SUCCESS) {
+        g_ble_radio_on = true;
+        return err;
+    }
+    err = ble_adv_flood_stop();
     if (err != NRF_SUCCESS) {
         g_ble_radio_on = true;
         return err;
@@ -1269,6 +1555,14 @@ uint32_t ble_radio_set(uint8_t on) {
     if (is_ble_scanning()) {
         err = ble_scan_stop();
         if (err != NRF_SUCCESS) {
+            g_ble_radio_on = true;
+            return err;
+        }
+    }
+    if (m_conn_handle != BLE_CONN_HANDLE_INVALID && m_adv_lab_state == 3u) {
+        err = sd_ble_gap_disconnect(m_conn_handle,
+                                    BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+        if (err != NRF_SUCCESS && err != NRF_ERROR_INVALID_STATE) {
             g_ble_radio_on = true;
             return err;
         }
@@ -1299,6 +1593,7 @@ uint32_t ble_adv_flood_start(uint8_t fill_byte, uint16_t interval_ms) {
     if (!g_ble_radio_on) {
         return NRF_ERROR_INVALID_STATE;
     }
+    if (ble_adv_lab_is_active()) return NRF_ERROR_BUSY;
     // Clamp interval to regulatory minimum and reject values above the
     // SoftDevice max before stopping normal advertising.
     if (interval_ms < 100) interval_ms = 100;
@@ -1377,6 +1672,324 @@ uint32_t ble_adv_flood_stop(void) {
     m_adv_flood_state = 0;
     rgb_marquee_set_ble_active_anim(false);
     return err;
+}
+
+static bool adv_lab_data_valid(const uint8_t *data, uint8_t length,
+                               bool scan_response, bool *has_name) {
+    uint8_t offset = 0u;
+    *has_name = false;
+    while (offset < length) {
+        uint8_t field_length = data[offset];
+        if (field_length == 0u ||
+                (uint16_t)offset + 1u + field_length > length) {
+            return false;
+        }
+        uint8_t type = data[offset + 1u];
+        if (scan_response && type == BLE_GAP_AD_TYPE_FLAGS) return false;
+        if (type == BLE_GAP_AD_TYPE_SHORT_LOCAL_NAME ||
+                type == BLE_GAP_AD_TYPE_COMPLETE_LOCAL_NAME) {
+            if (*has_name) return false;
+            *has_name = true;
+        }
+        offset += 1u + field_length;
+    }
+    return offset == length;
+}
+
+static void adv_lab_build_buffer(uint8_t buffer, uint8_t name_index) {
+    if (m_adv_lab_base_adv_length != 0u) {
+        memcpy(m_adv_lab_adv[buffer], m_adv_lab_base_adv,
+               m_adv_lab_base_adv_length);
+    }
+    if (m_adv_lab_base_scan_length != 0u) {
+        memcpy(m_adv_lab_scan[buffer], m_adv_lab_base_scan,
+               m_adv_lab_base_scan_length);
+    }
+    uint8_t adv_length = m_adv_lab_base_adv_length;
+    uint8_t scan_length = m_adv_lab_base_scan_length;
+    if (m_adv_lab_name_count != 0u) {
+        uint8_t name_length = m_adv_lab_name_lengths[name_index];
+        uint8_t *target = m_adv_lab_name_target == 1u
+                          ? m_adv_lab_adv[buffer] : m_adv_lab_scan[buffer];
+        uint8_t *target_length = m_adv_lab_name_target == 1u
+                                 ? &adv_length : &scan_length;
+        target[(*target_length)++] = name_length + 1u;
+        target[(*target_length)++] = BLE_GAP_AD_TYPE_COMPLETE_LOCAL_NAME;
+        memcpy(&target[*target_length], m_adv_lab_names[name_index], name_length);
+        *target_length += name_length;
+    }
+}
+
+static void adv_lab_lengths(uint8_t *adv_length, uint8_t *scan_length) {
+    *adv_length = m_adv_lab_base_adv_length;
+    *scan_length = m_adv_lab_base_scan_length;
+    if (m_adv_lab_name_count != 0u) {
+        uint8_t addition = m_adv_lab_name_lengths[m_adv_lab_name_index] + 2u;
+        if (m_adv_lab_name_target == 1u) *adv_length += addition;
+        else *scan_length += addition;
+    }
+}
+
+static void adv_lab_disable_normal_modes(void) {
+    m_adv_lab_saved_modes = m_advertising.adv_modes_config;
+    memset(&m_advertising.adv_modes_config, 0,
+           sizeof(m_advertising.adv_modes_config));
+    m_advertising.adv_modes_config.ble_adv_on_disconnect_disabled = true;
+}
+
+static void adv_lab_restore_modes(bool allow_disconnect_restart) {
+    m_advertising.adv_modes_config = m_adv_lab_saved_modes;
+    if (!allow_disconnect_restart) {
+        m_advertising.adv_modes_config.ble_adv_on_disconnect_disabled = true;
+    }
+}
+
+static uint32_t adv_lab_finish(uint8_t reason, bool restore_normal) {
+    uint32_t error = NRF_SUCCESS;
+    if (m_adv_lab_state == 2u) {
+        error = sd_ble_gap_adv_stop(m_advertising.adv_handle);
+        if (error == NRF_ERROR_INVALID_STATE) error = NRF_SUCCESS;
+    }
+    uint32_t configure_error = sd_ble_gap_adv_set_configure(
+        &m_advertising.adv_handle, NULL, NULL);
+    if (configure_error != NRF_SUCCESS && configure_error != NRF_ERROR_INVALID_STATE &&
+            error == NRF_SUCCESS) {
+        error = configure_error;
+    }
+    m_advertising.adv_modes_config = m_adv_lab_saved_modes;
+    m_adv_lab_state = error == NRF_SUCCESS ? 0u : 4u;
+    m_adv_lab_reason = error == NRF_SUCCESS ? reason : 7u;
+    rgb_marquee_set_ble_active_anim(false);
+    if (restore_normal && m_adv_lab_restore_normal && g_ble_radio_on &&
+            m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        advertising_start(false);
+    }
+    return error;
+}
+
+bool ble_adv_lab_is_active(void) {
+    return m_adv_lab_state == 2u || m_adv_lab_state == 3u;
+}
+
+uint32_t ble_adv_lab_start(uint8_t profile, uint8_t mode, uint8_t name_target,
+                           uint16_t interval_units, uint16_t rotation_ms,
+                           uint16_t duration_units, uint8_t max_adv_events,
+                           const uint8_t *adv_data, uint8_t adv_length,
+                           const uint8_t *scan_data, uint8_t scan_length,
+                           const uint8_t *names, uint16_t names_length,
+                           uint8_t name_count) {
+    if (!g_ble_radio_on) return NRF_ERROR_INVALID_STATE;
+    if (profile < 1u || profile > 3u || mode > 2u ||
+            name_target > 2u || adv_length > 31u || scan_length > 31u ||
+            name_count > BLE_ADV_LAB_MAX_NAMES ||
+            (adv_length != 0u && adv_data == NULL) ||
+            (scan_length != 0u && scan_data == NULL) ||
+            (names_length != 0u && names == NULL)) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if (m_conn_handle != BLE_CONN_HANDLE_INVALID || m_adv_flood_state != 0u ||
+            ble_adv_lab_is_active() || is_ble_scanning() ||
+            ble_central_is_connected() || ble_central_is_connecting() ||
+            keyboard_payload_is_running()) {
+        return NRF_ERROR_BUSY;
+    }
+    uint16_t minimum_interval = mode == 0u ? 32u : 160u;
+    if (interval_units < minimum_interval || interval_units > 0x4000u ||
+            (mode == 2u && (scan_length != 0u || name_target == 2u))) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    if ((name_count == 0u && (name_target != 0u || rotation_ms != 0u)) ||
+            (name_count != 0u && name_target == 0u) ||
+            (profile == 1u && name_count > 1u) ||
+            (profile == 2u && name_count == 0u) ||
+            (profile == 3u && name_count != 0u) ||
+            (name_count <= 1u && rotation_ms != 0u)) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+    uint16_t interval_ms = (uint16_t)(((uint32_t)interval_units * 625u + 999u) / 1000u);
+    if (name_count > 1u && (rotation_ms < 100u || rotation_ms < interval_ms)) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+
+    bool adv_has_name;
+    bool scan_has_name;
+    if (!adv_lab_data_valid(adv_data, adv_length, false, &adv_has_name) ||
+            !adv_lab_data_valid(scan_data, scan_length, true, &scan_has_name) ||
+            (adv_has_name && scan_has_name) ||
+            (name_count != 0u && (adv_has_name || scan_has_name))) {
+        return NRF_ERROR_INVALID_PARAM;
+    }
+
+    uint16_t offset = 0u;
+    for (uint8_t index = 0u; index < name_count; index++) {
+        if (offset >= names_length) return NRF_ERROR_INVALID_PARAM;
+        uint8_t length = names[offset++];
+        if (length == 0u || length > BLE_ADV_LAB_MAX_NAME_LENGTH ||
+                (uint32_t)offset + length > names_length ||
+                !valid_utf8_name(&names[offset], length)) {
+            return NRF_ERROR_INVALID_PARAM;
+        }
+        uint8_t target_length = name_target == 1u ? adv_length : scan_length;
+        if ((uint16_t)target_length + length + 2u > 31u) {
+            return NRF_ERROR_DATA_SIZE;
+        }
+        m_adv_lab_name_lengths[index] = length;
+        memcpy(m_adv_lab_names[index], &names[offset], length);
+        offset += length;
+    }
+    if (offset != names_length) return NRF_ERROR_INVALID_PARAM;
+
+    if (adv_length != 0u) memcpy(m_adv_lab_base_adv, adv_data, adv_length);
+    if (scan_length != 0u) memcpy(m_adv_lab_base_scan, scan_data, scan_length);
+    m_adv_lab_base_adv_length = adv_length;
+    m_adv_lab_base_scan_length = scan_length;
+    m_adv_lab_profile = profile;
+    m_adv_lab_mode = mode;
+    m_adv_lab_name_target = name_target;
+    m_adv_lab_name_count = name_count;
+    m_adv_lab_name_index = name_count == 0u ? 0xffu : 0u;
+    m_adv_lab_interval_units = interval_units;
+    m_adv_lab_rotation_ms = rotation_ms;
+    m_adv_lab_duration_units = duration_units;
+    m_adv_lab_max_events = max_adv_events;
+    m_adv_lab_rotation_count = 0u;
+    m_adv_lab_reason = 0u;
+    m_adv_lab_rotation_period_ticks = name_count > 1u
+                                      ? APP_TIMER_TICKS(rotation_ms) : 0u;
+    m_adv_lab_rotation_elapsed_ticks = 0u;
+    m_adv_lab_rotation_last_tick = app_timer_cnt_get();
+    m_adv_lab_restart_after_disconnect = false;
+    m_adv_lab_active_buffer = 0u;
+    adv_lab_build_buffer(0u, 0u);
+    uint8_t active_adv_length;
+    uint8_t active_scan_length;
+    adv_lab_lengths(&active_adv_length, &active_scan_length);
+
+    ble_gap_adv_params_t params = {0};
+    params.properties.type = mode == 0u
+                             ? BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED
+                             : mode == 1u
+                             ? BLE_GAP_ADV_TYPE_NONCONNECTABLE_SCANNABLE_UNDIRECTED
+                             : BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
+    params.interval = interval_units;
+    params.duration = duration_units;
+    params.max_adv_evts = max_adv_events;
+    params.filter_policy = BLE_GAP_ADV_FP_ANY;
+    params.primary_phy = BLE_GAP_PHY_1MBPS;
+    ble_gap_adv_data_t data = {
+        .adv_data = {.p_data = m_adv_lab_adv[0], .len = active_adv_length},
+        .scan_rsp_data = {.p_data = active_scan_length == 0u ? NULL : m_adv_lab_scan[0],
+                          .len = active_scan_length},
+    };
+
+    m_adv_lab_restore_normal = g_is_ble_advertising || m_peer_delete_pending;
+    advertising_stop();
+    if (g_is_ble_advertising) return NRF_ERROR_BUSY;
+    adv_lab_disable_normal_modes();
+    uint32_t error = sd_ble_gap_adv_set_configure(&m_advertising.adv_handle,
+                                                  &data, &params);
+    if (error == NRF_SUCCESS) {
+        error = sd_ble_gap_adv_start(m_advertising.adv_handle,
+                                     mode == 0u ? APP_BLE_CONN_CFG_TAG
+                                                : BLE_CONN_CFG_TAG_DEFAULT);
+    }
+    if (error != NRF_SUCCESS) {
+        (void)sd_ble_gap_adv_set_configure(&m_advertising.adv_handle, NULL, NULL);
+        m_advertising.adv_modes_config = m_adv_lab_saved_modes;
+        m_adv_lab_state = 4u;
+        m_adv_lab_reason = 7u;
+        if (m_adv_lab_restore_normal) advertising_start(false);
+        return error;
+    }
+
+    g_is_ble_advertising = false;
+    m_adv_lab_state = 2u;
+    rgb_marquee_set_ble_active_anim(true);
+    return NRF_SUCCESS;
+}
+
+void ble_adv_lab_process(void) {
+    if (m_adv_lab_state != 2u || m_adv_lab_name_count < 2u) {
+        return;
+    }
+    uint32_t now = app_timer_cnt_get();
+    m_adv_lab_rotation_elapsed_ticks += app_timer_cnt_diff_compute(
+                                           now, m_adv_lab_rotation_last_tick);
+    m_adv_lab_rotation_last_tick = now;
+    if (m_adv_lab_rotation_elapsed_ticks < m_adv_lab_rotation_period_ticks) {
+        return;
+    }
+    uint32_t steps = m_adv_lab_rotation_elapsed_ticks /
+                     m_adv_lab_rotation_period_ticks;
+    m_adv_lab_rotation_elapsed_ticks %= m_adv_lab_rotation_period_ticks;
+    uint8_t next_name = (uint8_t)((m_adv_lab_name_index +
+                                  steps % m_adv_lab_name_count) %
+                                 m_adv_lab_name_count);
+    uint8_t next_buffer = m_adv_lab_active_buffer ^ 1u;
+    adv_lab_build_buffer(next_buffer, next_name);
+    uint8_t adv_length;
+    uint8_t scan_length;
+    uint8_t old_name = m_adv_lab_name_index;
+    m_adv_lab_name_index = next_name;
+    adv_lab_lengths(&adv_length, &scan_length);
+    m_adv_lab_name_index = old_name;
+    ble_gap_adv_data_t data = {
+        .adv_data = {.p_data = m_adv_lab_adv[next_buffer], .len = adv_length},
+        .scan_rsp_data = {.p_data = scan_length == 0u ? NULL : m_adv_lab_scan[next_buffer],
+                          .len = scan_length},
+    };
+    uint32_t error = sd_ble_gap_adv_set_configure(&m_advertising.adv_handle,
+                                                  &data, NULL);
+    if (error != NRF_SUCCESS) {
+        (void)adv_lab_finish(7u, true);
+        return;
+    }
+    m_adv_lab_active_buffer = next_buffer;
+    m_adv_lab_name_index = next_name;
+    m_adv_lab_rotation_count += steps;
+}
+
+uint32_t ble_adv_lab_stop(void) {
+    if (m_adv_lab_state == 0u) return NRF_SUCCESS;
+    if (m_adv_lab_state == 3u) {
+        adv_lab_restore_modes(m_adv_lab_restore_normal);
+        m_adv_lab_reason = 1u;
+        rgb_marquee_set_ble_active_anim(false);
+        return NRF_SUCCESS;
+    }
+    return adv_lab_finish(1u, true);
+}
+
+uint16_t ble_adv_lab_get_status(uint8_t *out, uint16_t max_length) {
+    if (out == NULL || max_length < BLE_ADV_LAB_STATUS_LENGTH) return 0u;
+    uint8_t adv_length = m_adv_lab_base_adv_length;
+    uint8_t scan_length = m_adv_lab_base_scan_length;
+    if (m_adv_lab_name_count != 0u && m_adv_lab_name_index != 0xffu) {
+        uint8_t addition = m_adv_lab_name_lengths[m_adv_lab_name_index] + 2u;
+        if (m_adv_lab_name_target == 1u) adv_length += addition;
+        else scan_length += addition;
+    }
+    out[0] = BLE_ADV_LAB_VERSION;
+    out[1] = m_adv_lab_state;
+    out[2] = m_adv_lab_profile;
+    out[3] = m_adv_lab_mode;
+    out[4] = m_adv_lab_reason;
+    out[5] = m_adv_lab_name_index;
+    out[6] = m_adv_lab_name_count;
+    out[7] = adv_length;
+    out[8] = scan_length;
+    out[9] = (uint8_t)(m_adv_lab_interval_units >> 8u);
+    out[10] = (uint8_t)m_adv_lab_interval_units;
+    out[11] = (uint8_t)(m_adv_lab_rotation_ms >> 8u);
+    out[12] = (uint8_t)m_adv_lab_rotation_ms;
+    out[13] = (uint8_t)(m_adv_lab_duration_units >> 8u);
+    out[14] = (uint8_t)m_adv_lab_duration_units;
+    out[15] = m_adv_lab_max_events;
+    out[16] = (uint8_t)(m_adv_lab_rotation_count >> 24u);
+    out[17] = (uint8_t)(m_adv_lab_rotation_count >> 16u);
+    out[18] = (uint8_t)(m_adv_lab_rotation_count >> 8u);
+    out[19] = (uint8_t)m_adv_lab_rotation_count;
+    return BLE_ADV_LAB_STATUS_LENGTH;
 }
 
 /**

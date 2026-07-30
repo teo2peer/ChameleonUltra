@@ -17,6 +17,7 @@ static settings_data_t config;
 static uint16_t m_config_crc;
 static bool m_config_crc_valid;
 static bool m_ble_pairing_enable_first_load_value;
+static bool m_keyboard_hid_enable_first_load_value;
 
 static void update_config_crc(void) {
     calc_14a_crc_lut((uint8_t *)&config, sizeof(config), (uint8_t *)&m_config_crc);
@@ -89,6 +90,11 @@ void settings_init_ble_pairing_enable_config(void) {
     config.ble_pairing_enable = false;
 }
 
+// keyboard HID opt-in (reuses a reserved config bit, off by default)
+void settings_init_keyboard_hid_enable_config(void) {
+    config.keyboard_hid_enable = false;
+}
+
 // add on version6
 void settings_init_sleep_timeout_config(void) {
     config.sleep_timeout = SETTINGS_SLEEP_TIMEOUT_DEFAULT_S;
@@ -102,6 +108,7 @@ void settings_init_config(void) {
     settings_init_button_long_press_config();
     settings_init_ble_connect_key_config();
     settings_init_ble_pairing_enable_config();
+    settings_init_keyboard_hid_enable_config();
     settings_init_sleep_timeout_config();
 }
 
@@ -166,6 +173,7 @@ void settings_load_config(void) {
 
     // Assign values only after the first configuration load.
     m_ble_pairing_enable_first_load_value = config.ble_pairing_enable;
+    m_keyboard_hid_enable_first_load_value = config.keyboard_hid_enable;
 }
 
 uint8_t settings_save_config(void) {
@@ -341,6 +349,18 @@ bool settings_get_ble_pairing_enable(void) {
 
 bool settings_get_ble_pairing_enable_first_load(void) {
     return m_ble_pairing_enable_first_load_value;
+}
+
+void settings_set_keyboard_hid_enable(bool enable) {
+    config.keyboard_hid_enable = enable;
+}
+
+bool settings_get_keyboard_hid_enable(void) {
+    return config.keyboard_hid_enable;
+}
+
+bool settings_get_keyboard_hid_enable_first_load(void) {
+    return m_keyboard_hid_enable_first_load_value;
 }
 
 uint32_t settings_get_sleep_timeout(void) {
