@@ -266,8 +266,9 @@ evidencia explícita de pérdida.
 Cabecera de página v2, 72 bytes: la metadata anterior seguida de
 `page_first_sequence:u32be, page_next_sequence:u32be, record_count:u16be,
 record_bytes:u16be, crc32:u32be, delivery_token:u64be`. El token usa el rango
-positivo `1..7FFFFFFFFFFFFFFF`. El CRC32 IEEE cubre solo el stream de
-registros. Cada registro es:
+positivo `1..7FFFFFFFFFFFFFFF`. El CRC32 IEEE cubre la cabecera completa y el
+stream de registros, tratando su propio campo como cuatro bytes cero. Cada
+registro es:
 
 ```
 body_length:u16be, version:u8, type:u8, sequence:u32be,

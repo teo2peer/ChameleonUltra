@@ -468,19 +468,20 @@ hf_capture_result_t hf_capture_get(uint32_t session_id, bool acknowledge_present
     put_u32(&response[52], next_sequence);
     put_u16(&response[56], count);
     put_u16(&response[58], data_length);
-    put_u32(&response[60], crc32(&response[HF_CAPTURE_PAGE_HEADER_SIZE],
-                                  data_length));
+    put_u32(&response[60], 0u);
     uint64_t delivery_token = 0u;
     if (count > 0u) {
         CRITICAL_REGION_ENTER();
         delivery_token = m_next_delivery_token++;
         if (m_next_delivery_token > INT64_MAX) m_next_delivery_token = 1u;
         m_last_delivered_token = delivery_token;
-        if (count > m_delivered_records) m_delivered_records = count;
+        m_delivered_records = count;
         CRITICAL_REGION_EXIT();
     }
     put_u64(&response[64], delivery_token);
-    *response_length = (uint16_t)(HF_CAPTURE_PAGE_HEADER_SIZE + data_length);
+    uint16_t page_length = (uint16_t)(HF_CAPTURE_PAGE_HEADER_SIZE + data_length);
+    put_u32(&response[60], crc32(response, page_length));
+    *response_length = page_length;
     return HF_CAPTURE_RESULT_OK;
 }
 

@@ -1024,6 +1024,19 @@ inline void mf1_toolbox_report_healthy() {
     while (NRF_LOG_PROCESS());
 }
 
+static uint16_t mf1_toolbox_reselect_same_tag(uint32_t expected_cuid) {
+    uint16_t status = pcd_14a_reader_fast_select(p_tag_info);
+    if (status == STATUS_HF_TAG_OK) return status;
+
+    reset_radio_field_with_delay();
+    status = pcd_14a_reader_scan_auto(p_tag_info);
+    if (status != STATUS_HF_TAG_OK ||
+            get_u32_tag_uid(p_tag_info) != expected_cuid) {
+        return STATUS_HF_TAG_NO;
+    }
+    return STATUS_HF_TAG_OK;
+}
+
 static uint16_t mf1_toolbox_check_key_candidates(
     uint8_t block,
     uint8_t key_type,
@@ -1045,7 +1058,7 @@ static uint16_t mf1_toolbox_check_key_candidates(
             *cuid = get_u32_tag_uid(p_tag_info);
             *tag_selected = true;
         } else {
-            status = pcd_14a_reader_fast_select(p_tag_info);
+            status = mf1_toolbox_reselect_same_tag(*cuid);
             if (status != STATUS_HF_TAG_OK) return status;
         }
 
@@ -1102,7 +1115,7 @@ uint16_t mf1_toolbox_check_keys_of_sectors(
                 // Software Crypto1 auth does not arm the RC522 cipher. Re-auth
                 // in hardware before reading a potentially exposed Key B.
                 if (!skipKeyB) {
-                    status = pcd_14a_reader_fast_select(p_tag_info);
+                    status = mf1_toolbox_reselect_same_tag(cuid);
                     if (status == STATUS_HF_TAG_NO) return status;
                     if (status == STATUS_HF_TAG_OK) {
                         status = pcd_14a_reader_mf1_auth(

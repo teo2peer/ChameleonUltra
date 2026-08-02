@@ -2782,6 +2782,9 @@ static data_frame_tx_t *cmd_processor_hf_capture_start(uint16_t cmd,
             data[1] > HF_CAPTURE_MODE_READER || cmd_read_u32be(&data[2]) == 0u) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
+    if (iso_dep_session_is_active()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
     uint32_t session_id = 0;
     hf_capture_result_t result = hf_capture_start((hf_capture_mode_t)data[1],
                                                    data_frame_get_transport(),
@@ -4237,8 +4240,12 @@ static void auto_response_data(data_frame_tx_t *resp) {
 }
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
-static bool hf_capture_blocks_command(uint16_t cmd) {
+static bool hf_capture_blocks_command(uint16_t cmd,
+                                      data_frame_transport_t transport) {
     if (!hf_capture_is_active()) return false;
+    if (transport != hf_capture_owner()) {
+        return cmd != DATA_CMD_HF_CAPTURE_STATUS;
+    }
     switch (cmd) {
         case DATA_CMD_CHANGE_DEVICE_MODE:
         case DATA_CMD_SET_ACTIVE_SLOT:
@@ -4301,7 +4308,7 @@ void on_data_frame_received(uint16_t cmd, uint16_t status, uint16_t length, uint
     }
     app_cmd_active_slot_snapshot_process();
 #if defined(PROJECT_CHAMELEON_ULTRA)
-    if (hf_capture_blocks_command(cmd)) {
+    if (hf_capture_blocks_command(cmd, transport)) {
         response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
         auto_response_data(response);
         return;
