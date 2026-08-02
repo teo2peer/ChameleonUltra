@@ -135,6 +135,16 @@ export DFU_SIGNING_KEY="$KEY"
 
 if [ "$FLASH_MODE" = "full" ]; then
   echo "==> Building and packaging full FDS-aware migration DFU…"
+  # The full package also needs a strictly-increasing DFU version, or the
+  # bootloader rejects a re-flash with FwVersionFailure when no new commit has
+  # bumped the git-derived base. Reuse the app-only path's monotonic high-water
+  # mark so repeated `--full` runs always increase past what the device holds.
+  if [ -z "${APPLICATION_VERSION:-}" ]; then
+    APPLICATION_VERSION="$(derive_app_version)"
+    echo "==> Auto APPLICATION_VERSION=$APPLICATION_VERSION (export APPLICATION_VERSION to override)"
+  fi
+  export APPLICATION_VERSION
+  export BOOTLOADER_VERSION="${BOOTLOADER_VERSION:-$APPLICATION_VERSION}"
   CURRENT_DEVICE_TYPE=ultra "$SCRIPT_DIR/firmware/build.sh" package
 else
   if [ -z "${APPLICATION_VERSION:-}" ]; then
@@ -267,7 +277,10 @@ echo "    programmed OK"
 if [ "$FLASH_MODE" = "full" ]; then
   mkdir -p "$STATE_DIR"
   touch "$MIGRATED_MARKER"
-  printf '%s\n' "$(git_base_version)" > "$VERSION_STATE"
+  # Keep the monotonic high-water mark at/above the version just flashed so the
+  # next flash strictly increases (never lower it back to the git base).
+  cur="$(cat "$VERSION_STATE" 2>/dev/null || echo 0)"
+  if (( APPLICATION_VERSION > cur )); then printf '%s\n' "$APPLICATION_VERSION" > "$VERSION_STATE"; fi
   echo "    migration recorded ($MIGRATED_MARKER) — app-only DFU now enabled"
 fi
 

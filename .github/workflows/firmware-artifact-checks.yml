@@ -14,7 +14,8 @@ on:
 jobs:
   check-reports:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -23,8 +24,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+      - name: Validate source workflow
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.run-id || github.event.workflow_run.id }}
+        with:
+          script: |
+            const runId = Number(process.env.RUN_ID);
+            if (!Number.isSafeInteger(runId) || runId <= 0) {
+              core.setFailed('Invalid workflow run ID.');
+              return;
+            }
+            const {data: run} = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+            const allowedWorkflows = new Map([
+              ['PR handler', '.github/workflows/on_pr.yml'],
+              ['Push handler', '.github/workflows/on_push.yml'],
+            ]);
+            if (allowedWorkflows.get(run.name) !== run.path || run.status !== 'completed' ||
+                run.conclusion !== 'success' ||
+                run.repository.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.setFailed('Artifacts must come from a successful trusted source workflow.');
+            }
       - name: Download link and size reports
         uses: actions/download-artifact@v4
         with:

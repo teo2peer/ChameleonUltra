@@ -35,6 +35,10 @@ check_map_region() {
     exit 1
   fi
   read -r origin length <<<"$values"
+  if [[ ! $origin =~ ^0[xX][0-9a-fA-F]+$ || ! $length =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+    echo "$(basename "$map_file") has malformed $region region values." >&2
+    exit 1
+  fi
   if ((origin != expected_origin || length != expected_length)); then
     printf '%s %s region is [0x%X,+0x%X), expected [0x%X,+0x%X).\n' \
       "$(basename "$map_file")" "$region" "$origin" "$length" \

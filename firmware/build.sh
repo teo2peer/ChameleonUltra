@@ -132,23 +132,34 @@ fi
     --softdevice softdevice.hex \
     --bootloader-version "$bootloader_version" --bl-settings-version 2 \
     settings.hex
-  mergehex \
-    --merge \
-    settings.hex \
-    application.hex \
-    --output application_merged.hex
+  # Merged full-image hex + binaries.zip are only for direct SWD/J-Link
+  # programming; the DFU package above is what USB/BLE DFU flashing uses. Skip
+  # gracefully when 'mergehex' (Nordic nRF Command Line Tools) is absent so a
+  # DFU-only workflow still succeeds.
+  if command -v mergehex >/dev/null 2>&1; then
+    mergehex \
+      --merge \
+      settings.hex \
+      application.hex \
+      --output application_merged.hex
 
-  mergehex \
-    --merge \
-    bootloader.hex \
-    application_merged.hex \
-    softdevice.hex \
-    --output fullimage.hex
+    mergehex \
+      --merge \
+      bootloader.hex \
+      application_merged.hex \
+      softdevice.hex \
+      --output fullimage.hex
 
-  tmp_dir=$(mktemp -d -t cu_binaries_XXXXXXXXXX)
-  trap 'rm -rf "$tmp_dir"' EXIT
-  cp ./*.hex "$tmp_dir"
-  mv "$tmp_dir/application_merged.hex" "$tmp_dir/application.hex"
-  rm "$tmp_dir/settings.hex"
-  zip -j "${device_type}-binaries.zip" "$tmp_dir"/*.hex
+    tmp_dir=$(mktemp -d -t cu_binaries_XXXXXXXXXX)
+    trap 'rm -rf "$tmp_dir"' EXIT
+    cp ./*.hex "$tmp_dir"
+    mv "$tmp_dir/application_merged.hex" "$tmp_dir/application.hex"
+    rm "$tmp_dir/settings.hex"
+    zip -j "${device_type}-binaries.zip" "$tmp_dir"/*.hex
+  else
+    echo "WARNING: 'mergehex' not found — skipping merged full-image hex and ${device_type}-binaries.zip." >&2
+    echo "         Those are only needed for direct SWD/J-Link programming; the DFU package" >&2
+    echo "         (${device_type}-dfu-full.zip) is complete and is what USB/BLE DFU flashing uses." >&2
+    echo "         Install Nordic nRF Command Line Tools to enable the merged-hex artifacts." >&2
+  fi
 )
