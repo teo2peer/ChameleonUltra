@@ -50,6 +50,7 @@ NRF_LOG_MODULE_REGISTER();
 
 static active_slot_snapshot_transaction_t m_active_slot_snapshot;
 static uint32_t m_last_snapshot_revision;
+static volatile uint8_t m_disconnected_transport_mask;
 
 static uint16_t active_slot_snapshot_block_count(tag_specific_type_t type) {
     switch (type) {
@@ -72,7 +73,29 @@ static uint32_t active_slot_snapshot_new_revision(void) {
 }
 
 void app_cmd_active_slot_snapshot_process(void) {
+    uint8_t disconnected;
+    CRITICAL_REGION_ENTER();
+    disconnected = m_disconnected_transport_mask;
+    if (!m_active_slot_snapshot.active) {
+        m_disconnected_transport_mask = 0u;
+    } else {
+        uint8_t owner_bit = (uint8_t)(1u << m_active_slot_snapshot.owner);
+        m_disconnected_transport_mask &= owner_bit;
+    }
+    CRITICAL_REGION_EXIT();
     if (!m_active_slot_snapshot.active) return;
+
+    uint8_t owner_bit = (uint8_t)(1u << m_active_slot_snapshot.owner);
+    if ((disconnected & owner_bit) != 0u) {
+        if (m_active_slot_snapshot.committing) return;
+        CRITICAL_REGION_ENTER();
+        m_disconnected_transport_mask &= (uint8_t)~owner_bit;
+        CRITICAL_REGION_EXIT();
+        active_slot_snapshot_transaction_clear(&m_active_slot_snapshot);
+        tag_emulation_snapshot_release();
+        NRF_LOG_WARNING("Active-slot snapshot owner disconnected.");
+        return;
+    }
     uint32_t now = app_timer_cnt_get();
     uint32_t idle_elapsed = app_timer_cnt_diff_compute(
                                 now, m_active_slot_snapshot.last_activity);
@@ -90,6 +113,13 @@ void app_cmd_active_slot_snapshot_process(void) {
 
 bool app_cmd_active_slot_snapshot_is_active(void) {
     return m_active_slot_snapshot.active;
+}
+
+void app_cmd_transport_disconnected(data_frame_transport_t transport) {
+    if (transport <= DATA_FRAME_TRANSPORT_NONE || transport >= DATA_FRAME_TRANSPORT_COUNT) return;
+    CRITICAL_REGION_ENTER();
+    m_disconnected_transport_mask |= (uint8_t)(1u << transport);
+    CRITICAL_REGION_EXIT();
 }
 
 
@@ -1523,6 +1553,11 @@ static data_frame_tx_t *cmd_processor_active_slot_snapshot(uint16_t cmd, uint16_
             tag_emulation_snapshot_release();
             return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
         }
+        if (!data_frame_current_transport_generation_valid()) {
+            active_slot_snapshot_transaction_clear(&m_active_slot_snapshot);
+            tag_emulation_snapshot_release();
+            return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+        }
 
         uint8_t response[ACTIVE_SLOT_SNAPSHOT_BEGIN_RESPONSE_SIZE] = {
             ACTIVE_SLOT_SNAPSHOT_VERSION,
@@ -1540,7 +1575,8 @@ static data_frame_tx_t *cmd_processor_active_slot_snapshot(uint16_t cmd, uint16_
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     uint32_t revision = cmd_read_u32be(&data[2]);
-    if (!active_slot_snapshot_transaction_matches(
+    if (!data_frame_current_transport_generation_valid() ||
+            !active_slot_snapshot_transaction_matches(
                 &m_active_slot_snapshot, (uint8_t)transport, revision)) {
         return data_frame_make(cmd, m_active_slot_snapshot.active
                                ? STATUS_CMD_ERR : STATUS_DEVICE_MODE_ERROR, 0, NULL);
@@ -1554,6 +1590,11 @@ static data_frame_tx_t *cmd_processor_active_slot_snapshot(uint16_t cmd, uint16_
                     &m_active_slot_snapshot, (uint8_t)transport, absolute_elapsed,
                     APP_TIMER_TICKS(ACTIVE_SLOT_SNAPSHOT_ABSOLUTE_LEASE_MS),
                     APP_TIMER_TICKS(ACTIVE_SLOT_SNAPSHOT_COMMIT_MAX_MS))) {
+            return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+        }
+        if (!data_frame_current_transport_generation_valid()) {
+            active_slot_snapshot_transaction_clear(&m_active_slot_snapshot);
+            tag_emulation_snapshot_release();
             return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
         }
         tag_snapshot_save_result_t result = tag_emulation_snapshot_save(
@@ -4099,6 +4140,10 @@ data_frame_tx_t *cmd_processor_get_device_capabilities(uint16_t cmd, uint16_t st
  */
 static void auto_response_data(data_frame_tx_t *resp) {
     data_frame_transport_t transport = data_frame_get_transport();
+    if (!data_frame_current_transport_generation_valid()) {
+        NRF_LOG_WARNING("Discarding response for a stale transport generation.");
+        return;
+    }
     if (transport == DATA_FRAME_TRANSPORT_USB && is_usb_working()) {
         usb_cdc_write(resp->buffer, resp->length);
     } else if (transport == DATA_FRAME_TRANSPORT_BLE && is_nus_working()) {

@@ -30,6 +30,7 @@
 #include "rgb_marquee.h"
 #include "keyboard_hid.h"
 #include "keyboard_payload.h"
+#include "app_cmd.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "iso_dep_session.h"
 #endif
@@ -190,6 +191,8 @@ static bool m_nus_comm_started;
 static uint8_t m_nus_rx_pending[BLE_NUS_MAX_DATA_LEN];
 static uint16_t m_nus_rx_length;
 static uint16_t m_nus_rx_offset;
+static volatile uint32_t m_nus_rx_generation;
+static uint32_t m_nus_rx_decoder_generation;
 
 static bool nus_response_ready(void) {
     return g_is_ble_connected && m_nus_comm_started && m_nus_tx_count < NUS_TX_QUEUE_DEPTH;
@@ -367,24 +370,56 @@ static void nus_tx_send(void) {
     }
 }
 
+static void nus_rx_clear(void) {
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    m_nus_rx_generation++;
+    m_nus_rx_length = 0;
+    m_nus_rx_offset = 0;
+    app_util_critical_region_exit(nested);
+}
+
 static void nus_rx_resume(void) {
-    if (m_nus_rx_length == 0) {
+    uint8_t nested = 0;
+    uint16_t length;
+    uint16_t offset;
+    uint32_t generation;
+    uint32_t decoder_generation;
+    app_util_critical_region_enter(&nested);
+    length = m_nus_rx_length;
+    offset = m_nus_rx_offset;
+    generation = m_nus_rx_generation;
+    decoder_generation = m_nus_rx_decoder_generation;
+    app_util_critical_region_exit(nested);
+    if (length == 0) {
         return;
     }
-    uint16_t consumed = data_frame_receive_from(m_nus_rx_pending + m_nus_rx_offset,
-                                                 m_nus_rx_length - m_nus_rx_offset,
-                                                 DATA_FRAME_TRANSPORT_BLE);
-    m_nus_rx_offset += consumed;
-    if (m_nus_rx_offset == m_nus_rx_length) {
+    uint16_t consumed = data_frame_receive_from_generation(m_nus_rx_pending + offset,
+                                                           length - offset,
+                                                           DATA_FRAME_TRANSPORT_BLE,
+                                                           decoder_generation);
+    app_util_critical_region_enter(&nested);
+    if (generation != m_nus_rx_generation) {
+        app_util_critical_region_exit(nested);
+        return;
+    }
+    m_nus_rx_offset = offset + consumed;
+    if (m_nus_rx_offset == length) {
         m_nus_rx_length = 0;
         m_nus_rx_offset = 0;
     }
+    app_util_critical_region_exit(nested);
 }
 
 static void nus_rx_overrun(void) {
     NRF_LOG_WARNING("BLE NUS ingress queue overrun; disconnecting peer");
-    m_nus_rx_length = 0;
-    m_nus_rx_offset = 0;
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
+#endif
+    app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_BLE);
+    m_nus_comm_started = false;
+    nus_rx_clear();
+    nus_tx_clear();
     data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
     if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
         ret_code_t err = sd_ble_gap_disconnect(m_conn_handle,
@@ -408,14 +443,17 @@ static void nus_data_handler(ble_nus_evt_t *p_evt) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
         iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
+        app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_BLE);
         m_nus_comm_started = false;
-        m_nus_rx_length = 0;
-        m_nus_rx_offset = 0;
+        nus_rx_clear();
         nus_tx_clear();
         data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
         return;
     }
     if (p_evt->type == BLE_NUS_EVT_RX_DATA) {
+        if (!m_nus_comm_started) {
+            return;
+        }
         NRF_LOG_DEBUG("Received data from BLE NUS.");
         NRF_LOG_HEXDUMP_DEBUG(p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
         if (m_nus_rx_length != 0 || p_evt->params.rx_data.length > sizeof(m_nus_rx_pending)) {
@@ -423,6 +461,8 @@ static void nus_data_handler(ble_nus_evt_t *p_evt) {
             return;
         }
         memcpy(m_nus_rx_pending, p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
+        m_nus_rx_decoder_generation =
+            data_frame_get_transport_generation(DATA_FRAME_TRANSPORT_BLE);
         m_nus_rx_length = p_evt->params.rx_data.length;
         m_nus_rx_offset = 0;
         nus_rx_resume();
@@ -447,9 +487,11 @@ uint32_t nus_data_response_try(const uint8_t *p_data, uint16_t length) {
     uint32_t generation;
     uint8_t nested = 0;
     app_util_critical_region_enter(&nested);
-    if (m_nus_tx_count >= NUS_TX_QUEUE_DEPTH) {
+    if (m_nus_tx_count >= NUS_TX_QUEUE_DEPTH ||
+            !data_frame_current_transport_generation_valid()) {
         app_util_critical_region_exit(nested);
-        return NRF_ERROR_RESOURCES;
+        return m_nus_tx_count >= NUS_TX_QUEUE_DEPTH
+               ? NRF_ERROR_RESOURCES : NRF_ERROR_INVALID_STATE;
     }
 
     tail = (m_nus_tx_head + m_nus_tx_count) % NUS_TX_QUEUE_DEPTH;
@@ -460,7 +502,12 @@ uint32_t nus_data_response_try(const uint8_t *p_data, uint16_t length) {
 
     memcpy(m_nus_tx_queue[tail].data, p_data, length);
     app_util_critical_region_enter(&nested);
-    if (generation != m_nus_tx_generation) {
+    if (generation != m_nus_tx_generation ||
+            !data_frame_current_transport_generation_valid()) {
+        if (generation == m_nus_tx_generation && m_nus_tx_count != 0u) {
+            uint8_t reserved_tail = (m_nus_tx_head + m_nus_tx_count - 1u) % NUS_TX_QUEUE_DEPTH;
+            if (reserved_tail == tail) m_nus_tx_count--;
+        }
         app_util_critical_region_exit(nested);
         return NRF_ERROR_INVALID_STATE;
     }
@@ -706,6 +753,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
+            app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_BLE);
             sleep_timer_stop();
 
             NRF_LOG_INFO("Connected");
@@ -715,8 +763,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             APP_ERROR_CHECK(err_code);
             g_is_ble_connected = true;
             m_nus_comm_started = false;
-            m_nus_rx_length = 0;
-            m_nus_rx_offset = 0;
+            nus_rx_clear();
             nus_tx_clear();
             data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
             g_is_ble_advertising = false;
@@ -738,13 +785,13 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
+            app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_BLE);
             // LED indication will be changed when advertising starts.
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             g_is_ble_connected = false;
             m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;
             m_nus_comm_started = false;
-            m_nus_rx_length = 0;
-            m_nus_rx_offset = 0;
+            nus_rx_clear();
             nus_tx_clear();
             data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
             if (m_adv_lab_state == 3u) {

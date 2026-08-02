@@ -16,6 +16,9 @@ typedef struct {
 
 static received_frame_t received[8];
 static size_t received_count;
+static bool reset_transport_in_callback;
+static bool generation_valid_before_reset;
+static bool generation_valid_after_reset;
 
 static uint8_t lrc(const uint8_t *data, size_t length) {
     uint8_t sum = 0;
@@ -51,6 +54,11 @@ static void on_frame(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *da
     frame->status = status;
     frame->length = length;
     frame->transport = data_frame_get_transport();
+    generation_valid_before_reset = data_frame_current_transport_generation_valid();
+    if (reset_transport_in_callback) {
+        data_frame_reset_transport(frame->transport);
+        generation_valid_after_reset = data_frame_current_transport_generation_valid();
+    }
     if (length != 0) {
         memcpy(frame->data, data, length);
     }
@@ -62,8 +70,48 @@ static void reset_state(void) {
     data_frame_set_ready_callback(DATA_FRAME_TRANSPORT_USB, NULL);
     data_frame_set_ready_callback(DATA_FRAME_TRANSPORT_BLE, NULL);
     received_count = 0;
+    reset_transport_in_callback = false;
+    generation_valid_before_reset = false;
+    generation_valid_after_reset = false;
     memset(received, 0, sizeof(received));
     on_data_frame_complete(on_frame);
+}
+
+static void test_transport_generation_invalidates_inflight_request(void) {
+    uint8_t frame[NETDATA_FRAME_OVERHEAD];
+    assert(make_frame(frame, 0x1009, 0, NULL, 0) == sizeof(frame));
+
+    reset_state();
+    reset_transport_in_callback = true;
+    assert(data_frame_receive_from(frame, sizeof(frame), DATA_FRAME_TRANSPORT_BLE) == sizeof(frame));
+    data_frame_process();
+
+    assert(received_count == 1);
+    assert(generation_valid_before_reset);
+    assert(!generation_valid_after_reset);
+    assert(!data_frame_current_transport_generation_valid());
+}
+
+static void test_retained_input_rejects_stale_generation(void) {
+    uint8_t frame[NETDATA_FRAME_OVERHEAD];
+    assert(make_frame(frame, 0x1003, 0, NULL, 0) == sizeof(frame));
+
+    reset_state();
+    uint32_t generation = data_frame_get_transport_generation(DATA_FRAME_TRANSPORT_BLE);
+    data_frame_reset_transport(DATA_FRAME_TRANSPORT_BLE);
+    assert(data_frame_receive_from_generation(frame, sizeof(frame),
+                                              DATA_FRAME_TRANSPORT_BLE,
+                                              generation) == sizeof(frame));
+    data_frame_process();
+    assert(received_count == 0);
+
+    generation = data_frame_get_transport_generation(DATA_FRAME_TRANSPORT_BLE);
+    assert(data_frame_receive_from_generation(frame, sizeof(frame),
+                                              DATA_FRAME_TRANSPORT_BLE,
+                                              generation) == sizeof(frame));
+    data_frame_process();
+    assert(received_count == 1);
+    assert(received[0].cmd == 0x1003);
 }
 
 static void test_response_encoding(void) {
@@ -150,10 +198,36 @@ static void test_queue_backpressure_preserves_order(void) {
     }
 }
 
+static void test_complete_decoder_retries_after_other_transport_reset(void) {
+    uint8_t usb_a[NETDATA_FRAME_OVERHEAD];
+    uint8_t usb_b[NETDATA_FRAME_OVERHEAD];
+    uint8_t ble[NETDATA_FRAME_OVERHEAD];
+    assert(make_frame(usb_a, 20, 0, NULL, 0) == sizeof(usb_a));
+    assert(make_frame(usb_b, 21, 0, NULL, 0) == sizeof(usb_b));
+    assert(make_frame(ble, 22, 0, NULL, 0) == sizeof(ble));
+
+    reset_state();
+    assert(data_frame_receive_from(usb_a, sizeof(usb_a), DATA_FRAME_TRANSPORT_USB) ==
+           sizeof(usb_a));
+    assert(data_frame_receive_from(usb_b, sizeof(usb_b), DATA_FRAME_TRANSPORT_USB) ==
+           sizeof(usb_b));
+    assert(data_frame_receive_from(ble, sizeof(ble), DATA_FRAME_TRANSPORT_BLE) ==
+           sizeof(ble));
+
+    data_frame_reset_transport(DATA_FRAME_TRANSPORT_USB);
+    data_frame_process();
+    assert(received_count == 1);
+    assert(received[0].cmd == 22);
+    assert(received[0].transport == DATA_FRAME_TRANSPORT_BLE);
+}
+
 int main(void) {
     test_response_encoding();
     test_fragmented_and_interleaved_frames();
     test_malformed_input_resynchronizes();
     test_queue_backpressure_preserves_order();
+    test_complete_decoder_retries_after_other_transport_reset();
+    test_transport_generation_invalidates_inflight_request();
+    test_retained_input_rejects_stale_generation();
     return 0;
 }

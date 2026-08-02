@@ -7,6 +7,7 @@
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "iso_dep_session.h"
 #endif
+#include "app_cmd.h"
 
 #include "app_usbd.h"
 #include "app_usbd_cdc_acm.h"
@@ -50,6 +51,7 @@ static uint8_t cdc_data_buffer[NRF_DRV_USBD_EPSIZE];
 
 #define USB_TX_QUEUE_DEPTH 2
 typedef struct {
+    volatile bool valid;
     uint16_t length;
     uint8_t data[NETDATA_MAX_FRAME_LENGTH];
 } usb_tx_entry_t;
@@ -58,6 +60,7 @@ static usb_tx_entry_t m_usb_tx_queue[USB_TX_QUEUE_DEPTH];
 static uint8_t m_usb_tx_head;
 static uint8_t m_usb_tx_count;
 static bool m_usb_tx_active;
+static volatile uint32_t m_usb_tx_generation;
 static uint16_t m_usb_rx_length;
 static uint16_t m_usb_rx_offset;
 
@@ -67,9 +70,16 @@ static bool usb_response_ready(void) {
 }
 
 static void usb_tx_clear(void) {
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    m_usb_tx_generation++;
+    for (uint8_t i = 0; i < USB_TX_QUEUE_DEPTH; i++) {
+        m_usb_tx_queue[i].valid = false;
+    }
     m_usb_tx_head = 0;
     m_usb_tx_count = 0;
     m_usb_tx_active = false;
+    app_util_critical_region_exit(nested);
 }
 
 static void usb_tx_start(void) {
@@ -79,6 +89,9 @@ static void usb_tx_start(void) {
     }
 
     usb_tx_entry_t *entry = &m_usb_tx_queue[m_usb_tx_head];
+    if (!entry->valid) {
+        return;
+    }
     ret_code_t err = app_usbd_cdc_acm_write(&m_app_cdc_acm, entry->data, entry->length);
     if (err == NRF_SUCCESS) {
         m_usb_tx_active = true;
@@ -140,6 +153,7 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
+            app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_USB);
             g_usb_port_opened = true;
             data_frame_reset_transport(DATA_FRAME_TRANSPORT_USB);
             m_usb_rx_length = 0;
@@ -154,6 +168,7 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
+            app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_USB);
             g_usb_port_opened = false;
             g_usb_led_marquee_enable = true;
             m_usb_rx_length = 0;
@@ -164,6 +179,7 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
 
         case APP_USBD_CDC_ACM_USER_EVT_TX_DONE:
             if (m_usb_tx_active && m_usb_tx_count != 0) {
+                m_usb_tx_queue[m_usb_tx_head].valid = false;
                 m_usb_tx_head = (m_usb_tx_head + 1) % USB_TX_QUEUE_DEPTH;
                 m_usb_tx_count--;
             }
@@ -200,6 +216,7 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
+            app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_USB);
             keyboard_hid_usb_reset();
             g_usb_port_opened = false;
             m_usb_rx_length = 0;
@@ -219,6 +236,7 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
+            app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_USB);
             g_usb_port_opened = false;
             app_usbd_disable();
             break;
@@ -238,6 +256,7 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
+            app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_USB);
             keyboard_hid_usb_reset();
             g_usb_connected = false;
             g_usb_port_opened = false;
@@ -294,17 +313,44 @@ uint32_t usb_cdc_write_try(const void *p_buf, uint16_t length) {
     if (p_buf == NULL || length == 0 || length > NETDATA_MAX_FRAME_LENGTH) {
         return NRF_ERROR_INVALID_PARAM;
     }
+    while (app_usbd_event_queue_process());
     if (!g_usb_connected || !g_usb_port_opened) {
         return NRF_ERROR_INVALID_STATE;
     }
-    if (m_usb_tx_count >= USB_TX_QUEUE_DEPTH) {
-        return NRF_ERROR_RESOURCES;
+    uint8_t tail;
+    uint32_t generation;
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    if (m_usb_tx_count >= USB_TX_QUEUE_DEPTH ||
+            !data_frame_current_transport_generation_valid()) {
+        ret_code_t error = m_usb_tx_count >= USB_TX_QUEUE_DEPTH
+                           ? NRF_ERROR_RESOURCES : NRF_ERROR_INVALID_STATE;
+        app_util_critical_region_exit(nested);
+        return error;
     }
-
-    uint8_t tail = (m_usb_tx_head + m_usb_tx_count) % USB_TX_QUEUE_DEPTH;
-    memcpy(m_usb_tx_queue[tail].data, p_buf, length);
-    m_usb_tx_queue[tail].length = length;
+    tail = (m_usb_tx_head + m_usb_tx_count) % USB_TX_QUEUE_DEPTH;
+    generation = m_usb_tx_generation;
+    m_usb_tx_queue[tail].valid = false;
     m_usb_tx_count++;
+    app_util_critical_region_exit(nested);
+
+    memcpy(m_usb_tx_queue[tail].data, p_buf, length);
+    while (app_usbd_event_queue_process());
+    app_util_critical_region_enter(&nested);
+    uint8_t reserved_tail = m_usb_tx_count == 0 ? USB_TX_QUEUE_DEPTH :
+                            (m_usb_tx_head + m_usb_tx_count - 1u) % USB_TX_QUEUE_DEPTH;
+    if (generation != m_usb_tx_generation || reserved_tail != tail ||
+            !data_frame_current_transport_generation_valid()) {
+        if (generation == m_usb_tx_generation && reserved_tail == tail) {
+            m_usb_tx_count--;
+        }
+        app_util_critical_region_exit(nested);
+        return NRF_ERROR_INVALID_STATE;
+    }
+    m_usb_tx_queue[tail].length = length;
+    __DMB();
+    m_usb_tx_queue[tail].valid = true;
+    app_util_critical_region_exit(nested);
     usb_tx_start();
     return NRF_SUCCESS;
 }

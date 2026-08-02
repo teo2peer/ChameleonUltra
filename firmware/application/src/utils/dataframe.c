@@ -18,12 +18,14 @@ typedef struct {
     uint16_t length;
     uint16_t payload_length;
     bool complete;
-    uint32_t generation;
+    volatile bool receiving;
+    volatile uint32_t generation;
 } data_frame_decoder_t;
 
 typedef struct {
     volatile bool reserved;
     volatile bool valid;
+    volatile bool publishing;
     uint32_t sequence;
     uint32_t generation;
     data_frame_transport_t transport;
@@ -70,6 +72,8 @@ static data_frame_request_t *reserve_request(data_frame_transport_t transport,
         if (!m_requests[i].reserved) {
             request = &m_requests[i];
             request->reserved = true;
+            request->valid = false;
+            request->publishing = true;
             request->transport = transport;
             request->generation = generation;
             request->sequence = m_request_sequence++;
@@ -80,10 +84,15 @@ static data_frame_request_t *reserve_request(data_frame_transport_t transport,
     return request;
 }
 
-static bool queue_decoder(data_frame_transport_t transport, data_frame_decoder_t *decoder) {
-    data_frame_request_t *request = reserve_request(transport, decoder->generation);
+static bool queue_decoder(data_frame_transport_t transport, data_frame_decoder_t *decoder,
+                          uint32_t generation) {
+    data_frame_request_t *request = reserve_request(transport, generation);
     if (request == NULL) {
-        decoder->complete = true;
+        CRITICAL_REGION_ENTER();
+        if (decoder->generation == generation) {
+            decoder->complete = true;
+        }
+        CRITICAL_REGION_EXIT();
         return false;
     }
 
@@ -94,19 +103,38 @@ static bool queue_decoder(data_frame_transport_t transport, data_frame_decoder_t
         memcpy(request->data, decoder->frame.data, request->length);
     }
     CRITICAL_REGION_ENTER();
-    if (request->reserved && request->generation == decoder->generation) {
+    bool current = decoder->generation == generation;
+    if (current && request->reserved && request->publishing &&
+            request->generation == generation) {
+        request->publishing = false;
         __DMB();
         request->valid = true;
     } else {
         request->valid = false;
+        request->publishing = false;
         request->reserved = false;
     }
+    if (current) {
+        decoder->length = 0;
+        decoder->payload_length = 0;
+        decoder->complete = false;
+    }
     CRITICAL_REGION_EXIT();
+    return current;
+}
 
-    decoder->length = 0;
-    decoder->payload_length = 0;
-    decoder->complete = false;
-    return true;
+static uint16_t receive_finish(data_frame_decoder_t *decoder, uint32_t generation,
+                               uint16_t consumed, uint16_t input_length) {
+    CRITICAL_REGION_ENTER();
+    if (decoder->generation != generation) {
+        decoder->length = 0;
+        decoder->payload_length = 0;
+        decoder->complete = false;
+        consumed = input_length;
+    }
+    decoder->receiving = false;
+    CRITICAL_REGION_EXIT();
+    return consumed;
 }
 
 static bool decoder_prefix_valid(data_frame_decoder_t *decoder, bool *frame_complete) {
@@ -173,14 +201,30 @@ static void decoder_resynchronize(data_frame_decoder_t *decoder) {
     }
 }
 
-uint16_t data_frame_receive_from(const uint8_t *data, uint16_t length,
-                                 data_frame_transport_t transport) {
+static uint16_t receive_from_generation(const uint8_t *data, uint16_t length,
+                                        data_frame_transport_t transport,
+                                        bool require_generation,
+                                        uint32_t expected_generation) {
     data_frame_decoder_t *decoder = decoder_for_transport(transport);
     if (decoder == NULL || (data == NULL && length != 0)) {
         return 0;
     }
-    if (decoder->complete && !queue_decoder(transport, decoder)) {
+    uint32_t generation;
+    CRITICAL_REGION_ENTER();
+    if (decoder->receiving) {
+        CRITICAL_REGION_EXIT();
         return 0;
+    }
+    if (require_generation && decoder->generation != expected_generation) {
+        CRITICAL_REGION_EXIT();
+        return length;
+    }
+    decoder->receiving = true;
+    generation = decoder->generation;
+    CRITICAL_REGION_EXIT();
+
+    if (decoder->complete && !queue_decoder(transport, decoder, generation)) {
+        return receive_finish(decoder, generation, 0, length);
     }
 
     uint16_t consumed = 0;
@@ -197,16 +241,27 @@ uint16_t data_frame_receive_from(const uint8_t *data, uint16_t length,
         if (!decoder_prefix_valid(decoder, &complete)) {
             NRF_LOG_DEBUG("Malformed frame bytes on transport %u", transport);
             decoder_resynchronize(decoder);
-            if (decoder->complete && !queue_decoder(transport, decoder)) {
+            if (decoder->complete && !queue_decoder(transport, decoder, generation)) {
                 break;
             }
             continue;
         }
-        if (complete && !queue_decoder(transport, decoder)) {
+        if (complete && !queue_decoder(transport, decoder, generation)) {
             break;
         }
     }
-    return consumed;
+    return receive_finish(decoder, generation, consumed, length);
+}
+
+uint16_t data_frame_receive_from(const uint8_t *data, uint16_t length,
+                                 data_frame_transport_t transport) {
+    return receive_from_generation(data, length, transport, false, 0);
+}
+
+uint16_t data_frame_receive_from_generation(const uint8_t *data, uint16_t length,
+                                            data_frame_transport_t transport,
+                                            uint32_t generation) {
+    return receive_from_generation(data, length, transport, true, generation);
 }
 
 void data_frame_receive(uint8_t *data, uint16_t length) {
@@ -221,15 +276,20 @@ void data_frame_reset_transport(data_frame_transport_t transport) {
     if (decoder == NULL) {
         return;
     }
-    uint32_t generation = decoder->generation + 1;
-    memset(decoder, 0, sizeof(*decoder));
-    decoder->generation = generation;
     CRITICAL_REGION_ENTER();
+    decoder->generation++;
+    if (!decoder->receiving) {
+        decoder->length = 0;
+        decoder->payload_length = 0;
+        decoder->complete = false;
+    }
     for (uint8_t i = 0; i < DATA_FRAME_REQUEST_QUEUE_DEPTH; i++) {
         if (&m_requests[i] != m_processing_request && m_requests[i].reserved &&
                 m_requests[i].transport == transport) {
             m_requests[i].valid = false;
-            m_requests[i].reserved = false;
+            if (!m_requests[i].publishing) {
+                m_requests[i].reserved = false;
+            }
         }
     }
     CRITICAL_REGION_EXIT();
@@ -251,6 +311,30 @@ data_frame_transport_t data_frame_get_transport(void) {
     return m_current_transport;
 }
 
+uint32_t data_frame_get_transport_generation(data_frame_transport_t transport) {
+    data_frame_decoder_t *decoder = decoder_for_transport(transport);
+    if (decoder == NULL) {
+        return 0;
+    }
+    uint32_t generation;
+    CRITICAL_REGION_ENTER();
+    generation = decoder->generation;
+    CRITICAL_REGION_EXIT();
+    return generation;
+}
+
+bool data_frame_current_transport_generation_valid(void) {
+    bool valid = false;
+    CRITICAL_REGION_ENTER();
+    data_frame_request_t *request = m_processing_request;
+    if (request != NULL) {
+        data_frame_decoder_t *decoder = decoder_for_transport(request->transport);
+        valid = decoder != NULL && request->generation == decoder->generation;
+    }
+    CRITICAL_REGION_EXIT();
+    return valid;
+}
+
 static data_frame_request_t *oldest_request(void) {
     data_frame_request_t *oldest = NULL;
     for (uint8_t i = 0; i < DATA_FRAME_REQUEST_QUEUE_DEPTH; i++) {
@@ -267,7 +351,18 @@ static data_frame_request_t *oldest_request(void) {
     return oldest;
 }
 
+static void resume_transports(void) {
+    for (data_frame_transport_t transport = DATA_FRAME_TRANSPORT_USB;
+            transport < DATA_FRAME_TRANSPORT_COUNT; transport++) {
+        (void)data_frame_receive_from(NULL, 0, transport);
+        if (m_flow_callbacks[transport] != NULL) {
+            m_flow_callbacks[transport]();
+        }
+    }
+}
+
 void data_frame_process(void) {
+    resume_transports();
     data_frame_request_t *request = oldest_request();
     CRITICAL_REGION_ENTER();
     if (request != NULL && request->valid) {
@@ -292,16 +387,7 @@ void data_frame_process(void) {
     m_processing_request = NULL;
     CRITICAL_REGION_EXIT();
 
-    for (data_frame_transport_t transport = DATA_FRAME_TRANSPORT_USB;
-            transport < DATA_FRAME_TRANSPORT_COUNT; transport++) {
-        data_frame_decoder_t *decoder = decoder_for_transport(transport);
-        if (decoder->complete) {
-            (void)queue_decoder(transport, decoder);
-        }
-        if (m_flow_callbacks[transport] != NULL) {
-            m_flow_callbacks[transport]();
-        }
-    }
+    resume_transports();
 }
 
 void on_data_frame_complete(data_frame_cbk_t callback) {

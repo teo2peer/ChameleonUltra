@@ -24,8 +24,15 @@ void data_frame_receive(uint8_t *data, uint16_t length);
 // Returns the number of input bytes consumed. A short result applies backpressure;
 // the caller must retain the remainder and retry after its flow callback runs.
 uint16_t data_frame_receive_from(const uint8_t *data, uint16_t length, data_frame_transport_t transport);
+// Drops all input when the transport was reset after the caller retained it.
+uint16_t data_frame_receive_from_generation(const uint8_t *data, uint16_t length,
+                                            data_frame_transport_t transport,
+                                            uint32_t generation);
+uint32_t data_frame_get_transport_generation(data_frame_transport_t transport);
 // Valid while the registered frame-complete callback is running.
 data_frame_transport_t data_frame_get_transport(void);
+// False when the transport was reset after the current request was queued.
+bool data_frame_current_transport_generation_valid(void);
 void data_frame_reset_transport(data_frame_transport_t transport);
 void data_frame_set_flow_callback(data_frame_transport_t transport, void (*callback)(void));
 void data_frame_set_ready_callback(data_frame_transport_t transport, bool (*callback)(void));

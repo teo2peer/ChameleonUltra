@@ -1097,6 +1097,7 @@ int main(void) {
     // Enter main loop.
     NRF_LOG_INFO("Chameleon working");
     while (1) {
+        app_cmd_active_slot_snapshot_process();
         // process lesc event
         lesc_event_process();
         // Button event process
@@ -1124,6 +1125,8 @@ int main(void) {
         }
 
         lf_tag_emulation_process();
+        // Apply queued USB session changes before dispatching another command.
+        while (app_usbd_event_queue_process());
         // Data pack process
         data_frame_process();
         // Log print process
@@ -1135,6 +1138,10 @@ int main(void) {
         // No task to process, system sleep enter.
         // If system idle sometime, we can enter deep sleep state.
         // Some task process done, we can enter cpu sleep state.
-        sleep_system_run(system_off_enter, nrf_pwr_mgmt_run);
+        if (!app_cmd_active_slot_snapshot_is_active()) {
+            sleep_system_run(system_off_enter, nrf_pwr_mgmt_run);
+        } else {
+            nrf_pwr_mgmt_run();
+        }
     }
 }
