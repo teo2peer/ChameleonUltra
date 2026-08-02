@@ -2931,6 +2931,18 @@ class ChameleonCMD:
         return self.device.send_cmd_sync(Command.SET_ANIMATION_MODE, data)
 
     @expect_response(Status.SUCCESS)
+    def set_runtime_undercover_mode(self, enabled: bool):
+        """Set the BLE-session-only LED suppression mode."""
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        resp = self.device.send_cmd_sync(
+            Command.SET_RUNTIME_UNDERCOVER_MODE,
+            struct.pack('!?', enabled),
+        )
+        resp.parsed = True
+        return resp
+
+    @expect_response(Status.SUCCESS)
     def get_sleep_timeout(self):
         """
         Get the wake timeout (in seconds) after a button wakeup

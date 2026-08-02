@@ -159,7 +159,7 @@ static void field_generator_rainbow_loop(void) {
     static uint8_t color_index = 0;
     static uint32_t last_update = 0;
 
-    if (!m_is_field_on) return;
+    if (!m_is_field_on || rgb_marquee_is_undercover()) return;
 
     uint32_t now = app_timer_cnt_get();
 
@@ -1112,7 +1112,9 @@ int main(void) {
         // slot indicator. BLE-active (solid blue, outside -> centre) has
         // priority over BLE-test so the operator can see a stress / broadcast
         // run from across the room.
-        if (rgb_marquee_is_reader_keys_anim()) {
+        if (rgb_marquee_is_undercover()) {
+            // Functional producers continue running while all LED output stays gated.
+        } else if (rgb_marquee_is_reader_keys_anim()) {
             rgb_marquee_reader_keys_loop();
         } else if (rgb_marquee_is_ble_active_anim()) {
             rgb_marquee_ble_active_loop();

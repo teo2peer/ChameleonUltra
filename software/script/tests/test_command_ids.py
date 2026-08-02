@@ -21,6 +21,10 @@ DATA_CMD_H = os.path.normpath(
 )
 APP_STATUS_H = os.path.join(os.path.dirname(DATA_CMD_H), "app_status.h")
 APP_CMD_C = os.path.join(os.path.dirname(DATA_CMD_H), "app_cmd.c")
+BLE_MAIN_C = os.path.join(os.path.dirname(DATA_CMD_H), "ble_main.c")
+HW_CONNECT_C = os.path.normpath(
+    os.path.join(REPO, "..", "..", "firmware", "common", "hw_connect.c")
+)
 
 # Defined for compatibility with existing clients but intentionally has no
 # firmware handler. Any addition here needs a concrete protocol reason.
@@ -87,6 +91,21 @@ def _parse_dispatch(path):
 
 
 class TestCommandMirror(unittest.TestCase):
+    def test_runtime_undercover_is_common_and_disconnect_scoped(self):
+        self.assertEqual(int(Command.SET_RUNTIME_UNDERCOVER_MODE), 1053)
+        dispatch = _parse_dispatch(APP_CMD_C)
+        self.assertIn("SET_RUNTIME_UNDERCOVER_MODE", dispatch["ultra"])
+        self.assertIn("SET_RUNTIME_UNDERCOVER_MODE", dispatch["lite"])
+        with open(BLE_MAIN_C) as source:
+            ble_source = source.read()
+        self.assertGreaterEqual(ble_source.count("runtime_undercover_revoke();"), 2)
+        with open(APP_CMD_C) as source:
+            self.assertIn("enabled && !is_nus_working()", source.read())
+        with open(HW_CONNECT_C) as source:
+            hardware_source = source.read()
+        self.assertIn("nrf_gpio_cfg_input(m_led_array[i]", hardware_source)
+        self.assertIn("app_util_critical_region_enter", hardware_source)
+
     def test_debug_counters_mirrored(self):
         self.assertEqual(int(Command.HF14A_4_DEBUG_COUNTERS), 6010)
 

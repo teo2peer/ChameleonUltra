@@ -265,6 +265,29 @@ static data_frame_tx_t *cmd_processor_get_animation_mode(uint16_t cmd, uint16_t 
     return data_frame_make(cmd, STATUS_SUCCESS, 1, &animation_mode);
 }
 
+static data_frame_tx_t *cmd_processor_set_runtime_undercover_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    bool enabled;
+    if (!cmd_payload_exact(length, data, 1u) || !cmd_parse_bool(data[0], &enabled)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    if (data_frame_get_transport() != DATA_FRAME_TRANSPORT_BLE || !is_nus_working()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+
+    rgb_marquee_set_undercover(enabled);
+    if (enabled && !is_nus_working()) {
+        rgb_marquee_set_undercover(false);
+        set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
+        light_up_by_slot();
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    if (!enabled) {
+        set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
+        light_up_by_slot();
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 static data_frame_tx_t *cmd_processor_get_battery_info(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     struct {
         uint16_t voltage;
@@ -3886,6 +3909,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_SET_BLE_PAIRING_ENABLE,       NULL,                        cmd_processor_set_ble_pairing_enable,        NULL                   },
     {    DATA_CMD_GET_KEYBOARD_HID_ENABLE,      NULL,                        cmd_processor_get_keyboard_hid_enable,       NULL                   },
     {    DATA_CMD_SET_KEYBOARD_HID_ENABLE,      NULL,                        cmd_processor_set_keyboard_hid_enable,       NULL                   },
+    {    DATA_CMD_SET_RUNTIME_UNDERCOVER_MODE,  NULL,                        cmd_processor_set_runtime_undercover_mode,   NULL                   },
     {    DATA_CMD_GET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_get_sleep_timeout,             NULL                   },
     {    DATA_CMD_SET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_set_sleep_timeout,             NULL                   },
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },

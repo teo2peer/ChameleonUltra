@@ -30,6 +30,7 @@
 #include "rgb_marquee.h"
 #include "keyboard_hid.h"
 #include "keyboard_payload.h"
+#include "rfid_main.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "iso_dep_session.h"
 #endif
@@ -186,13 +187,20 @@ static volatile bool m_nus_tx_sending;
 static volatile bool m_nus_tx_pending;
 static volatile bool m_nus_hvn_inflight;
 static volatile uint32_t m_nus_tx_generation;
-static bool m_nus_comm_started;
+static volatile bool m_nus_comm_started;
 static uint8_t m_nus_rx_pending[BLE_NUS_MAX_DATA_LEN];
 static uint16_t m_nus_rx_length;
 static uint16_t m_nus_rx_offset;
 
 static bool nus_response_ready(void) {
     return g_is_ble_connected && m_nus_comm_started && m_nus_tx_count < NUS_TX_QUEUE_DEPTH;
+}
+
+static void runtime_undercover_revoke(void) {
+    if (!rgb_marquee_is_undercover()) return;
+    rgb_marquee_set_undercover(false);
+    set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
+    light_up_by_slot();
 }
 
 // Simple function to provide an index to the next input buffer
@@ -405,6 +413,7 @@ static void nus_data_handler(ble_nus_evt_t *p_evt) {
         return;
     }
     if (p_evt->type == BLE_NUS_EVT_COMM_STOPPED) {
+        runtime_undercover_revoke();
 #if defined(PROJECT_CHAMELEON_ULTRA)
         iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
@@ -735,6 +744,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
                 break;
             }
             NRF_LOG_INFO("Disconnected");
+            runtime_undercover_revoke();
 #if defined(PROJECT_CHAMELEON_ULTRA)
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif

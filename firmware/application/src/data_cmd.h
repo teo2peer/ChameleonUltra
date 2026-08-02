@@ -60,6 +60,7 @@
 #define DATA_CMD_ACTIVE_SLOT_SNAPSHOT            (1050)
 #define DATA_CMD_GET_KEYBOARD_HID_ENABLE        (1051)
 #define DATA_CMD_SET_KEYBOARD_HID_ENABLE        (1052)
+#define DATA_CMD_SET_RUNTIME_UNDERCOVER_MODE     (1053)
 
 //
 // ******************************************************************
