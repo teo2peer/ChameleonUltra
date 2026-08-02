@@ -2,6 +2,7 @@
 #define NFC_MF1_H
 
 #include "nfc_14a.h"
+#include "mf1_auth_log_internal.h"
 #include "netdata.h"
 
 // Exchange space for time.
@@ -131,23 +132,8 @@ typedef struct {
     uint8_t tx_frame_bit_size;
 } nfc_tag_mf1_tx_buffer_t;
 
-// MF1 label verification history
-typedef struct {
-    // Basic information of verification
-    uint8_t block;
-    uint8_t is_key_b: 1;
-    uint8_t is_nested: 1;
-    // padding to full byte
-    uint8_t : 6;
-    // MFKEY32 necessary parameters
-    uint8_t uid[4];
-    uint8_t nt[4];
-    uint8_t nr[4];
-    uint8_t ar[4];
-    // uint32_t nt;
-    // uint32_t nr;
-    // uint32_t ar;
-} PACKED nfc_tag_mf1_auth_log_t;
+// Explicit wire record used by command 4006.
+typedef mf1_auth_log_record_t nfc_tag_mf1_auth_log_t;
 
 
 nfc_tag_mf1_auth_log_t *mf1_get_auth_log(uint32_t *count);

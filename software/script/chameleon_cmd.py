@@ -2550,6 +2550,15 @@ class ChameleonCMD:
         return self.device.send_cmd_sync(Command.MF1_SET_DETECTION_ENABLE, data)
 
     @expect_response(Status.SUCCESS)
+    def mf1_get_detection_enable(self):
+        """Get the runtime reader-key capture state."""
+        resp = self.device.send_cmd_sync(Command.MF1_GET_DETECTION_ENABLE)
+        if len(resp.data) != 1 or resp.data[0] not in (0, 1):
+            raise ValueError("Invalid MF1 detection state response")
+        resp.parsed = resp.data[0] == 1
+        return resp
+
+    @expect_response(Status.SUCCESS)
     def mf1_set_random_uid_mode(self, enabled: bool):
         """
         Set whether the emulator presents a new random UID on each reader activation.
@@ -2596,7 +2605,11 @@ class ChameleonCMD:
         """
         resp = self.device.send_cmd_sync(Command.MF1_GET_DETECTION_COUNT)
         if resp.status == Status.SUCCESS:
+            if len(resp.data) != 4:
+                raise ValueError("Invalid MF1 detection count response")
             resp.parsed, = struct.unpack('!I', resp.data)
+            if resp.parsed > 1000:
+                raise ValueError("Invalid MF1 detection count")
         return resp
 
     @expect_response(Status.SUCCESS)
@@ -2610,6 +2623,8 @@ class ChameleonCMD:
         data = struct.pack('!I', index)
         resp = self.device.send_cmd_sync(Command.MF1_GET_DETECTION_LOG, data)
         if resp.status == Status.SUCCESS:
+            if not resp.data or len(resp.data) % 18 != 0:
+                raise ValueError("Invalid MF1 detection log page")
             # convert
             result_list = []
             pos = 0

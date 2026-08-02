@@ -7,6 +7,7 @@
 #include "rfid/nfctag/hf/ntag_mirror_internal.h"
 #include "rfid/reader/hf/emv_trace_internal.h"
 #include "mf1_key_access_internal.h"
+#include "rfid/nfctag/hf/mf1_auth_log_internal.h"
 
 static void test_ntag_mirror_render(void) {
     static const uint8_t uid[7] = {0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03};
@@ -100,6 +101,24 @@ static void test_mf1_key_access(void) {
     }
 }
 
+static void test_mf1_auth_log_latch(void) {
+    assert(sizeof(mf1_auth_log_record_t) == MF1_AUTH_LOG_RECORD_SIZE);
+    assert(mf1_auth_log_flags(false, false) == 0u);
+    assert(mf1_auth_log_flags(true, true) ==
+           (MF1_AUTH_LOG_FLAG_KEY_B | MF1_AUTH_LOG_FLAG_NESTED));
+
+    mf1_auth_log_latch_t latch = {0};
+    assert(mf1_auth_log_latch_begin(&latch, true, 7u));
+    assert(mf1_auth_log_latch_active(&latch, true, 7u));
+    assert(!mf1_auth_log_latch_active(&latch, true, 8u));
+    assert(!mf1_auth_log_latch_finish(&latch, true, 8u));
+    assert(!latch.pending);
+
+    assert(mf1_auth_log_latch_begin(&latch, true, 9u));
+    assert(mf1_auth_log_latch_finish(&latch, true, 9u));
+    assert(!mf1_auth_log_latch_begin(&latch, false, 10u));
+}
+
 static void set_frame_bit(uint8_t *frame, size_t bit, uint8_t value) {
     if (value != 0u) frame[bit / 8u] |= 1u << (bit % 8u);
 }
@@ -170,6 +189,7 @@ int main(void) {
     test_ntag_mirror_render();
     test_ntag_mirror_overlay();
     test_mf1_key_access();
+    test_mf1_auth_log_latch();
     test_nfc_14a_unwrap_exact_groups();
     test_emv_uid_continuity();
     return 0;

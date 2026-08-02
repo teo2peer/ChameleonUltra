@@ -6,6 +6,7 @@
 #include "mf1_crapto1.h"  // for prng_successor — real MFC LFSR PRNG
 #include "fds_util.h"
 #include "tag_persistence.h"
+#include "app_util_platform.h"
 
 #ifdef NFC_MF1_FAST_SIM
 #include "mf1_crypto1.h"
@@ -222,6 +223,14 @@ static __attribute__((section(".noinit_mf1"))) struct nfc_tag_mf1_auth_log_buffe
     uint32_t magic;
 } m_auth_log;
 
+_Static_assert(sizeof(nfc_tag_mf1_auth_log_t) == MF1_AUTH_LOG_RECORD_SIZE,
+               "MF1 auth log wire record must remain 18 bytes");
+
+static volatile bool m_detection_enabled;
+static volatile uint32_t m_detection_generation;
+static mf1_auth_log_latch_t m_auth_log_latch;
+static nfc_tag_mf1_auth_log_t m_pending_auth_log;
+
 static uint8_t CardResponse[4];
 static uint8_t ReaderResponse[4];
 static uint8_t CurrentAddress;
@@ -427,15 +436,14 @@ void append_mf1_auth_log_step1(bool isKeyB, bool isNested, uint8_t block, uint8_
         NRF_LOG_INFO("Mifare Classic auth log buffer overflow");
         return;
     }
-    // Determine whether this card slot enables the detection log record
-    if (m_tag_information->config.detection_enable) {
-        m_auth_log.logs[m_auth_log.count].is_key_b = isKeyB;
-        m_auth_log.logs[m_auth_log.count].block = block;
-        m_auth_log.logs[m_auth_log.count].is_nested = isNested;
-        memcpy(m_auth_log.logs[m_auth_log.count].uid, UID_BY_CASCADE_LEVEL, 4);
-//        m_auth_log.logs[m_auth_log.count].nt = U32HTONL(*(uint32_t *)nonce);
-        memcpy(m_auth_log.logs[m_auth_log.count].nt, nonce, 4);
-    }
+    if (!mf1_auth_log_latch_begin(&m_auth_log_latch, m_detection_enabled,
+                                  m_detection_generation)) return;
+
+    memset(&m_pending_auth_log, 0, sizeof(m_pending_auth_log));
+    m_pending_auth_log.block = block;
+    m_pending_auth_log.flags = mf1_auth_log_flags(isKeyB, isNested);
+    memcpy(m_pending_auth_log.uid, UID_BY_CASCADE_LEVEL, 4);
+    memcpy(m_pending_auth_log.nt, nonce, 4);
 }
 
 /** @brief MF1 additional verification log, step 2, store the encryption information of the read -ahead response
@@ -448,13 +456,13 @@ void append_mf1_auth_log_step2(uint8_t *nr, uint8_t *ar) {
     if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         return;
     }
-    if (m_tag_information->config.detection_enable) {
-        // Cache encryption information
-//        m_auth_log.logs[m_auth_log.count].nr = U32HTONL(*(uint32_t *)nr);
-//        m_auth_log.logs[m_auth_log.count].ar = U32HTONL(*(uint32_t *)ar);
-        memcpy(m_auth_log.logs[m_auth_log.count].nr, nr, 4);
-        memcpy(m_auth_log.logs[m_auth_log.count].ar, ar, 4);
+    if (!mf1_auth_log_latch_active(&m_auth_log_latch, m_detection_enabled,
+                                   m_detection_generation)) {
+        mf1_auth_log_latch_reset(&m_auth_log_latch);
+        return;
     }
+    memcpy(m_pending_auth_log.nr, nr, 4);
+    memcpy(m_pending_auth_log.ar, ar, 4);
 }
 
 /** @brief MF1 additional verification log, step 3, store the last verification or failure log
@@ -462,17 +470,19 @@ void append_mf1_auth_log_step2(uint8_t *nr, uint8_t *ar) {
  * @param is_auth_success: Whether to verify success
  */
 void append_mf1_auth_log_step3(bool is_auth_success) {
+    (void)is_auth_success;
     ensure_auth_log_valid();
     // Determine to the upper limit and skip this operation directly to avoid covering the previous records
     if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
         return;
     }
-    if (m_tag_information->config.detection_enable) {
-        // Then you can end this record, the number of statistics increases
-        m_auth_log.count += 1;
-        // Print the number of logs in the current record
-        NRF_LOG_INFO("Auth log count: %d", m_auth_log.count);
-    }
+    if (!mf1_auth_log_latch_finish(&m_auth_log_latch, m_detection_enabled,
+                                   m_detection_generation)) return;
+
+    memcpy(&m_auth_log.logs[m_auth_log.count], &m_pending_auth_log,
+           sizeof(m_pending_auth_log));
+    m_auth_log.count += 1;
+    NRF_LOG_INFO("Auth log count: %d", m_auth_log.count);
 }
 
 /** @brief MF1 obtain verification log
@@ -1309,6 +1319,11 @@ int nfc_tag_mf1_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer)
     if (buffer->length >= info_size) {
         //Convert the data buffer to MF1 structure type
         m_tag_information = (nfc_tag_mf1_information_t *)buffer->buffer;
+        // Reader-key detection is a runtime session and must never revive from FDS.
+        m_tag_information->config.detection_enable = false;
+        m_detection_enabled = false;
+        m_detection_generation++;
+        mf1_auth_log_latch_reset(&m_auth_log_latch);
         // The specific type of MF1 that is emulated by the cache
         m_tag_type = type;
         // Register 14A communication management interface
@@ -1393,12 +1408,19 @@ bool nfc_tag_mf1_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
 
 // Settling whether it enables detection
 void nfc_tag_mf1_set_detection_enable(bool enable) {
-    m_tag_information->config.detection_enable = enable;
+    CRITICAL_REGION_ENTER();
+    m_detection_generation++;
+    mf1_auth_log_latch_reset(&m_auth_log_latch);
+    m_detection_enabled = enable;
+    if (m_tag_information != NULL) {
+        m_tag_information->config.detection_enable = false;
+    }
+    CRITICAL_REGION_EXIT();
 }
 
 // Whether it can be detected at present
 bool nfc_tag_mf1_is_detection_enable(void) {
-    return m_tag_information->config.detection_enable;
+    return m_detection_enabled;
 }
 
 // Enable/disable random-UID-per-activation mode
@@ -1420,8 +1442,12 @@ bool nfc_tag_mf1_is_random_uid_mode(void) {
 
 // Clear detection record
 void nfc_tag_mf1_detection_log_clear(void) {
+    CRITICAL_REGION_ENTER();
     ensure_auth_log_valid();
+    m_detection_generation++;
+    mf1_auth_log_latch_reset(&m_auth_log_latch);
     m_auth_log.count = 0;
+    CRITICAL_REGION_EXIT();
 }
 
 // The number of statistics of detection records

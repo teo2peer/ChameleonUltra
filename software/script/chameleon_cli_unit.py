@@ -5592,6 +5592,9 @@ class HFMFReaderKeysStart(SlotIndexArgsUnit):
                                     "Set it with 'hw slot type' first.")))
             return
 
+        # Capturing only works while the device is emulating a tag.
+        self.cmd.set_device_reader_mode(False)
+
         # Optionally load a dump to emulate as the card.
         if args.file is not None:
             content_type = args.type
@@ -5638,7 +5641,7 @@ class HFMFReaderKeysStart(SlotIndexArgsUnit):
         print(color_string((CG, f" - Reader-key capture armed on slot {self.slot_num}. "
                                 "Present the device to the target reader.")))
         print("   Progress: 'hf mf readerkeys status'")
-        print("   Recover : 'hf mf readerkeys extract -o keys.dic'  (do this before 'stop')")
+        print("   Recover : 'hf mf readerkeys extract -o keys.dic'")
         print("   Stop    : 'hf mf readerkeys stop'")
 
 
@@ -5651,7 +5654,7 @@ class HFMFReaderKeysStatus(DeviceRequiredUnit):
 
     def on_exec(self, args: argparse.Namespace):
         count = self.cmd.mf1_get_detection_count()
-        detection = self.cmd.mf1_get_emulator_config()["detection"]
+        detection = self.cmd.mf1_get_detection_enable()
         random_uid = self.cmd.mf1_get_random_uid_mode()
         print(f" - Capture armed  : {detection}")
         print(f" - Random UID mode: {random_uid}")
@@ -5689,25 +5692,28 @@ class HFMFReaderKeysExtract(HFMFELog):
             print("." * recv, end="")
         print()
 
-        # Group by uid -> block -> key type, then recover each with mfkey32.
+        # Group by UID -> sector -> key type so captures from different blocks
+        # protected by the same sector key can form a valid MFKey32 pair.
         result_maps = {}
         for item in result_list:
+            block = item["block"]
+            sector = block // 4 if block < 128 else 32 + (block - 128) // 16
             result_maps.setdefault(item["uid"], {}).setdefault(
-                item["block"], {}).setdefault(item["type"], []).append(item)
+                sector, {}).setdefault(item["type"], []).append(item)
 
         all_keys = set()
         for uid in result_maps:
             print(f" - Reader keys for UID [{uid.upper()}]")
             uid_found_keys = set()
-            for block in result_maps[uid]:
+            for sector in result_maps[uid]:
                 for keyType in "AB":
-                    records = result_maps[uid][block].get(keyType, [])
+                    records = result_maps[uid][sector].get(keyType, [])
                     if len(records) < 1:
                         continue
                     keys = self.decrypt_by_list(records, uid_found_keys)
                     uid_found_keys.update(keys)
                     if keys:
-                        print(f"   Block {block} key {keyType}: "
+                        print(f"   Sector {sector} key {keyType}: "
                               f"{', '.join(sorted(k.upper() for k in keys))}")
             all_keys.update(uid_found_keys)
 
@@ -5732,15 +5738,14 @@ class HFMFReaderKeysStop(DeviceRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
         parser = ArgumentParserNoExit()
         parser.description = ("Stop reader-key capture: disable logging + UID randomization "
-                              "and stop the LED animation (this clears the on-device log)")
+                              "and stop the LED animation while preserving the on-device log")
         return parser
 
     def on_exec(self, args: argparse.Namespace):
         self.cmd.mf1_set_reader_keys_anim(False)
         self.cmd.mf1_set_random_uid_mode(False)
-        # Disabling detection clears the on-device auth log — extract first!
         self.cmd.mf1_set_detection_enable(False)
-        print(color_string((CG, " - Reader-key capture stopped (on-device log cleared)")))
+        print(color_string((CG, " - Reader-key capture stopped (on-device log preserved)")))
 
 
 @hf_mf.command("eload")

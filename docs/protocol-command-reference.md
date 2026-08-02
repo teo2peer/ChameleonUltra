@@ -346,7 +346,7 @@ requiere owner de emulación.
 |---:|---|---|---|
 | 4000 | `MF1_WRITE_EMU_BLOCK_DATA` | `start_block, blocks[N*16]`, N=1..255 | Escribe RAM MFC; solo limita a 256 bloques |
 | 4001 | `HF14A_SET_ANTI_COLL_DATA` | `uid_len, uid, atqa[2], sak, ats_len, ats` | Cambia UID/ATQA/SAK/ATS del slot HF activo |
-| 4004 | `MF1_SET_DETECTION_ENABLE` | `enabled:u8` | 1 limpia y arma log; 0 desarma sin borrar |
+| 4004 | `MF1_SET_DETECTION_ENABLE` | `enabled:u8` | 1 limpia y arma log runtime-only; 0 desarma sin borrar |
 | 4005 | `MF1_GET_DETECTION_COUNT` | ignorado | `count:u32be`, máximo 1000 |
 | 4006 | `MF1_GET_DETECTION_LOG` | `start_index:u32be` | Registros de autenticación de 18 bytes, hasta 227 por página |
 | 4007 | `MF1_GET_DETECTION_ENABLE` | ignorado | `enabled:u8` |
@@ -399,8 +399,9 @@ nr_encrypted:u32be
 ar_encrypted:u32be
 ```
 
-Se registran autenticaciones completas correctas y fallidas. El log es global,
-está en RAM retenida `.noinit_mf1`, satura a 1000 y no se guarda en FDS.
+Se publican únicamente autenticaciones completas correctas y fallidas. El log es
+global, está en RAM retenida `.noinit_mf1`, satura a 1000 y no se guarda en FDS.
+El estado armado es runtime-only y siempre vuelve desarmado al cargar un slot.
 
 Write modes MFC/MF0:
 
