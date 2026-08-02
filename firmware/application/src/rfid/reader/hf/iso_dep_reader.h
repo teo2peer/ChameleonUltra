@@ -9,7 +9,8 @@
 
 #define ISO_DEP_READER_MAX_APDU_RESPONSE 512u
 #define ISO_DEP_READER_MAX_CHAIN_BLOCKS  32u
-#define ISO_DEP_READER_MAX_WTX           8u
+#define ISO_DEP_READER_MAX_WTX           64u
+#define ISO_DEP_READER_MAX_WTX_TOTAL_MS  5000u
 
 typedef enum {
     ISO_DEP_OK = 0,

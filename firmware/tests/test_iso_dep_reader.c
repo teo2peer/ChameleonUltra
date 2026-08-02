@@ -105,6 +105,74 @@ static uint8_t wtx_handler(const uint8_t *tx, uint8_t tx_len,
     return STATUS_HF_TAG_OK;
 }
 
+static uint8_t repeated_wtx_handler(const uint8_t *tx, uint8_t tx_len,
+                                    uint8_t *rx, uint16_t *rx_len) {
+    (void)tx_len;
+    if (m_step == 0u) {
+        assert(tx[0] == 0x02u);
+    } else {
+        assert(tx[0] == 0xF2u && tx[1] == 0x01u);
+    }
+    if (m_step++ < 9u) {
+        const uint8_t wtx[] = {0xF2, 0x01};
+        make_frame(rx, rx_len, wtx, sizeof(wtx));
+    } else {
+        const uint8_t response[] = {0x02, 0x90, 0x00};
+        make_frame(rx, rx_len, response, sizeof(response));
+    }
+    return STATUS_HF_TAG_OK;
+}
+
+static uint8_t endless_wtx_handler(const uint8_t *tx, uint8_t tx_len,
+                                   uint8_t *rx, uint16_t *rx_len) {
+    (void)tx_len;
+    if (m_step++ == 0u) {
+        assert(tx[0] == 0x02u);
+    } else {
+        assert(tx[0] == 0xF2u && tx[1] == 0x02u);
+    }
+    const uint8_t wtx[] = {0xF2, 0x02};
+    make_frame(rx, rx_len, wtx, sizeof(wtx));
+    return STATUS_HF_TAG_OK;
+}
+
+static uint8_t wtx_timeout_recovery_handler(const uint8_t *tx, uint8_t tx_len,
+                                            uint8_t *rx, uint16_t *rx_len) {
+    (void)tx_len;
+    if (m_step == 0u) {
+        assert(tx[0] == 0x02u);
+        const uint8_t wtx[] = {0xF2, 0x01};
+        make_frame(rx, rx_len, wtx, sizeof(wtx));
+        m_step++;
+        return STATUS_HF_TAG_OK;
+    }
+    if (m_step == 1u) {
+        assert(tx[0] == 0xF2u && tx[1] == 0x01u);
+        *rx_len = 0u;
+        m_step++;
+        return STATUS_HF_TAG_NO;
+    }
+    assert(tx[0] == 0xB2u);
+    const uint8_t response[] = {0x02, 0x90, 0x00};
+    make_frame(rx, rx_len, response, sizeof(response));
+    m_step++;
+    return STATUS_HF_TAG_OK;
+}
+
+static uint8_t initial_timeout_recovery_handler(const uint8_t *tx, uint8_t tx_len,
+                                                uint8_t *rx, uint16_t *rx_len) {
+    (void)tx_len;
+    if (m_step++ == 0u) {
+        assert(tx[0] == 0x02u);
+        *rx_len = 0u;
+        return STATUS_HF_TAG_NO;
+    }
+    assert(tx[0] == 0xB2u);
+    const uint8_t response[] = {0x02, 0x90, 0x00};
+    make_frame(rx, rx_len, response, sizeof(response));
+    return STATUS_HF_TAG_OK;
+}
+
 static uint8_t bad_crc_handler(const uint8_t *tx, uint8_t tx_len,
                                uint8_t *rx, uint16_t *rx_len) {
     (void)tx;
@@ -126,6 +194,16 @@ static uint8_t final_nak_handler(const uint8_t *tx, uint8_t tx_len,
         const uint8_t response[] = {0x02, 0x90, 0x00};
         make_frame(rx, rx_len, response, sizeof(response));
     }
+    return STATUS_HF_TAG_OK;
+}
+
+static uint8_t deselect_handler(const uint8_t *tx, uint8_t tx_len,
+                                uint8_t *rx, uint16_t *rx_len) {
+    assert(tx[0] == 0xC2u);
+    assert(tx_len == 3u);
+    const uint8_t response[] = {0xC2};
+    make_frame(rx, rx_len, response, sizeof(response));
+    m_step++;
     return STATUS_HF_TAG_OK;
 }
 
@@ -193,10 +271,70 @@ static void test_wtx_and_crc_error(void) {
     assert(m_step == 2u);
 }
 
+static void test_repeated_wtx_and_total_budget(void) {
+    iso_dep_reader_t reader = new_reader(8);
+    const uint8_t command[] = {0x00, 0xA4, 0x04, 0x00, 0x00};
+    uint8_t response[32];
+    iso_dep_result_t result;
+
+    m_step = 0u;
+    m_handler = repeated_wtx_handler;
+    assert(iso_dep_reader_transceive(&reader, command, sizeof(command),
+                                     response, sizeof(response), &result));
+    assert(result.wtx_count == 9u);
+    assert(result.response_len == 2u);
+
+    reader = new_reader(8);
+    reader.frame_timeout_ms = 1000u;
+    m_step = 0u;
+    m_handler = endless_wtx_handler;
+    assert(!iso_dep_reader_transceive(&reader, command, sizeof(command),
+                                      response, sizeof(response), &result));
+    assert(result.error == ISO_DEP_ERR_TIMEOUT);
+    assert(result.wtx_count == 3u);
+}
+
+static void test_wtx_timeout_response_recovery(void) {
+    iso_dep_reader_t reader = new_reader(8);
+    const uint8_t command[] = {0x80, 0xCA, 0x9F, 0x36, 0x00};
+    uint8_t response[32];
+    iso_dep_result_t result;
+
+    m_step = 0u;
+    m_handler = wtx_timeout_recovery_handler;
+    assert(iso_dep_reader_transceive(&reader, command, sizeof(command),
+                                     response, sizeof(response), &result));
+    assert(m_step == 3u);
+    assert(result.wtx_count == 1u);
+    assert(result.response_len == 2u);
+
+    reader = new_reader(8);
+    m_step = 0u;
+    m_handler = initial_timeout_recovery_handler;
+    assert(iso_dep_reader_transceive(&reader, command, sizeof(command),
+                                     response, sizeof(response), &result));
+    assert(m_step == 2u);
+    assert(result.wtx_count == 0u);
+    assert(result.response_len == 2u);
+}
+
+static void test_deselect(void) {
+    iso_dep_reader_t reader = new_reader(8);
+    m_step = 0u;
+    m_timeout = 123u;
+    m_handler = deselect_handler;
+    iso_dep_reader_deselect(&reader);
+    assert(m_step == 1u);
+    assert(m_timeout == 123u);
+}
+
 int main(void) {
     test_chained_command();
     test_chained_response_and_next_command();
     test_wtx_and_crc_error();
+    test_repeated_wtx_and_total_budget();
+    test_wtx_timeout_response_recovery();
+    test_deselect();
     puts("iso_dep_reader tests passed");
     return 0;
 }

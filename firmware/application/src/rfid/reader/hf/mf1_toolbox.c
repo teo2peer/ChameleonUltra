@@ -3,6 +3,7 @@
 #include "hex_utils.h"
 
 #include "mf1_toolbox.h"
+#include "mf1_key_access_internal.h"
 #include "mf1_crapto1.h"
 #include "app_status.h"
 

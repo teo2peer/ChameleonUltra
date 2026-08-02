@@ -11,6 +11,8 @@ extern uint8_t percentage_batt_lvl;
 
 typedef void (*lf_adc_callback_t)(nrf_saadc_value_t *, size_t);
 
+#define BLE_TEMPORARY_NAME_MAX_LENGTH 26u
+
 void ble_slave_init(void);
 void advertising_start(bool erase_bonds);
 void advertising_stop(void);
@@ -21,6 +23,10 @@ uint32_t nus_data_response_try(const uint8_t *p_data, uint16_t length);
 bool is_nus_working(void);
 bool is_nus_tx_idle(void);
 bool ble_command_link_authorized(void);
+bool ble_keyboard_link_authorized(void);
+uint32_t ble_peripheral_name_set_temporary(const uint8_t *name, uint8_t length);
+uint8_t ble_peripheral_name_get(uint8_t *name);
+uint32_t ble_keyboard_advertising_start(void);
 void set_ble_connect_key(uint8_t *key);
 
 void register_lf_adc_callback(lf_adc_callback_t cb);
@@ -73,6 +79,23 @@ uint32_t ble_radio_get(uint8_t *out);
 // advertising_start afterwards).
 uint32_t ble_adv_flood_start(uint8_t fill_byte, uint16_t interval_ms);
 uint32_t ble_adv_flood_stop(void);
+
+#define BLE_ADV_LAB_VERSION            1u
+#define BLE_ADV_LAB_MAX_NAMES          32u
+#define BLE_ADV_LAB_MAX_NAME_LENGTH    26u
+#define BLE_ADV_LAB_STATUS_LENGTH      20u
+
+uint32_t ble_adv_lab_start(uint8_t profile, uint8_t mode, uint8_t name_target,
+                           uint16_t interval_units, uint16_t rotation_ms,
+                           uint16_t duration_units, uint8_t max_adv_events,
+                           const uint8_t *adv_data, uint8_t adv_length,
+                           const uint8_t *scan_data, uint8_t scan_length,
+                           const uint8_t *names, uint16_t names_length,
+                           uint8_t name_count);
+uint32_t ble_adv_lab_stop(void);
+uint16_t ble_adv_lab_get_status(uint8_t *out, uint16_t max_length);
+void ble_adv_lab_process(void);
+bool ble_adv_lab_is_active(void);
 
 uint16_t ble_link_mtu(uint16_t conn_handle); // effective ATT MTU for a connection
 

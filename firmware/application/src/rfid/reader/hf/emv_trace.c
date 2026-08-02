@@ -1,4 +1,5 @@
 #include "emv_trace.h"
+#include "emv_trace_internal.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -12,7 +13,7 @@
 #include "netdata.h"
 #include "rc522.h"
 
-#define TRACE_CAPACITY        8192u
+#define TRACE_CAPACITY        12288u
 #define TRACE_MAX_AIDS       16u
 #define TRACE_MAX_APDUS      512u
 #define TRACE_MAX_RECORDS_APP 64u
@@ -31,6 +32,7 @@
 #define TRACE_FLAG_TIMING_VALID      0x00000040u
 #define TRACE_FLAG_MAX_PROCESSING    0x00000080u
 #define TRACE_FLAG_TRANSPORT_ERROR   0x00000100u
+#define TRACE_FLAG_EXPRESS_TRANSIT   0x00000200u
 
 #define RECORD_RF       1u
 #define RECORD_APDU     2u
@@ -54,6 +56,12 @@ typedef struct {
     uint8_t priority;
 } emv_aid_t;
 
+typedef enum {
+    EMV_SCHEME_OTHER,
+    EMV_SCHEME_VISA,
+    EMV_SCHEME_MASTERCARD,
+} emv_scheme_t;
+
 typedef struct {
     uint8_t options;
     uint8_t max_aids;
@@ -66,6 +74,13 @@ typedef struct {
     uint8_t date[3];
     uint8_t transaction_type;
     uint8_t cryptogram_type;
+    uint8_t terminal_profile;
+    uint8_t custom_ttq[4];
+    uint8_t polling_profile;
+    uint8_t behavior;
+    uint8_t poll_retries;
+    uint8_t poll_delay_ms;
+    uint8_t poll_timeout_ms;
 } emv_request_t;
 
 typedef struct {
@@ -101,6 +116,66 @@ static uint8_t m_stage;
 static uint8_t m_app_index;
 static uint8_t m_attempt;
 static bool m_store_disabled;
+static uint8_t m_active_ttq[4];
+static uint8_t m_active_terminal_type = 0x22u;
+static uint8_t m_active_terminal_capabilities[3] = {0xE0, 0x08, 0x00};
+
+static const uint8_t m_ttq_profiles[][4] = {
+    {0x36, 0x00, 0xC0, 0x00}, /* automatic/default */
+    {0x33, 0x80, 0x40, 0x00}, /* Apple transit */
+    {0x32, 0x80, 0x40, 0x00}, /* online, no ODA */
+    {0x36, 0x00, 0xC0, 0x00}, /* broad mobile */
+    {0x26, 0x80, 0x40, 0x00}, /* qVSDC online */
+    {0x22, 0x80, 0x40, 0x00}, /* minimal online */
+    {0xB6, 0x00, 0xC0, 0x00}, /* MSD + qVSDC */
+};
+
+static bool terminal_profile_valid(uint8_t profile) {
+    return profile <= EMV_TERMINAL_PROFILE_MSD_QVSDC ||
+           profile == EMV_TERMINAL_PROFILE_CUSTOM ||
+           profile == EMV_TERMINAL_PROFILE_SWEEP;
+}
+
+static void terminal_profile_select(uint8_t profile) {
+    if (profile == EMV_TERMINAL_PROFILE_AUTO) {
+        profile = (m_request.options & EMV_TRACE_OPT_EXPRESS_TRANSIT) != 0u ?
+                  EMV_TERMINAL_PROFILE_APPLE_TRANSIT :
+                  EMV_TERMINAL_PROFILE_BROAD_MOBILE;
+    }
+    if (profile == EMV_TERMINAL_PROFILE_CUSTOM) {
+        memcpy(m_active_ttq, m_request.custom_ttq, sizeof(m_active_ttq));
+    } else if (profile <= EMV_TERMINAL_PROFILE_MSD_QVSDC) {
+        memcpy(m_active_ttq, m_ttq_profiles[profile], sizeof(m_active_ttq));
+    }
+    m_active_terminal_type =
+        (profile == EMV_TERMINAL_PROFILE_APPLE_TRANSIT ||
+         profile == EMV_TERMINAL_PROFILE_QVSDC_ONLINE ||
+         profile == EMV_TERMINAL_PROFILE_MINIMAL_ONLINE) ? 0x14u : 0x22u;
+    m_active_terminal_capabilities[0] = 0xE0u;
+    m_active_terminal_capabilities[1] = 0x08u; /* No-CVM capability. */
+    m_active_terminal_capabilities[2] = 0x00u;
+}
+
+static void polling_profile_values(uint8_t *retries, uint8_t *delay_ms,
+                                   uint8_t *timeout_ms) {
+    switch (m_request.polling_profile) {
+        case EMV_POLLING_PROFILE_FAST:
+            *retries = 18u; *delay_ms = 3u; *timeout_ms = 2u;
+            break;
+        case EMV_POLLING_PROFILE_BALANCED:
+            *retries = 40u; *delay_ms = 5u; *timeout_ms = 3u;
+            break;
+        case EMV_POLLING_PROFILE_PATIENT:
+            *retries = 80u; *delay_ms = 8u; *timeout_ms = 4u;
+            break;
+        default:
+            *retries = 30u; *delay_ms = 5u; *timeout_ms = 2u;
+            break;
+    }
+    if (m_request.poll_retries != 0u) *retries = m_request.poll_retries;
+    if (m_request.poll_delay_ms != 0u) *delay_ms = m_request.poll_delay_ms;
+    if (m_request.poll_timeout_ms != 0u) *timeout_ms = m_request.poll_timeout_ms;
+}
 
 static void put_u16(uint8_t *out, uint16_t value) {
     out[0] = (uint8_t)(value >> 8);
@@ -302,6 +377,47 @@ static void sort_aids(emv_aid_t *aids, uint8_t count) {
     }
 }
 
+static emv_scheme_t aid_scheme(const emv_aid_t *aid) {
+    if (aid->aid_len < 5u) return EMV_SCHEME_OTHER;
+    if (memcmp(aid->aid, "\xA0\x00\x00\x00\x03", 5) == 0) return EMV_SCHEME_VISA;
+    if (memcmp(aid->aid, "\xA0\x00\x00\x00\x04", 5) == 0) return EMV_SCHEME_MASTERCARD;
+    return EMV_SCHEME_OTHER;
+}
+
+static void sweep_order(const emv_aid_t *aid, uint8_t *profiles) {
+    static const uint8_t visa[] = {
+        EMV_TERMINAL_PROFILE_APPLE_TRANSIT,
+        EMV_TERMINAL_PROFILE_ONLINE_NO_ODA,
+        EMV_TERMINAL_PROFILE_QVSDC_ONLINE,
+        EMV_TERMINAL_PROFILE_BROAD_MOBILE,
+        EMV_TERMINAL_PROFILE_MINIMAL_ONLINE,
+        EMV_TERMINAL_PROFILE_MSD_QVSDC,
+    };
+    static const uint8_t mastercard[] = {
+        EMV_TERMINAL_PROFILE_BROAD_MOBILE,
+        EMV_TERMINAL_PROFILE_QVSDC_ONLINE,
+        EMV_TERMINAL_PROFILE_APPLE_TRANSIT,
+        EMV_TERMINAL_PROFILE_ONLINE_NO_ODA,
+        EMV_TERMINAL_PROFILE_MSD_QVSDC,
+        EMV_TERMINAL_PROFILE_MINIMAL_ONLINE,
+    };
+    static const uint8_t other[] = {
+        EMV_TERMINAL_PROFILE_QVSDC_ONLINE,
+        EMV_TERMINAL_PROFILE_BROAD_MOBILE,
+        EMV_TERMINAL_PROFILE_APPLE_TRANSIT,
+        EMV_TERMINAL_PROFILE_ONLINE_NO_ODA,
+        EMV_TERMINAL_PROFILE_MINIMAL_ONLINE,
+        EMV_TERMINAL_PROFILE_MSD_QVSDC,
+    };
+    const uint8_t *source = visa;
+    if ((m_request.behavior & EMV_TRACE_BEHAVIOR_ADAPTIVE_PROFILES) != 0u) {
+        emv_scheme_t scheme = aid_scheme(aid);
+        source = scheme == EMV_SCHEME_MASTERCARD ? mastercard :
+                 scheme == EMV_SCHEME_VISA ? visa : other;
+    }
+    memcpy(profiles, source, sizeof(visa));
+}
+
 static bool activate(picc_14a_tag_t *tag, bool poll) {
     m_stage = STAGE_ACTIVATION;
     pcd_14a_reader_antenna_off();
@@ -433,17 +549,37 @@ static uint16_t fill_dol(const uint8_t *dol, uint16_t dol_len, uint8_t *out,
         uint8_t source_len = 0;
         uint8_t unpredictable[4] = {(uint8_t)rand(), (uint8_t)rand(),
                                     (uint8_t)rand(), (uint8_t)rand()};
-        static const uint8_t ttq[4] = {0x36, 0x00, 0xC0, 0x00};
-        static const uint8_t terminal_type = 0x22;
+        static const uint8_t amount_other[6] = {0};
+        static const uint8_t tvr[5] = {0};
+        static const uint8_t cvm_results[3] = {0x3F, 0x00, 0x00};
+        static const uint8_t floor_limit[4] = {0};
+        static const uint8_t additional_capabilities[5] = {0};
+        static const uint8_t merchant_category[2] = {0x41, 0x11};
+        static const uint8_t merchant_id[15] = "CHAMELEON-LAB  ";
+        static const uint8_t merchant_name[20] = "CHAMELEON TRANSIT   ";
+        static const uint8_t transaction_category = 0x52;
+        uint8_t sequence[4] = {(uint8_t)rand(), (uint8_t)rand(),
+                               (uint8_t)rand(), (uint8_t)rand()};
         switch (tag) {
             case 0x9F02: source = m_request.amount; source_len = 6; break;
+            case 0x9F03: source = amount_other; source_len = 6; break;
             case 0x9F1A: source = m_request.country; source_len = 2; break;
             case 0x5F2A: source = m_request.currency; source_len = 2; break;
+            case 0x95: source = tvr; source_len = 5; break;
             case 0x9A: source = m_request.date; source_len = 3; break;
             case 0x9C: source = &m_request.transaction_type; source_len = 1; break;
-            case 0x9F35: source = &terminal_type; source_len = 1; break;
+            case 0x9F35: source = &m_active_terminal_type; source_len = 1; break;
             case 0x9F37: source = unpredictable; source_len = 4; break;
-            case 0x9F66: source = ttq; source_len = 4; break;
+            case 0x9F66: source = m_active_ttq; source_len = 4; break;
+            case 0x9F33: source = m_active_terminal_capabilities; source_len = 3; break;
+            case 0x9F40: source = additional_capabilities; source_len = 5; break;
+            case 0x9F34: source = cvm_results; source_len = 3; break;
+            case 0x9F1B: source = floor_limit; source_len = 4; break;
+            case 0x9F15: source = merchant_category; source_len = 2; break;
+            case 0x9F16: source = merchant_id; source_len = 15; break;
+            case 0x9F4E: source = merchant_name; source_len = 20; break;
+            case 0x9F41: source = sequence; source_len = 4; break;
+            case 0x9F53: source = &transaction_category; source_len = 1; break;
             default: break;
         }
         if (source != NULL) {
@@ -474,6 +610,30 @@ static void record_application(const emv_aid_t *aid) {
     payload[1u + aid->aid_len] = aid->priority;
     append_record(RECORD_APP, STAGE_SELECT_APP, m_app_index, 0, 0,
                   STATUS_SUCCESS, payload, (uint16_t)(2u + aid->aid_len), false);
+}
+
+static void probe_direct_aids(emv_aid_t *aids, uint8_t *count) {
+    static const emv_aid_t candidates[] = {
+        {{0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10}, 7, 0}, /* Visa */
+        {{0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10}, 7, 0}, /* Mastercard */
+        {{0xA0, 0x00, 0x00, 0x00, 0x04, 0x30, 0x60}, 7, 0}, /* Maestro */
+        {{0xA0, 0x00, 0x00, 0x00, 0x25, 0x01}, 6, 0},       /* Amex */
+        {{0xA0, 0x00, 0x00, 0x01, 0x52, 0x30, 0x10}, 7, 0}, /* Discover */
+        {{0xA0, 0x00, 0x00, 0x00, 0x65, 0x10, 0x10}, 7, 0}, /* JCB */
+        {{0xA0, 0x00, 0x00, 0x03, 0x33, 0x01, 0x01, 0x01}, 8, 0}, /* UnionPay */
+        {{0xA0, 0x00, 0x00, 0x02, 0x77, 0x10, 0x10}, 7, 0}, /* Interac */
+    };
+    static uint8_t response[ISO_DEP_READER_MAX_APDU_RESPONSE];
+    for (uint8_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]) &&
+            *count < m_request.max_aids && budget_available(); i++) {
+        if (aid_exists(aids, *count, candidates[i].aid, candidates[i].aid_len)) continue;
+        uint16_t response_len = 0;
+        m_app_index = (uint8_t)(*count + 1u);
+        if (select_application(&candidates[i], response, &response_len)) {
+            aids[(*count)++] = candidates[i];
+        }
+    }
+    m_app_index = 0;
 }
 
 static void get_standard_data(void) {
@@ -595,7 +755,15 @@ static uint8_t read_afl(const uint8_t *gpo, uint16_t gpo_len,
     return successful;
 }
 
-static void process_application(const emv_aid_t *aid, bool maximum) {
+static bool profile_retry_status(const uint8_t *response, uint16_t response_len) {
+    if (response_len < 2u) return false;
+    uint16_t sw = ((uint16_t)response[response_len - 2u] << 8) |
+                  response[response_len - 1u];
+    return sw == 0x6985u || sw == 0x6986u || sw == 0x6A80u;
+}
+
+static bool process_application(const emv_aid_t *aid, bool maximum,
+                                picc_14a_tag_t *tag) {
     static uint8_t response[ISO_DEP_READER_MAX_APDU_RESPONSE];
     uint16_t response_len = 0;
     static uint8_t fci[ISO_DEP_READER_MAX_APDU_RESPONSE];
@@ -603,39 +771,71 @@ static void process_application(const emv_aid_t *aid, bool maximum) {
     uint16_t cdol_len = 0;
 
     record_application(aid);
-    if (!select_application(aid, response, &response_len)) return;
+    if (!select_application(aid, response, &response_len)) return true;
     uint16_t fci_len = response_len;
     memcpy(fci, response, response_len);
-    get_standard_data();
-    read_transaction_log(fci, fci_len);
 
     if (!maximum) {
+        get_standard_data();
+        read_transaction_log(fci, fci_len);
         (void)scan_records((m_request.options & EMV_TRACE_OPT_RECORD_GRID) != 0u,
                            STAGE_READ_SCAN, cdol, &cdol_len);
-        return;
+        return true;
     }
 
-    const uint8_t *pdol = NULL;
-    uint16_t pdol_len = 0;
-    (void)find_tlv(fci, fci_len >= 2u ? fci_len - 2u : 0u,
-                   0x9F38u, &pdol, &pdol_len, 0);
+    uint8_t sweep_profiles[6];
+    sweep_order(aid, sweep_profiles);
+    uint8_t requested_profile = m_request.terminal_profile;
+    uint8_t profile_count = requested_profile == EMV_TERMINAL_PROFILE_SWEEP ?
+                            sizeof(sweep_profiles) : 1u;
     static uint8_t pdol_data[128];
-    uint16_t data_len = pdol == NULL ? 0u : fill_dol(pdol, pdol_len, pdol_data, sizeof(pdol_data));
-    if (pdol != NULL && data_len == 0u) return;
     static uint8_t gpo[136];
-    uint16_t gpo_len = 0;
-    gpo[gpo_len++] = 0x80; gpo[gpo_len++] = 0xA8;
-    gpo[gpo_len++] = 0x00; gpo[gpo_len++] = 0x00;
-    gpo[gpo_len++] = (uint8_t)(data_len + 2u);
-    gpo[gpo_len++] = 0x83; gpo[gpo_len++] = (uint8_t)data_len;
-    if (data_len > 0u) memcpy(&gpo[gpo_len], pdol_data, data_len);
-    gpo_len += data_len;
-    gpo[gpo_len++] = 0x00;
-    m_stage = STAGE_GPO;
-    m_attempt = 0;
-    bool gpo_ok = exchange_apdu(gpo, gpo_len, response, &response_len) &&
-                  sw_success(response, response_len);
+    uint16_t data_len = 0;
+    bool gpo_ok = false;
+    for (uint8_t profile_index = 0; profile_index < profile_count; profile_index++) {
+        if (profile_index > 0u) {
+            if ((m_request.behavior & EMV_TRACE_BEHAVIOR_REACQUIRE_PROFILES) != 0u) {
+                iso_dep_reader_deselect(&m_reader);
+                if (!activate(tag, true)) return false;
+                if (!emv_trace_same_uid(m_trace.tag.uid, m_trace.tag.uid_len,
+                                        tag->uid, tag->uid_len)) {
+                    m_trace.result_status = STATUS_HF_ERR_STAT;
+                    return false;
+                }
+            }
+            if (!select_application(aid, response, &response_len)) break;
+            fci_len = response_len;
+            memcpy(fci, response, response_len);
+        }
+        uint8_t profile = requested_profile == EMV_TERMINAL_PROFILE_SWEEP ?
+                          sweep_profiles[profile_index] : requested_profile;
+        terminal_profile_select(profile);
+
+        const uint8_t *pdol = NULL;
+        uint16_t pdol_len = 0;
+        (void)find_tlv(fci, fci_len >= 2u ? fci_len - 2u : 0u,
+                       0x9F38u, &pdol, &pdol_len, 0);
+        data_len = pdol == NULL ? 0u :
+                   fill_dol(pdol, pdol_len, pdol_data, sizeof(pdol_data));
+        if (pdol != NULL && data_len == 0u) return true;
+
+        uint16_t gpo_len = 0;
+        gpo[gpo_len++] = 0x80; gpo[gpo_len++] = 0xA8;
+        gpo[gpo_len++] = 0x00; gpo[gpo_len++] = 0x00;
+        gpo[gpo_len++] = (uint8_t)(data_len + 2u);
+        gpo[gpo_len++] = 0x83; gpo[gpo_len++] = (uint8_t)data_len;
+        if (data_len > 0u) memcpy(&gpo[gpo_len], pdol_data, data_len);
+        gpo_len += data_len;
+        gpo[gpo_len++] = 0x00;
+        m_stage = STAGE_GPO;
+        m_attempt = profile_index;
+        bool exchanged = exchange_apdu(gpo, gpo_len, response, &response_len);
+        gpo_ok = exchanged && sw_success(response, response_len);
+        if (gpo_ok || !exchanged ||
+                !profile_retry_status(response, response_len)) break;
+    }
     if (!gpo_ok && data_len > 0u &&
+            (m_request.options & EMV_TRACE_OPT_EXPRESS_TRANSIT) == 0u &&
             (m_request.options & EMV_TRACE_OPT_PDOL_FALLBACK) != 0u) {
         static const uint8_t empty_gpo[] = {0x80, 0xA8, 0x00, 0x00,
                                             0x02, 0x83, 0x00, 0x00};
@@ -644,7 +844,7 @@ static void process_application(const emv_aid_t *aid, bool maximum) {
         gpo_ok = exchange_apdu(empty_gpo, sizeof(empty_gpo), response, &response_len) &&
                  sw_success(response, response_len);
     }
-    if (!gpo_ok) return;
+    if (!gpo_ok) return true;
 
     const uint8_t *application_cryptogram;
     uint16_t application_cryptogram_len;
@@ -680,6 +880,9 @@ static void process_application(const emv_aid_t *aid, bool maximum) {
             (void)exchange_apdu(gac, gac_len, response, &response_len);
         }
     }
+    get_standard_data();
+    read_transaction_log(fci, fci_len);
+    return true;
 }
 
 static uint32_t trace_crc32(void) {
@@ -694,8 +897,11 @@ static uint32_t trace_crc32(void) {
 }
 
 static bool parse_request(const uint8_t *data, uint16_t length) {
-    if (data == NULL || length != EMV_TRACE_START_REQUEST_SIZE ||
-            data[0] != EMV_TRACE_PROTOCOL_VERSION || (data[1] & 0xC0u) != 0u) return false;
+    if (data == NULL || length < 2u || data[0] != EMV_TRACE_PROTOCOL_VERSION) return false;
+    bool has_profile = (data[1] & EMV_TRACE_OPT_TERMINAL_PROFILE) != 0u;
+    if ((!has_profile && length != EMV_TRACE_START_REQUEST_SIZE) ||
+            (has_profile && length != EMV_TRACE_START_REQUEST_PROFILE_SIZE &&
+             length != EMV_TRACE_START_REQUEST_BEHAVIOR_SIZE)) return false;
     memset(&m_request, 0, sizeof(m_request));
     m_request.options = data[1];
     m_request.max_aids = data[2] == 0u ? 8u : data[2];
@@ -710,6 +916,24 @@ static bool parse_request(const uint8_t *data, uint16_t length) {
     memcpy(m_request.date, &data[20], 3);
     m_request.transaction_type = data[23];
     m_request.cryptogram_type = data[24];
+    m_request.terminal_profile = EMV_TERMINAL_PROFILE_AUTO;
+    if (has_profile) {
+        m_request.terminal_profile = data[25];
+        memcpy(m_request.custom_ttq, &data[26], sizeof(m_request.custom_ttq));
+        if (!terminal_profile_valid(m_request.terminal_profile)) return false;
+        if (length == EMV_TRACE_START_REQUEST_BEHAVIOR_SIZE) {
+            m_request.polling_profile = data[30];
+            m_request.behavior = data[31];
+            m_request.poll_retries = data[32];
+            m_request.poll_delay_ms = data[33];
+            m_request.poll_timeout_ms = data[34];
+            if (m_request.polling_profile > EMV_POLLING_PROFILE_PATIENT ||
+                    (m_request.behavior & ~EMV_TRACE_BEHAVIOR_ALL) != 0u ||
+                    m_request.poll_retries > 100u ||
+                    m_request.poll_delay_ms > 20u ||
+                    m_request.poll_timeout_ms > 10u) return false;
+        }
+    }
     return m_request.max_aids <= TRACE_MAX_AIDS &&
            m_request.max_records <= TRACE_MAX_RECORDS_APP &&
            m_request.max_apdus <= TRACE_MAX_APDUS &&
@@ -738,12 +962,32 @@ uint16_t emv_trace_start(const uint8_t *request, uint16_t request_length,
     m_trace.first_dropped = UINT32_MAX;
     if (m_request.options & EMV_TRACE_OPT_TIMING) m_trace.flags |= TRACE_FLAG_TIMING_VALID;
     if (m_request.options & EMV_TRACE_OPT_MAX_PROCESSING) m_trace.flags |= TRACE_FLAG_MAX_PROCESSING;
+    if (m_request.options & EMV_TRACE_OPT_EXPRESS_TRANSIT) m_trace.flags |= TRACE_FLAG_EXPRESS_TRANSIT;
     m_store_disabled = false;
     m_stage = STAGE_ACTIVATION;
     m_app_index = 0;
     m_attempt = 0;
+    terminal_profile_select(m_request.terminal_profile);
     m_timer = bsp_obtain_timer(0);
     pcd_14a_reader_trace_set(rf_trace_callback);
+
+    static const uint8_t ecp2_tfl[] = {
+        0x6A, 0x02, 0xC8, 0x01, 0x00, 0x03, 0x00, 0x02,
+        0x79, 0x00, 0x00, 0x00, 0x00, 0xC2, 0xD8
+    };
+    if ((m_request.options & EMV_TRACE_OPT_EXPRESS_TRANSIT) != 0u) {
+        uint8_t retries;
+        uint8_t delay_ms;
+        uint8_t timeout_ms;
+        polling_profile_values(&retries, &delay_ms, &timeout_ms);
+        if (!pcd_14a_reader_polling_annotation_set(ecp2_tfl, sizeof(ecp2_tfl)) ||
+                !pcd_14a_reader_polling_annotation_timing_set(
+                    retries, delay_ms, timeout_ms)) {
+            m_trace.result_status = STATUS_PAR_ERR;
+            m_trace.state = TRACE_STATE_ABORTED;
+            goto finish;
+        }
+    }
 
     static picc_14a_tag_t tag;
     if (!activate(&tag, true)) {
@@ -761,8 +1005,11 @@ uint16_t emv_trace_start(const uint8_t *request, uint16_t request_length,
     static uint8_t ppse_response[ISO_DEP_READER_MAX_APDU_RESPONSE];
     uint16_t ppse_len = 0;
     m_stage = STAGE_PPSE;
-    if (!exchange_apdu(ppse, sizeof(ppse), ppse_response, &ppse_len) ||
-            !sw_success(ppse_response, ppse_len)) {
+    bool ppse_exchanged = exchange_apdu(ppse, sizeof(ppse),
+                                        ppse_response, &ppse_len);
+    bool ppse_ok = ppse_exchanged && sw_success(ppse_response, ppse_len);
+    if (!ppse_ok &&
+            (m_request.behavior & EMV_TRACE_BEHAVIOR_DIRECT_AID_FALLBACK) == 0u) {
         m_trace.result_status = STATUS_HF_ERR_STAT;
         m_trace.state = TRACE_STATE_ABORTED;
         goto finish;
@@ -771,7 +1018,13 @@ uint16_t emv_trace_start(const uint8_t *request, uint16_t request_length,
     static emv_aid_t aids[TRACE_MAX_AIDS];
     memset(aids, 0, sizeof(aids));
     uint8_t aid_count = 0;
-    collect_templates(ppse_response, ppse_len - 2u, aids, &aid_count, 0);
+    if (ppse_ok) {
+        collect_templates(ppse_response, ppse_len - 2u, aids, &aid_count, 0);
+    }
+    if (aid_count == 0u &&
+            (m_request.behavior & EMV_TRACE_BEHAVIOR_DIRECT_AID_FALLBACK) != 0u) {
+        probe_direct_aids(aids, &aid_count);
+    }
     sort_aids(aids, aid_count);
     if (aid_count == m_request.max_aids) m_trace.flags |= TRACE_FLAG_APP_LIMIT;
     m_trace.application_count = aid_count;
@@ -779,17 +1032,17 @@ uint16_t emv_trace_start(const uint8_t *request, uint16_t request_length,
     bool maximum = (m_request.options & EMV_TRACE_OPT_MAX_PROCESSING) != 0u;
     for (uint8_t i = 0; i < aid_count && budget_available(); i++) {
         m_app_index = i + 1u;
-        if (maximum) {
-            iso_dep_reader_deselect(&m_reader);
-            if (!activate(&tag, false)) break;
+        if (!process_application(&aids[i], maximum, &tag)) {
+            m_trace.state = TRACE_STATE_ABORTED;
+            goto finish;
         }
-        process_application(&aids[i], maximum);
     }
     m_trace.state = TRACE_STATE_COMPLETE;
     m_trace.flags |= TRACE_FLAG_COMPLETE;
 
 finish:
     iso_dep_reader_deselect(&m_reader);
+    pcd_14a_reader_polling_annotation_clear();
     pcd_14a_reader_trace_clear();
     pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
     pcd_14a_reader_antenna_off();

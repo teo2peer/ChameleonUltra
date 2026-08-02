@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include "rfid_main.h"
 #include "rgb_marquee.h"
+#if defined(PROJECT_CHAMELEON_ULTRA)
+#include "iso_dep_session.h"
+#endif
 
 //The current mode of the device
 device_mode_t rfid_state = DEVICE_MODE_NONE;
@@ -39,6 +42,9 @@ void reader_mode_enter(void) {
  */
 void tag_mode_enter(void) {
     if (rfid_state != DEVICE_MODE_TAG) {
+#if defined(PROJECT_CHAMELEON_ULTRA)
+        iso_dep_session_abort();
+#endif
         rfid_state = DEVICE_MODE_TAG;
 
 #if defined(PROJECT_CHAMELEON_ULTRA)

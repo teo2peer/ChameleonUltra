@@ -11,9 +11,12 @@ SRC_FILES += \
   $(PROJ_DIR)/app_main.c \
   $(PROJ_DIR)/app_cmd.c \
   $(PROJ_DIR)/app_cmd_ble.c \
+  $(PROJ_DIR)/app_cmd_keyboard.c \
   $(PROJ_DIR)/ble_main.c \
   $(PROJ_DIR)/ble_scan.c \
   $(PROJ_DIR)/ble_central.c \
+  $(PROJ_DIR)/keyboard_hid.c \
+  $(PROJ_DIR)/keyboard_payload.c \
   $(PROJ_DIR)/rfid_main.c \
   $(PROJ_DIR)/settings.c \
   $(PROJ_DIR)/usb_main.c \
@@ -49,6 +52,7 @@ SRC_FILES += \
   $(PROJ_DIR)/rfid/nfctag/lf/protocols/wiegand.c \
   $(PROJ_DIR)/rfid/nfctag/lf/protocols/idteck.c \
   $(PROJ_DIR)/rfid/reader/hf/iso_dep_reader.c \
+  $(PROJ_DIR)/rfid/reader/hf/iso_dep_session.c \
   $(PROJ_DIR)/rfid/reader/hf/emv_trace.c \
   $(PROJ_DIR)/utils/dataframe.c \
   $(PROJ_DIR)/utils/delayed_reset.c \
@@ -71,6 +75,8 @@ SRC_FILES += \
   $(SDK_ROOT)/components/libraries/timer/app_timer2.c \
   $(SDK_ROOT)/components/libraries/usbd/app_usbd.c \
   $(SDK_ROOT)/components/libraries/usbd/class/cdc/acm/app_usbd_cdc_acm.c \
+  $(SDK_ROOT)/components/libraries/usbd/class/hid/app_usbd_hid.c \
+  $(SDK_ROOT)/components/libraries/usbd/class/hid/kbd/app_usbd_hid_kbd.c \
   $(SDK_ROOT)/components/libraries/usbd/app_usbd_core.c \
   $(SDK_ROOT)/components/libraries/usbd/app_usbd_serial_num.c \
   $(SDK_ROOT)/components/libraries/usbd/app_usbd_string_desc.c \
@@ -130,6 +136,7 @@ SRC_FILES += \
   $(SDK_ROOT)/external/utf_converter/utf.c \
   $(SDK_ROOT)/components/ble/ble_services/ble_nus/ble_nus.c \
   $(SDK_ROOT)/components/ble/ble_services/ble_bas/ble_bas.c \
+  $(SDK_ROOT)/components/ble/ble_services/ble_hids/ble_hids.c \
   $(SDK_ROOT)/components/ble/nrf_ble_qwr/nrf_ble_qwr.c \
   $(SDK_ROOT)/components/softdevice/common/nrf_sdh.c \
   $(SDK_ROOT)/components/softdevice/common/nrf_sdh_ble.c \

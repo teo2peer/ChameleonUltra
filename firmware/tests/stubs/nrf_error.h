@@ -1,0 +1,10 @@
+#ifndef NRF_ERROR_H
+#define NRF_ERROR_H
+
+#define NRF_SUCCESS 0u
+#define NRF_ERROR_BUSY 1u
+#define NRF_ERROR_RESOURCES 2u
+#define NRF_ERROR_INVALID_STATE 3u
+#define NRF_ERROR_INVALID_PARAM 4u
+
+#endif

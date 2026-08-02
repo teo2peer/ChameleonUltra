@@ -55,6 +55,10 @@ data_frame_tx_t *cmd_processor_ble_advertising_set(uint16_t cmd, uint16_t status
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
 
+    if (ble_adv_lab_is_active()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+
     if (!enabled) {
         advertising_stop();
     } else {
@@ -299,6 +303,9 @@ data_frame_tx_t *cmd_processor_ble_radio_set(uint16_t cmd, uint16_t status, uint
     if (!cmd_payload_exact(length, data, 1u) || !cmd_parse_bool(data[0], &radio_on)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
+    if (!radio_on && data_frame_get_transport() == DATA_FRAME_TRANSPORT_BLE) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
     uint32_t err = ble_radio_set(radio_on);
     if (err != NRF_SUCCESS) {
         return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
@@ -434,4 +441,64 @@ data_frame_tx_t *cmd_processor_ble_adv_flood_stop(uint16_t cmd, uint16_t status,
     uint32_t err = ble_adv_flood_stop();
     return data_frame_make(cmd, err == NRF_SUCCESS ? STATUS_SUCCESS : STATUS_CMD_ERR,
                            0, NULL);
+}
+
+static uint16_t adv_lab_error_status(uint32_t error) {
+    if (error == NRF_ERROR_INVALID_PARAM || error == NRF_ERROR_DATA_SIZE ||
+            error == NRF_ERROR_INVALID_FLAGS || error == NRF_ERROR_INVALID_DATA ||
+            error == NRF_ERROR_INVALID_LENGTH || error == NRF_ERROR_NOT_SUPPORTED ||
+            error == BLE_ERROR_GAP_UUID_LIST_MISMATCH) {
+        return STATUS_PAR_ERR;
+    }
+    if (error == NRF_ERROR_BUSY || error == NRF_ERROR_INVALID_STATE) {
+        return STATUS_DEVICE_MODE_ERROR;
+    }
+    return STATUS_CMD_ERR;
+}
+
+data_frame_tx_t *cmd_processor_ble_adv_lab_start(uint16_t cmd, uint16_t status,
+                                                  uint16_t length, uint8_t *data) {
+    if (data_frame_get_transport() == DATA_FRAME_TRANSPORT_BLE) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+    if (data == NULL || length < 14u || data[0] != BLE_ADV_LAB_VERSION) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t adv_length = data[11];
+    uint8_t scan_length = data[12];
+    uint16_t fixed_length = (uint16_t)(14u + adv_length + scan_length);
+    if (fixed_length > length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t error = ble_adv_lab_start(
+        data[1], data[2], data[3], cmd_read_u16be(&data[4]),
+        cmd_read_u16be(&data[6]), cmd_read_u16be(&data[8]), data[10],
+        &data[14], adv_length, &data[14u + adv_length], scan_length,
+        &data[fixed_length], length - fixed_length, data[13]);
+    if (error != NRF_SUCCESS) {
+        return data_frame_make(cmd, adv_lab_error_status(error), 0, NULL);
+    }
+    uint16_t out_length = ble_adv_lab_get_status(m_ble_response,
+                                                  sizeof(m_ble_response));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_length, m_ble_response);
+}
+
+data_frame_tx_t *cmd_processor_ble_adv_lab_status(uint16_t cmd, uint16_t status,
+                                                   uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    uint16_t out_length = ble_adv_lab_get_status(m_ble_response,
+                                                  sizeof(m_ble_response));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_length, m_ble_response);
+}
+
+data_frame_tx_t *cmd_processor_ble_adv_lab_stop(uint16_t cmd, uint16_t status,
+                                                 uint16_t length, uint8_t *data) {
+    if (!cmd_payload_empty(length)) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    uint32_t error = ble_adv_lab_stop();
+    if (error != NRF_SUCCESS) {
+        return data_frame_make(cmd, adv_lab_error_status(error), 0, NULL);
+    }
+    uint16_t out_length = ble_adv_lab_get_status(m_ble_response,
+                                                  sizeof(m_ble_response));
+    return data_frame_make(cmd, STATUS_SUCCESS, out_length, m_ble_response);
 }

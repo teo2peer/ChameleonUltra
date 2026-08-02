@@ -1285,6 +1285,14 @@ int nfc_tag_mf1_data_savecb(tag_specific_type_t type, tag_data_buffer_t *buffer)
     }
 }
 
+void nfc_tag_mf1_data_save_failcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
+    (void)buffer;
+    if (m_tag_type == type && m_tag_information != NULL &&
+            m_tag_information->config.mode_block_write == NFC_TAG_MF1_WRITE_SHADOW) {
+        m_tag_information->config.mode_block_write = NFC_TAG_MF1_WRITE_SHADOW_REQ;
+    }
+}
+
 /** @brief MF1 load data
  * @param type     Refined label type
  * @param buffer   Data buffer
@@ -1329,6 +1337,7 @@ bool nfc_tag_mf1_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
 
     // default mf1 info
     nfc_tag_mf1_information_t mf1_tmp_information;
+    memset(&mf1_tmp_information, 0, sizeof(mf1_tmp_information));
     nfc_tag_mf1_information_t *p_mf1_information;
     p_mf1_information = &mf1_tmp_information;
     int block_max = get_block_max_by_tag_type(tag_type);

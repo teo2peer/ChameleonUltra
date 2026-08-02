@@ -31,7 +31,8 @@ uint16_t data_frame_receive_from_generation(const uint8_t *data, uint16_t length
 uint32_t data_frame_get_transport_generation(data_frame_transport_t transport);
 // Valid while the registered frame-complete callback is running.
 data_frame_transport_t data_frame_get_transport(void);
-// False when the transport was reset after the current request was queued.
+// True only while the current callback still belongs to the transport generation
+// that queued it. A disconnect/reset invalidates the generation immediately.
 bool data_frame_current_transport_generation_valid(void);
 void data_frame_reset_transport(data_frame_transport_t transport);
 void data_frame_set_flow_callback(data_frame_transport_t transport, void (*callback)(void));

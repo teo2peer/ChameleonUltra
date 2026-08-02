@@ -14,7 +14,13 @@ sys.path.append(CURRENT_DIR.rsplit(os.sep, 1)[0])
 
 import chameleon_com  # noqa: E402
 from chameleon_cli_unit import BLEPing, BLEWrite, _drain_ble_pages  # noqa: E402
-from chameleon_cmd import ChameleonCMD  # noqa: E402
+from chameleon_cmd import (  # noqa: E402
+    ChameleonCMD,
+    build_ble_apple_proximity_profile,
+    build_ble_advertising_profile,
+    build_ble_fast_pair_profile,
+    validate_ble_advertising_data,
+)
 from chameleon_enum import Command, Status  # noqa: E402
 from chameleon_utils import UnexpectedResponseError  # noqa: E402
 
@@ -76,6 +82,76 @@ class TestBLEPayloads(unittest.TestCase):
             (Command.BLE_GET_NOTIFICATIONS, b'\x12\x34'),
             (Command.BLE_FUZZ_GET_LOG, b'\xfe\xdc'),
         ])
+
+    def test_advertising_lab_encodes_rotating_names(self):
+        status = bytes((1, 2, 2, 1, 0, 0, 2, 10, 0,
+                        0, 160, 3, 232, 0, 0, 0, 0, 0, 0, 0))
+        self.device.responses.append(response(status))
+        parsed = self.cmd.ble_adv_lab_start(
+            b'\x02\x01\x06', names=('Lab A', 'Lab B'), name_target=1,
+            interval_ms=100, rotation_ms=1000, profile=2)
+        expected = struct.pack('!BBBBHHHBBBB', 1, 2, 1, 1, 160, 1000,
+                               0, 0, 3, 0, 2)
+        expected += b'\x02\x01\x06\x05Lab A\x05Lab B'
+        self.assertEqual(self.device.calls[-1],
+                         (Command.BLE_ADV_LAB_START, expected))
+        self.assertTrue(parsed['running'])
+        self.assertEqual(parsed['rotation_ms'], 1000)
+
+    def test_advertising_lab_status_rejects_wrong_length(self):
+        self.device.responses.append(response(b'\x01' * 19))
+        with self.assertRaisesRegex(ValueError, 'expected 20'):
+            self.cmd.ble_adv_lab_status()
+
+    def test_advertising_lab_validation_happens_before_transport(self):
+        invalid_values = (
+            dict(advertising_data=b'\x05\x09bad'),
+            dict(advertising_data=b'\x02\x01\x06', names=('A',), name_target=0),
+            dict(advertising_data=b'\x02\x01\x06', names=('A', 'B'),
+                 name_target=1, rotation_ms=50),
+            dict(advertising_data=b'', scan_response_data=b'\x02\x01\x06'),
+        )
+        for values in invalid_values:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.cmd.ble_adv_lab_start(**values)
+        self.assertEqual(self.device.calls, [])
+
+    def test_advertising_lab_rotation_uses_quantized_interval(self):
+        with self.assertRaisesRegex(ValueError, 'rotation_ms'):
+            self.cmd.ble_adv_lab_start(
+                b'\x02\x01\x06', names=('A', 'B'), name_target=1,
+                interval_ms=101, rotation_ms=101, profile=2)
+        self.assertEqual(self.device.calls, [])
+
+    def test_advertising_profile_is_vendor_neutral_and_little_endian(self):
+        advertising, scan = build_ble_advertising_profile(
+            service_uuid=0x180F, company_id=0x1234,
+            manufacturer_data=b'\xaa\xbb')
+        self.assertEqual(advertising, b'\x02\x01\x06\x03\x03\x0f\x18')
+        self.assertEqual(scan, b'\x05\xff\x34\x12\xaa\xbb')
+        self.assertFalse(validate_ble_advertising_data(advertising))
+        self.assertFalse(validate_ble_advertising_data(scan, scan_response=True))
+
+    def test_advertising_profile_encodes_generic_service_data(self):
+        advertising, scan = build_ble_advertising_profile(
+            service_uuid=0x181A, service_data_uuid=0x181A,
+            service_data=b'\x01\x02')
+        self.assertEqual(advertising, b'\x02\x01\x06\x03\x03\x1a\x18')
+        self.assertEqual(scan, b'\x05\x16\x1a\x18\x01\x02')
+        with self.assertRaisesRegex(ValueError, 'service_data_uuid'):
+            build_ble_advertising_profile(service_data=b'\x01')
+
+    def test_pairing_discovery_profiles_are_complete_ad_structures(self):
+        apple, apple_scan = build_ble_apple_proximity_profile(0x0E20)
+        self.assertEqual(len(apple), 31)
+        self.assertEqual(apple[:9], b'\x1e\xff\x4c\x00\x07\x19\x07\x0e\x20')
+        self.assertEqual(apple_scan, b'')
+
+        android, android_scan = build_ble_fast_pair_profile(0x2D7A23)
+        self.assertEqual(
+            android,
+            bytes.fromhex('02 01 06 03 03 2C FE 06 16 2C FE 2D 7A 23 02 0A EC'))
+        self.assertEqual(android_scan, b'')
 
     def test_invalid_payload_arguments_are_rejected_before_transport(self):
         invalid_calls = [

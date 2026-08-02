@@ -5,11 +5,11 @@
 #include "nrf_drv_spi.h"
 #include "nrf_gpio.h"
 #include "app_error.h"
+#include "app_timer.h"
 
 #include "rfid_main.h"
 #include "rc522.h"
 #include "bsp_delay.h"
-#include "bsp_time.h"
 #include "bsp_wdt.h"
 #include "app_status.h"
 #include "hex_utils.h"
@@ -34,10 +34,15 @@ static bool m_reader_is_init = false;
 
 // Communication timeout
 static uint16_t g_com_timeout_ms = DEF_COM_TIMEOUT;
-static autotimer *g_timeout_auto_timer;
 static pcd_14a_trace_cb_t m_trace_callback;
 static pcd_14a_trace_cb_t m_capture_trace_callback;
 static bool m_trace_inside_bits;
+#define POLLING_ANNOTATION_MAX_LENGTH 32u
+static uint8_t m_polling_annotation[POLLING_ANNOTATION_MAX_LENGTH];
+static uint8_t m_polling_annotation_length;
+static uint8_t m_polling_annotation_retries = 30u;
+static uint8_t m_polling_annotation_delay_ms = 5u;
+static uint8_t m_polling_annotation_timeout_ms = 2u;
 
 void pcd_14a_reader_trace_set(pcd_14a_trace_cb_t callback) {
     m_trace_callback = callback;
@@ -63,6 +68,32 @@ static void trace_emit(bool tx, const uint8_t *data, uint16_t bit_length,
             m_capture_trace_callback != m_trace_callback) {
         m_capture_trace_callback(tx, data, bit_length, status);
     }
+}
+
+bool pcd_14a_reader_polling_annotation_set(const uint8_t *frame, uint8_t length) {
+    if (frame == NULL || length == 0u || length > sizeof(m_polling_annotation)) return false;
+    memcpy(m_polling_annotation, frame, length);
+    m_polling_annotation_length = length;
+    return true;
+}
+
+bool pcd_14a_reader_polling_annotation_timing_set(uint8_t retries,
+                                                   uint8_t delay_ms,
+                                                   uint8_t timeout_ms) {
+    if (retries == 0u || retries > 100u || delay_ms > 20u ||
+            timeout_ms == 0u || timeout_ms > 10u) return false;
+    m_polling_annotation_retries = retries;
+    m_polling_annotation_delay_ms = delay_ms;
+    m_polling_annotation_timeout_ms = timeout_ms;
+    return true;
+}
+
+void pcd_14a_reader_polling_annotation_clear(void) {
+    memset(m_polling_annotation, 0, sizeof(m_polling_annotation));
+    m_polling_annotation_length = 0u;
+    m_polling_annotation_retries = 30u;
+    m_polling_annotation_delay_ms = 5u;
+    m_polling_annotation_timeout_ms = 2u;
 }
 
 // RC522 SPI
@@ -267,9 +298,6 @@ void pcd_14a_reader_init(void) {
         errCode = nrf_drv_spi_init(&s_spiHandle, &spiConfig, NULL, NULL);
         APP_ERROR_CHECK(errCode);
 
-        // Initialized timer
-        // This timer is not released after the initialization of the timer, and it always needs to take up
-        g_timeout_auto_timer = bsp_obtain_timer(0);
     }
 }
 
@@ -310,7 +338,6 @@ void pcd_14a_reader_uninit(void) {
     // Make sure that the device has been initialized, and then the anti -initialization
     if (m_reader_is_init) {
         m_reader_is_init = false;
-        bsp_return_timer(g_timeout_auto_timer);
         nrf_drv_spi_uninit(&s_spiHandle);
     }
 }
@@ -386,12 +413,13 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
         set_register_mask(BitFramingReg, 0x80);     // StartSend places to start the data to send this bit and send and receive commands when it is valid
     }
 
-    bsp_set_timer(g_timeout_auto_timer, 0);         // Before starting the operation, return to zero over time counting
+    uint32_t started = app_timer_cnt_get();
+    uint32_t timeout_ticks = APP_TIMER_TICKS(g_com_timeout_ms);
 
     do {
         n = read_register_single(ComIrqReg);                // Read the communication interrupt register to determine whether the current IO task is completed!
         bsp_wdt_feed();
-        not_timeout = NO_TIMEOUT_1MS(g_timeout_auto_timer, g_com_timeout_ms);
+        not_timeout = app_timer_cnt_diff_compute(app_timer_cnt_get(), started) < timeout_ticks;
     } while (not_timeout && (!(n & waitFor)));  // Exit conditions: timeout interruption, interrupt with empty command commands
     if (m_spi_failed) not_timeout = 0;
     // NRF_LOG_INFO("N = %02x\n", n);
@@ -650,11 +678,12 @@ uint8_t pcd_14a_reader_bytes_transfer_flags(uint8_t Command, uint8_t *pIn, uint8
         set_register_mask(BitFramingReg, 0x80);     // StartSend places to start the data to send this bit and send and receive commands when it is valid
     }
 
-    bsp_set_timer(g_timeout_auto_timer, 0);         // Before starting the operation, return to zero over time counting
+    uint32_t started = app_timer_cnt_get();
+    uint32_t timeout_ticks = APP_TIMER_TICKS(g_com_timeout_ms);
 
     do {
         n = read_register_single(ComIrqReg);                // Read the communication interrupt register to determine whether the current IO task is completed!
-        not_timeout = NO_TIMEOUT_1MS(g_timeout_auto_timer, g_com_timeout_ms);
+        not_timeout = app_timer_cnt_diff_compute(app_timer_cnt_get(), started) < timeout_ticks;
     } while (not_timeout && (!(n & waitFor)));  // Exit conditions: timeout interruption, interrupt with empty command commands
     if (m_spi_failed) not_timeout = 0;
     // NRF_LOG_INFO("N = %02x\n", n);
@@ -1030,13 +1059,33 @@ uint8_t pcd_14a_reader_atqa_request(uint8_t *resp, uint8_t *resp_par, uint16_t r
     uint8_t retry = 0;
     uint8_t status = STATUS_HF_TAG_OK;
     uint8_t wupa[] = { PICC_REQALL };  // 0x26 - REQA  0x52 - WAKE-UP
+    bool annotated = m_polling_annotation_length > 0u;
+    uint16_t original_timeout = pcd_14a_reader_timeout_get();
+    if (annotated) pcd_14a_reader_timeout_set(m_polling_annotation_timeout_ms);
 
     // we may need several tries if we did send an unknown command or a wrong authentication before...
     do {
+        if (annotated) {
+            // Apple ECP has no direct response. Send it before every WUPA so a
+            // target already visible to NFC-A still receives the annotation.
+            (void)pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE,
+                                                m_polling_annotation,
+                                                m_polling_annotation_length,
+                                                NULL, NULL, 0u);
+            write_register_single(CommandReg, PCD_IDLE);
+            write_register_single(ComIrqReg, 0x7Fu);
+            set_register_mask(FIFOLevelReg, 0x80u);
+            clear_register_mask(BitFramingReg, 0x87u);
+            bsp_delay_ms(m_polling_annotation_delay_ms);
+        }
         // Broadcast for a card, WUPA (0x52) will force response from all cards in the field and Receive the ATQA
         status = pcd_14a_reader_bits_transfer(wupa, 7, NULL, resp, resp_par, &len, resp_max_bit);
         // NRF_LOG_INFO("pcd_14a_reader_atqa_request len: %d\n", len);
-    } while (len != 16 && (retry++ < 10));
+        if (status == STATUS_HF_TAG_OK && len == 16u) break;
+    } while (len != 16u && (retry++ < (annotated ?
+                                      m_polling_annotation_retries : 10u)));
+
+    if (annotated) pcd_14a_reader_timeout_set(original_timeout);
 
     // normal ATQA It is 2 bytes, that is, 16bit,
     // We need to judge whether the data received is correct

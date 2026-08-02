@@ -1,5 +1,7 @@
 #include "tag_emulation.h"
 
+#include <string.h>
+
 #include "crc_utils.h"
 #include "fds_ids.h"
 #include "fds_util.h"
@@ -57,6 +59,7 @@ static tag_data_buffer_t m_tag_data_lf = {
     .actual_length = 0,
     .buffer = m_tag_data_buffer_lf,
     .crc = &m_tag_data_lf_crc,
+    .crc_valid = false,
 };
 
 static uint8_t m_tag_data_buffer_hf[4500];  // HF card data buffer
@@ -66,16 +69,24 @@ static tag_data_buffer_t m_tag_data_hf = {
     .actual_length = 0,
     .buffer = m_tag_data_buffer_hf,
     .crc = &m_tag_data_hf_crc,
+    .crc_valid = false,
 };
 
 typedef struct {
     bool valid;
     uint8_t slot;
     tag_specific_type_t type;
+    uint32_t generation;
 } loaded_tag_owner_t;
 
 static loaded_tag_owner_t m_loaded_hf = {0};
 static loaded_tag_owner_t m_loaded_lf = {0};
+static uint32_t m_loaded_owner_generation;
+static bool m_snapshot_frozen;
+static bool m_snapshot_restore_hf_sense;
+static bool m_snapshot_restore_lf_sense;
+static bool m_hf_sense_enabled;
+static bool m_lf_sense_enabled;
 
 static loaded_tag_owner_t *loaded_owner(tag_sense_type_t sense_type) {
     if (sense_type == TAG_SENSE_HF) return &m_loaded_hf;
@@ -86,6 +97,12 @@ static loaded_tag_owner_t *loaded_owner(tag_sense_type_t sense_type) {
 static bool loaded_owner_matches(uint8_t slot, tag_specific_type_t type) {
     loaded_tag_owner_t *owner = loaded_owner(get_sense_type_from_tag_type(type));
     return owner != NULL && owner->valid && owner->slot == slot && owner->type == type;
+}
+
+static uint32_t next_loaded_owner_generation(void) {
+    m_loaded_owner_generation++;
+    if (m_loaded_owner_generation == 0u) m_loaded_owner_generation++;
+    return m_loaded_owner_generation;
 }
 
 /**
@@ -111,6 +128,20 @@ static tag_slot_config_t slotConfig ALIGN_U32 = {
 // The card slot configuration unique CRC, once the slot configuration changes, can be checked by CRC
 static uint16_t m_slot_config_crc;
 
+bool tag_emulation_is_active_type_loaded(tag_specific_type_t tag_type) {
+    tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
+    uint8_t slot = tag_emulation_get_slot();
+    tag_specific_type_t configured_type;
+    if (sense_type == TAG_SENSE_HF) {
+        configured_type = slotConfig.slots[slot].tag_hf;
+    } else if (sense_type == TAG_SENSE_LF) {
+        configured_type = slotConfig.slots[slot].tag_lf;
+    } else {
+        return false;
+    }
+    return configured_type == tag_type && loaded_owner_matches(slot, tag_type);
+}
+
 // ********************** Specific parameter ends **********************
 
 /**
@@ -120,36 +151,36 @@ static uint16_t m_slot_config_crc;
  */
 static tag_base_handler_map_t tag_base_map[] = {
     // LF tag emulation
-    {TAG_SENSE_LF, TAG_TYPE_EM410X,      lf_tag_data_loadcb,           lf_tag_em410x_data_savecb,    lf_tag_em410x_data_factory,    &m_tag_data_lf},
-    {TAG_SENSE_LF, TAG_TYPE_EM410X_ELECTRA, lf_tag_data_loadcb,        lf_tag_em410x_data_savecb,    lf_tag_em410x_data_factory,    &m_tag_data_lf},
-    {TAG_SENSE_LF, TAG_TYPE_HID_PROX,    lf_tag_data_loadcb,           lf_tag_hidprox_data_savecb,   lf_tag_hidprox_data_factory,   &m_tag_data_lf},
-    {TAG_SENSE_LF, TAG_TYPE_IOPROX,      lf_tag_data_loadcb,           lf_tag_ioprox_data_savecb,    lf_tag_ioprox_data_factory,    &m_tag_data_lf},
-    {TAG_SENSE_LF, TAG_TYPE_VIKING,      lf_tag_data_loadcb,           lf_tag_viking_data_savecb,    lf_tag_viking_data_factory,    &m_tag_data_lf},
-    {TAG_SENSE_LF, TAG_TYPE_PAC,         lf_tag_data_loadcb,           lf_tag_pac_data_savecb,       lf_tag_pac_data_factory,       &m_tag_data_lf},
-    {TAG_SENSE_LF, TAG_TYPE_JABLOTRON,   lf_tag_data_loadcb,           lf_tag_jablotron_data_savecb, lf_tag_jablotron_data_factory, &m_tag_data_lf},
-    {TAG_SENSE_LF, TAG_TYPE_IDTECK,      lf_tag_data_loadcb,           lf_tag_idteck_data_savecb,    lf_tag_idteck_data_factory,    &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_EM410X,      lf_tag_data_loadcb,           lf_tag_em410x_data_savecb,    NULL, lf_tag_em410x_data_factory,    &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_EM410X_ELECTRA, lf_tag_data_loadcb,        lf_tag_em410x_data_savecb,    NULL, lf_tag_em410x_data_factory,    &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_HID_PROX,    lf_tag_data_loadcb,           lf_tag_hidprox_data_savecb,   NULL, lf_tag_hidprox_data_factory,   &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_IOPROX,      lf_tag_data_loadcb,           lf_tag_ioprox_data_savecb,    NULL, lf_tag_ioprox_data_factory,   &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_VIKING,      lf_tag_data_loadcb,           lf_tag_viking_data_savecb,    NULL, lf_tag_viking_data_factory,    &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_PAC,         lf_tag_data_loadcb,           lf_tag_pac_data_savecb,       NULL, lf_tag_pac_data_factory,       &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_JABLOTRON,   lf_tag_data_loadcb,           lf_tag_jablotron_data_savecb, NULL, lf_tag_jablotron_data_factory, &m_tag_data_lf},
+    {TAG_SENSE_LF, TAG_TYPE_IDTECK,      lf_tag_data_loadcb,           lf_tag_idteck_data_savecb,    NULL, lf_tag_idteck_data_factory,    &m_tag_data_lf},
     // MF1 tag emulation
-    {TAG_SENSE_HF, TAG_TYPE_MIFARE_Mini, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_factory,      &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_MIFARE_1024, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_factory,      &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_MIFARE_2048, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_factory,      &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_MIFARE_4096, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_factory,      &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MIFARE_Mini, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_save_failcb, nfc_tag_mf1_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MIFARE_1024, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_save_failcb, nfc_tag_mf1_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MIFARE_2048, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_save_failcb, nfc_tag_mf1_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MIFARE_4096, nfc_tag_mf1_data_loadcb,      nfc_tag_mf1_data_savecb,      nfc_tag_mf1_data_save_failcb, nfc_tag_mf1_data_factory, &m_tag_data_hf},
     // NTAG tag emulation
-    {TAG_SENSE_HF, TAG_TYPE_NTAG_210,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_NTAG_212,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_NTAG_213,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_NTAG_215,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_NTAG_216,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_NTAG_210,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_NTAG_212,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_NTAG_213,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_NTAG_215,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_NTAG_216,    nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
     // MF0 tag emulation
-    {TAG_SENSE_HF, TAG_TYPE_MF0ICU1,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_MF0ICU2,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_MF0UL11,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
-    {TAG_SENSE_HF, TAG_TYPE_MF0UL21,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MF0ICU1,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MF0ICU2,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MF0UL11,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_MF0UL21,     nfc_tag_mf0_ntag_data_loadcb, nfc_tag_mf0_ntag_data_savecb, nfc_tag_mf0_ntag_data_save_failcb, nfc_tag_mf0_ntag_data_factory, &m_tag_data_hf},
     // ISO14443-4 T=CL emulation
-    {TAG_SENSE_HF, TAG_TYPE_HF14A_4,     nfc_tag_14a_4_data_loadcb,    nfc_tag_14a_4_data_savecb,    nfc_tag_14a_4_data_factory,    &m_tag_data_hf},
+    {TAG_SENSE_HF, TAG_TYPE_HF14A_4,     nfc_tag_14a_4_data_loadcb,    nfc_tag_14a_4_data_savecb,    NULL, nfc_tag_14a_4_data_factory, &m_tag_data_hf},
 };
 
 static void tag_emulation_load_config(void);
-static void tag_emulation_save_config(void);
+static bool tag_emulation_save_config(void);
 
 static bool slot_config_types_valid(const tag_slot_config_t *config) {
     for (uint8_t i = 0; i < TAG_MAX_SLOT_NUM; i++) {
@@ -182,6 +213,15 @@ static tag_datas_savecb_t get_data_savecb_from_tag_type(tag_specific_type_t type
     for (int i = 0; i < ARRAY_SIZE(tag_base_map); i++) {
         if (tag_base_map[i].tag_type == type) {
             return tag_base_map[i].data_on_save;
+        }
+    }
+    return NULL;
+}
+
+static tag_datas_save_failcb_t get_data_save_failcb_from_tag_type(tag_specific_type_t type) {
+    for (int i = 0; i < ARRAY_SIZE(tag_base_map); i++) {
+        if (tag_base_map[i].tag_type == type) {
+            return tag_base_map[i].data_on_save_fail;
         }
     }
     return NULL;
@@ -231,6 +271,7 @@ tag_data_buffer_t *get_buffer_by_tag_type(tag_specific_type_t type) {
  * Load data from memory to the emulated card data.
  */
 bool tag_emulation_load_by_buffer(tag_specific_type_t tag_type, bool update_crc) {
+    if (m_snapshot_frozen) return false;
     // data has been read to buffer,
     // here we load buffer to the emulator to config pwm seq for the activated card slot.
     tag_datas_loadcb_t loader = get_data_loadcb_from_tag_type(tag_type);
@@ -269,11 +310,13 @@ bool tag_emulation_load_by_buffer(tag_specific_type_t tag_type, bool update_crc)
 
     owner->slot = slot;
     owner->type = tag_type;
+    owner->generation = next_loaded_owner_generation();
     owner->valid = true;
     buffer->actual_length = stored_length;
     if (update_crc) {
         // afterReadingIsCompleted,WeCanSaveACrcOfTheCurrentDataWhenItIsStoredLater,ItCanBeUsedAsAReferenceForChangesComparison
         calc_14a_crc_lut(buffer->buffer, length, (uint8_t *)buffer->crc);
+        buffer->crc_valid = true;
     }
     return true;
 }
@@ -297,6 +340,7 @@ static void load_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
     loaded_tag_owner_t *owner = loaded_owner(sense_type);
     if (owner != NULL) owner->valid = false;
     buffer->actual_length = 0;
+    buffer->crc_valid = false;
     memset(buffer->buffer, 0, buffer->length);
 
     // get fds record for the card slot
@@ -323,19 +367,18 @@ static void load_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
 /**
  * Save data according to the type
  */
-static void save_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
+static bool save_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type, bool force_write) {
     // Maybe the card slot is not enabled to use the emulation of this type of label, and skip it directly to save this data
     if (tag_type == TAG_TYPE_UNDEFINED) {
-        return;
+        return true;
+    }
+    tag_data_buffer_t *buffer = get_buffer_by_tag_type(tag_type);
+    if (buffer == NULL) {
+        return false;
     }
     if (!loaded_owner_matches(slot, tag_type)) {
         NRF_LOG_WARNING("Refusing to save stale slot %d type %d buffer.", slot, tag_type);
-        return;
-    }
-
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(tag_type);
-    if (buffer == NULL) {
-        return;
+        return true;
     }
 
     // The length of the data to be saved by the user should not exceed the size of the global buffer
@@ -343,26 +386,26 @@ static void save_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
     tag_datas_savecb_t fn_savecb = get_data_savecb_from_tag_type(tag_type);
     if (fn_savecb == NULL) {  // Make sure that there is a real estate process
         NRF_LOG_INFO("Tag data saver no impl.");
-        return;
+        return false;
     }
 
     data_byte_length = fn_savecb(tag_type, buffer);
     // Make sure to save data, we can judge whether the data has changed through CRC
     if (data_byte_length <= 0) {
         NRF_LOG_INFO("Tag type %d data no save.", tag_type);
-        return;
+        return true;
     }
     // Make sure that the data to be stored is not greater than the size of the current buffer area
     if (data_byte_length > buffer->length) {
         NRF_LOG_ERROR("Tag data save length overflow.", tag_type);
-        return;
+        return false;
     }
     uint16_t crc;
     calc_14a_crc_lut(buffer->buffer, data_byte_length, (uint8_t *)&crc);
     // Determine whether the data has changed
-    if (crc == *buffer->crc) {
+    if (!force_write && buffer->crc_valid && crc == *buffer->crc) {
         NRF_LOG_INFO("Tag slot data no change, length = %d", data_byte_length);
-        return;
+        return true;
     }
     tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
     // Get the special card slot FDS record information
@@ -372,24 +415,29 @@ static void save_data_by_tag_type(uint8_t slot, tag_specific_type_t tag_type) {
     bool ret = fds_write_sync(map_info.id, map_info.key, data_byte_length, buffer->buffer);
     if (ret) {
         NRF_LOG_INFO("Save tag slot data success.");
+        *buffer->crc = crc;
+        buffer->crc_valid = true;
     } else {
         NRF_LOG_ERROR("Save tag slot data error.");
+        tag_datas_save_failcb_t fn_save_failcb = get_data_save_failcb_from_tag_type(tag_type);
+        if (fn_save_failcb != NULL) fn_save_failcb(tag_type, buffer);
     }
-    // After the preservation is completed, the CRC of the BUFFER in the corresponding memory
-    *buffer->crc = crc;
+    return ret;
 }
 
 /**
  * Delete data according to the type
  */
-static void delete_data_by_tag_type(uint8_t slot, tag_sense_type_t sense_type) {
+static bool delete_data_by_tag_type(uint8_t slot, tag_sense_type_t sense_type) {
     if (sense_type == TAG_SENSE_NO) {
-        return;
+        return false;
     }
     fds_slot_record_map_t map_info;
     get_fds_map_by_slot_sense_type_for_dump(slot, sense_type, &map_info);
     int count = fds_delete_sync(map_info.id, map_info.key);
     NRF_LOG_INFO("Slot %d delete sense type %d data, record count: %d", slot, sense_type, count);
+    (void)count;
+    return fds_util_last_error() == NRF_SUCCESS;
 }
 
 /**
@@ -397,6 +445,7 @@ static void delete_data_by_tag_type(uint8_t slot, tag_sense_type_t sense_type) {
  * Start the analog card, please call tag_emulation_sense_run function, otherwise you will not sensor the field event
  */
 void tag_emulation_load_data(void) {
+    if (m_snapshot_frozen) return;
     uint8_t slot = tag_emulation_get_slot();
     load_data_by_tag_type(slot, slotConfig.slots[slot].tag_hf);
     load_data_by_tag_type(slot, slotConfig.slots[slot].tag_lf);
@@ -405,10 +454,11 @@ void tag_emulation_load_data(void) {
 /**
  *Save the emulated card configuration data. At the right time, this function should be called for data preservation of data
  */
-void tag_emulation_save_data(void) {
+static bool tag_emulation_save_data(void) {
     uint8_t slot = tag_emulation_get_slot();
-    save_data_by_tag_type(slot, slotConfig.slots[slot].tag_hf);
-    save_data_by_tag_type(slot, slotConfig.slots[slot].tag_lf);
+    bool hf_saved = save_data_by_tag_type(slot, slotConfig.slots[slot].tag_hf, false);
+    bool lf_saved = save_data_by_tag_type(slot, slotConfig.slots[slot].tag_lf, false);
+    return hf_saved && lf_saved;
 }
 
 /**
@@ -426,9 +476,12 @@ void tag_emulation_get_specific_types_by_slot(uint8_t slot, tag_slot_specific_ty
 /**
  * Delete the data specified by a card slot, if it is the current activated card slot data, we also need to dynamically close the emulation of this card
  */
-void tag_emulation_delete_data(uint8_t slot, tag_sense_type_t sense_type) {
+bool tag_emulation_delete_data(uint8_t slot, tag_sense_type_t sense_type) {
+    if (m_snapshot_frozen) return false;
     // delete data
-    delete_data_by_tag_type(slot, sense_type);
+    if (slot >= TAG_MAX_SLOT_NUM || !delete_data_by_tag_type(slot, sense_type)) {
+        return false;
+    }
     // Close the corresponding card type of the corresponding card slot
     switch (sense_type) {
         case TAG_SENSE_HF: {
@@ -450,22 +503,30 @@ void tag_emulation_delete_data(uint8_t slot, tag_sense_type_t sense_type) {
         if (owner != NULL) owner->valid = false;
         tag_emulation_sense_switch(sense_type, false);
     }
+    return true;
 }
 
 /**
  * Set the data of a card slot to the preset data from the factory
  */
 bool tag_emulation_factory_data(uint8_t slot, tag_specific_type_t tag_type) {
+    if (m_snapshot_frozen) return false;
+    if (slot >= TAG_MAX_SLOT_NUM || !is_tag_specific_type_valid(tag_type)) {
+        return false;
+    }
+    tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
+    tag_specific_type_t configured_type = sense_type == TAG_SENSE_HF
+                                          ? slotConfig.slots[slot].tag_hf
+                                          : slotConfig.slots[slot].tag_lf;
+    if (configured_type != tag_type) {
+        return false;
+    }
     tag_datas_factory_t factory = get_data_factory_from_tag_type(tag_type);
     // The process of implementing the data formatting data!
     if (factory != NULL && factory(slot, tag_type)) {
         // If the current data card slot number currently set is the current activated card slot, then we need to update to the memory
         if (tag_emulation_get_slot() == slot) {
-            tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
-            tag_specific_type_t configured_type = sense_type == TAG_SENSE_HF
-                                                  ? slotConfig.slots[slot].tag_hf
-                                                  : slotConfig.slots[slot].tag_lf;
-            if (configured_type == tag_type) load_data_by_tag_type(slot, tag_type);
+            load_data_by_tag_type(slot, tag_type);
         }
         return true;
     }
@@ -479,18 +540,12 @@ bool tag_emulation_factory_data(uint8_t slot, tag_specific_type_t tag_type) {
 static void tag_emulation_sense_switch_all(bool enable) {
     uint8_t slot = tag_emulation_get_slot();
     // NRF_LOG_INFO("Slot %d tag type hf %d, lf %d", slot, slotConfig.slots[slot].tag_hf, slotConfig.slots[slot].tag_lf);
-    if (enable && (slotConfig.slots[slot].enabled_hf) &&
-            loaded_owner_matches(slot, slotConfig.slots[slot].tag_hf)) {
-        nfc_tag_14a_sense_switch(true);
-    } else {
-        nfc_tag_14a_sense_switch(false);
-    }
-    if (enable && (slotConfig.slots[slot].enabled_lf) &&
-            loaded_owner_matches(slot, slotConfig.slots[slot].tag_lf)) {
-        lf_tag_125khz_sense_switch(true);
-    } else {
-        lf_tag_125khz_sense_switch(false);
-    }
+    m_hf_sense_enabled = enable && slotConfig.slots[slot].enabled_hf &&
+                         loaded_owner_matches(slot, slotConfig.slots[slot].tag_hf);
+    nfc_tag_14a_sense_switch(m_hf_sense_enabled);
+    m_lf_sense_enabled = enable && slotConfig.slots[slot].enabled_lf &&
+                         loaded_owner_matches(slot, slotConfig.slots[slot].tag_lf);
+    lf_tag_125khz_sense_switch(m_lf_sense_enabled);
 }
 
 /**
@@ -499,6 +554,7 @@ static void tag_emulation_sense_switch_all(bool enable) {
  * @param enable: Whether to enable this type of field induction
  */
 void tag_emulation_sense_switch(tag_sense_type_t type, bool enable) {
+    if (m_snapshot_frozen && enable) return;
     uint8_t slot = tag_emulation_get_slot();
     // Check the parameters, not allowed to switch non -normal field
     switch (type) {
@@ -506,20 +562,14 @@ void tag_emulation_sense_switch(tag_sense_type_t type, bool enable) {
             APP_ERROR_CHECK(NRF_ERROR_INVALID_PARAM);
             break;
         case TAG_SENSE_HF:
-            if (enable && (slotConfig.slots[slot].enabled_hf) &&
-                    loaded_owner_matches(slot, slotConfig.slots[slot].tag_hf)) {
-                nfc_tag_14a_sense_switch(true);
-            } else {
-                nfc_tag_14a_sense_switch(false);
-            }
+            m_hf_sense_enabled = enable && slotConfig.slots[slot].enabled_hf &&
+                                 loaded_owner_matches(slot, slotConfig.slots[slot].tag_hf);
+            nfc_tag_14a_sense_switch(m_hf_sense_enabled);
             break;
         case TAG_SENSE_LF:
-            if (enable && (slotConfig.slots[slot].enabled_lf) &&
-                    loaded_owner_matches(slot, slotConfig.slots[slot].tag_lf)) {
-                lf_tag_125khz_sense_switch(true);
-            } else {
-                lf_tag_125khz_sense_switch(false);
-            }
+            m_lf_sense_enabled = enable && slotConfig.slots[slot].enabled_lf &&
+                                 loaded_owner_matches(slot, slotConfig.slots[slot].tag_lf);
+            lf_tag_125khz_sense_switch(m_lf_sense_enabled);
             break;
     }
 }
@@ -574,7 +624,6 @@ static void tag_emulation_migrate_slot_config(void) {
              * through to the next case.
              */
 
-            tag_emulation_save_config();
         case TAG_SLOT_CONFIG_CURRENT_VERSION:
             break;
         default:
@@ -587,7 +636,8 @@ static void tag_emulation_migrate_slot_config(void) {
  * Load the emulated card configuration data, note that loading is just a card slot configuration
  */
 static void tag_emulation_load_config(void) {
-    tag_slot_config_t loaded = slotConfig;
+    tag_slot_config_t fallback_config = slotConfig;
+    tag_slot_config_t loaded = fallback_config;
     uint16_t length = sizeof(loaded);
     // Read the card slot configuration data
     bool ret = fds_read_sync(FDS_EMULATION_CONFIG_FILE_ID, FDS_EMULATION_CONFIG_RECORD_KEY, &length, (uint8_t *)&loaded);
@@ -605,6 +655,11 @@ static void tag_emulation_load_config(void) {
         NRF_LOG_INFO("Load tag slot config done.");
         if (slotConfig.version < TAG_SLOT_CONFIG_CURRENT_VERSION) {  // old slotConfig, need to migrate
             tag_emulation_migrate_slot_config();
+            if (!slot_config_types_valid(&slotConfig)) {
+                NRF_LOG_ERROR("Migrated tag slot config is invalid; restoring defaults.");
+                slotConfig = fallback_config;
+            }
+            (void)tag_emulation_save_config();
         }
     } else {
         NRF_LOG_INFO("Tag slot config does not exist.");
@@ -614,7 +669,7 @@ static void tag_emulation_load_config(void) {
 /**
  * Save the emulated card configuration data
  */
-static void tag_emulation_save_config(void) {
+static bool tag_emulation_save_config(void) {
     // We are configured the card slot configuration, and we need to calculate the current card slot configuration CRC code to judge whether the data below is updated
     uint16_t new_calc_crc;
     calc_14a_crc_lut((uint8_t *)&slotConfig, sizeof(slotConfig), (uint8_t *)&new_calc_crc);
@@ -627,8 +682,10 @@ static void tag_emulation_save_config(void) {
         } else {
             NRF_LOG_ERROR("Save tag slot config error.");
         }
+        return ret;
     } else {
         NRF_LOG_INFO("Tag slot config no change.");
+        return true;
     }
 }
 
@@ -636,6 +693,7 @@ static void tag_emulation_save_config(void) {
  * Start tag emulation
  */
 void tag_emulation_sense_run(void) {
+    if (m_snapshot_frozen) return;
     tag_emulation_sense_switch_all(true);
 }
 
@@ -645,6 +703,7 @@ void tag_emulation_sense_run(void) {
  */
 void tag_emulation_sense_end(void) {
     TAG_FIELD_LED_OFF();
+    g_is_tag_emulating = false;
     tag_emulation_sense_switch_all(false);
 }
 
@@ -659,9 +718,11 @@ void tag_emulation_init(void) {
 /**
  * Save the tag data (written from RAM to Flash)
  */
-void tag_emulation_save(void) {
-    tag_emulation_save_config();  // Save the card slot configuration
-    tag_emulation_save_data();    // Save card slot data
+bool tag_emulation_save(void) {
+    if (m_snapshot_frozen) return false;
+    bool config_saved = tag_emulation_save_config();  // Save the card slot configuration
+    bool data_saved = tag_emulation_save_data();      // Save card slot data
+    return config_saved && data_saved;
 }
 
 /**
@@ -675,7 +736,7 @@ uint8_t tag_emulation_get_slot(void) {
  * Set the currently activated card slot index
  */
 void tag_emulation_set_slot(uint8_t index) {
-    if (index >= TAG_MAX_SLOT_NUM) return;
+    if (index >= TAG_MAX_SLOT_NUM || m_snapshot_frozen) return;
     slotConfig.active_slot = index;  // Re -set to the new switched card slot
     rgb_marquee_reset();             // force animation color refresh according to new slot
 }
@@ -683,13 +744,16 @@ void tag_emulation_set_slot(uint8_t index) {
 /**
  * Switch to the card slot of the specified index, this function will automatically complete the data loading
  */
-void tag_emulation_change_slot(uint8_t index, bool sense_disable) {
-    if (index >= TAG_MAX_SLOT_NUM) return;
+bool tag_emulation_change_slot(uint8_t index, bool sense_disable) {
+    if (index >= TAG_MAX_SLOT_NUM || m_snapshot_frozen) return false;
     if (sense_disable) {
         // Turn off the analog card to avoid triggering the emulation when switching the card slot
         tag_emulation_sense_end();
     }
-    tag_emulation_save_data();      // Save the data of the current card, in case of there is a change
+    if (!tag_emulation_save_data()) {
+        if (sense_disable) tag_emulation_sense_run();
+        return false;
+    }
     g_is_tag_emulating = false;     // Reset the emulating flag
     tag_emulation_set_slot(index);  // Update the index of the activated card slot
     tag_emulation_load_data();      // Then reload the data of the card slot
@@ -697,6 +761,7 @@ void tag_emulation_change_slot(uint8_t index, bool sense_disable) {
         // According to the configuration of the new card slot, the monitoring status of our update
         tag_emulation_sense_run();
     }
+    return true;
 }
 
 /**
@@ -717,7 +782,7 @@ bool is_slot_enabled(uint8_t slot, tag_sense_type_t sense_type) {
  * Set whether the specified card slot is enabled
  */
 void tag_emulation_slot_set_enable(uint8_t slot, tag_sense_type_t sense_type, bool enable) {
-    if (slot >= TAG_MAX_SLOT_NUM) return;
+    if (slot >= TAG_MAX_SLOT_NUM || m_snapshot_frozen) return;
     // Set the capacity of the corresponding card slot directly
     if (sense_type == TAG_SENSE_LF) {
         slotConfig.slots[slot].enabled_lf = enable;
@@ -764,7 +829,7 @@ uint8_t tag_emulation_slot_find_prev(uint8_t slot_now) {
  * Set the card specified by the specified card slot card slot card type card to the specified type
  */
 void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type) {
-    if (slot >= TAG_MAX_SLOT_NUM || !is_tag_specific_type_valid(tag_type)) return;
+    if (slot >= TAG_MAX_SLOT_NUM || !is_tag_specific_type_valid(tag_type) || m_snapshot_frozen) return;
     tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
     NRF_LOG_INFO("sense type = %d", sense_type);
     switch (sense_type) {
@@ -785,6 +850,63 @@ void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type) {
         load_data_by_tag_type(slot, tag_type);
         NRF_LOG_INFO("reload data success.");
     }
+}
+
+static bool is_mifare_classic_type(tag_specific_type_t type) {
+    return type == TAG_TYPE_MIFARE_Mini || type == TAG_TYPE_MIFARE_1024 ||
+           type == TAG_TYPE_MIFARE_2048 || type == TAG_TYPE_MIFARE_4096;
+}
+
+bool tag_emulation_snapshot_begin(uint8_t *slot, tag_specific_type_t *tag_type,
+                                  uint32_t *owner_generation) {
+    if (m_snapshot_frozen || slot == NULL || tag_type == NULL ||
+            owner_generation == NULL) return false;
+
+    uint8_t active_slot = tag_emulation_get_slot();
+    tag_specific_type_t active_type = slotConfig.slots[active_slot].tag_hf;
+    if (!is_mifare_classic_type(active_type) ||
+            !tag_emulation_is_active_type_loaded(active_type)) {
+        return false;
+    }
+
+    m_snapshot_restore_hf_sense = m_hf_sense_enabled;
+    m_snapshot_restore_lf_sense = m_lf_sense_enabled;
+    tag_emulation_sense_end();
+    m_snapshot_frozen = true;
+    *slot = active_slot;
+    *tag_type = active_type;
+    *owner_generation = m_loaded_hf.generation;
+    return true;
+}
+
+tag_snapshot_save_result_t tag_emulation_snapshot_save(uint8_t slot, tag_specific_type_t tag_type) {
+    if (!m_snapshot_frozen || slot >= TAG_MAX_SLOT_NUM ||
+            slot != tag_emulation_get_slot() ||
+            slotConfig.slots[slot].tag_hf != tag_type ||
+            !is_mifare_classic_type(tag_type) ||
+            !tag_emulation_is_active_type_loaded(tag_type)) {
+        return TAG_SNAPSHOT_SAVE_INVALID_STATE;
+    }
+    if (nfc_tag_mf1_get_write_mode() != NFC_TAG_MF1_WRITE_NORMAL) {
+        return TAG_SNAPSHOT_SAVE_WRITE_MODE;
+    }
+    return save_data_by_tag_type(slot, tag_type, true)
+           ? TAG_SNAPSHOT_SAVE_OK : TAG_SNAPSHOT_SAVE_FLASH_FAIL;
+}
+
+void tag_emulation_snapshot_release(void) {
+    if (!m_snapshot_frozen) return;
+    bool restore_hf = m_snapshot_restore_hf_sense;
+    bool restore_lf = m_snapshot_restore_lf_sense;
+    m_snapshot_frozen = false;
+    m_snapshot_restore_hf_sense = false;
+    m_snapshot_restore_lf_sense = false;
+    tag_emulation_sense_switch(TAG_SENSE_HF, restore_hf);
+    tag_emulation_sense_switch(TAG_SENSE_LF, restore_lf);
+}
+
+bool tag_emulation_snapshot_is_active(void) {
+    return m_snapshot_frozen;
 }
 
 /**

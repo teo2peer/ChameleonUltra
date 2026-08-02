@@ -102,8 +102,9 @@ static bool queue_decoder(data_frame_transport_t transport, data_frame_decoder_t
     if (request->length != 0) {
         memcpy(request->data, decoder->frame.data, request->length);
     }
+    bool current;
     CRITICAL_REGION_ENTER();
-    bool current = decoder->generation == generation;
+    current = decoder->generation == generation;
     if (current && request->reserved && request->publishing &&
             request->generation == generation) {
         request->publishing = false;
@@ -209,25 +210,28 @@ static uint16_t receive_from_generation(const uint8_t *data, uint16_t length,
     if (decoder == NULL || (data == NULL && length != 0)) {
         return 0;
     }
-    uint32_t generation;
+    uint32_t generation = 0;
+    uint16_t consumed = 0;
+    bool can_receive = false;
     CRITICAL_REGION_ENTER();
-    if (decoder->receiving) {
-        CRITICAL_REGION_EXIT();
-        return 0;
+    if (!decoder->receiving) {
+        if (require_generation && decoder->generation != expected_generation) {
+            consumed = length;
+        } else {
+            decoder->receiving = true;
+            generation = decoder->generation;
+            can_receive = true;
+        }
     }
-    if (require_generation && decoder->generation != expected_generation) {
-        CRITICAL_REGION_EXIT();
-        return length;
-    }
-    decoder->receiving = true;
-    generation = decoder->generation;
     CRITICAL_REGION_EXIT();
+    if (!can_receive) {
+        return consumed;
+    }
 
     if (decoder->complete && !queue_decoder(transport, decoder, generation)) {
         return receive_finish(decoder, generation, 0, length);
     }
 
-    uint16_t consumed = 0;
     while (consumed < length) {
         if (decoder->length >= sizeof(decoder->frame)) {
             decoder_resynchronize(decoder);

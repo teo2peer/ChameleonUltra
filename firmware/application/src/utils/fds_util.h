@@ -3,6 +3,8 @@
 
 #include "fds.h"
 
+#define FDS_SYNC_OPERATION_TIMEOUT_MS 15000U
+#define FDS_WRITE_WITH_GC_MAX_MS      (3U * FDS_SYNC_OPERATION_TIMEOUT_MS)
 
 bool fds_read_sync(uint16_t id, uint16_t key, uint16_t *length, uint8_t *buffer);
 bool fds_write_sync(uint16_t id, uint16_t key, uint16_t length, void *buffer);

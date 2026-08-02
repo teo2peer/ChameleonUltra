@@ -43,10 +43,13 @@ NRF_LOG_MODULE_REGISTER();
 #include "rgb_marquee.h"
 #include "tag_persistence.h"
 #include "settings.h"
+#include "keyboard_payload.h"
+#include "keyboard_hid.h"
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "rc522.h"
 #include "hf_capture.h"
+#include "iso_dep_session.h"
 #endif
 
 // Defining soft timers
@@ -207,11 +210,28 @@ static void timer_button_event_handle(void *arg) {
         NRF_LOG_INFO("BUTTON press during shutdown");
         return;
     }
+    if (app_cmd_active_slot_snapshot_is_active()) {
+        m_is_a_btn_press = false;
+        m_is_b_btn_press = false;
+        m_is_a_btn_release = false;
+        m_is_b_btn_release = false;
+        m_is_btn_long_press = false;
+        return;
+    }
 
     nrf_drv_gpiote_pin_t pin = *(nrf_drv_gpiote_pin_t *)arg;
 
     // Check here if the current GPIO is at the pressed level
     if (nrf_gpio_pin_read(pin) == 1) {
+        if ((pin == BUTTON_1 || pin == BUTTON_2) && keyboard_payload_cancel_from_button()) {
+            NRF_LOG_INFO("Keyboard payload cancelled by button");
+            m_is_a_btn_press = false;
+            m_is_b_btn_press = false;
+            m_is_a_btn_release = false;
+            m_is_b_btn_release = false;
+            m_is_btn_long_press = false;
+            return;
+        }
         if (pin == BUTTON_1) {
             // If button is disabled, we can't dispatch key event.
             if (settings_get_button_press_config('b') != SettingsButtonDisable) {
@@ -292,7 +312,12 @@ static void system_off_enter(void) {
     ret_code_t ret;
     m_system_off_processing = true;
     // Save tag data
-    tag_emulation_save();
+    if (!tag_emulation_save() && !g_is_low_battery_shutdown) {
+        NRF_LOG_ERROR("System off deferred because tag persistence failed.");
+        m_system_off_processing = false;
+        sleep_timer_start(settings_get_sleep_timeout());
+        return;
+    }
 
     if (g_is_low_battery_shutdown) {
         // Don't create too complex animations, just blink LED1 three times.
@@ -488,7 +513,7 @@ static void check_wakeup_src(void) {
         light_up_by_slot();
 
         // If no operation follows, wait for the timeout and then deep hibernate
-        sleep_timer_start(SLEEP_DELAY_MS_BUTTON_WAKEUP);
+        sleep_timer_start(settings_get_sleep_timeout());
     } else if ((m_reset_source & (NRF_POWER_RESETREAS_NFC_MASK | NRF_POWER_RESETREAS_LPCOMP_MASK)) ||
                (m_gpregret_val & RESET_ON_LF_FIELD_EXISTS_Msk)) {
         NRF_LOG_INFO("WakeUp from rfid field");
@@ -587,7 +612,10 @@ static void cycle_slot(bool dec) {
         slot_new = tag_emulation_slot_find_next(slot_now);
     }
     // Update status only if the new card slot switch is valid
-    tag_emulation_change_slot(slot_new, true); // Tell the analog card module that we need to switch card slots
+    if (!tag_emulation_change_slot(slot_new, true)) {
+        NRF_LOG_ERROR("Slot change aborted because tag data could not be saved");
+        return;
+    }
     // Turn off the LEDs in case we were showing the battery status
     rgb_marquee_stop();
     uint32_t *led_pins = hw_get_led_array();
@@ -662,10 +690,22 @@ static void offline_status_ok(void) {
 
 static void btn_fn_copy_lf(uint8_t slot, tag_specific_type_t type) {
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(type);
-    if (buffer == NULL) {
+    if (buffer == NULL || buffer->length > 20u ||
+            !tag_emulation_is_active_type_loaded(type)) {
         // empty HF slot, nothing to do
         return;
     }
+    if (!tag_emulation_save()) {
+        NRF_LOG_ERROR("Offline LF clone could not persist current slot")
+        offline_status_error();
+        return;
+    }
+    uint8_t previous_data[20];
+    memcpy(previous_data, buffer->buffer, buffer->length);
+    uint16_t previous_length = buffer->actual_length;
+    uint16_t previous_crc = *buffer->crc;
+    bool previous_crc_valid = buffer->crc_valid;
+    tag_specific_type_t previous_type = type;
     size_t size = 0;
     uint8_t id_buffer[16] = {0x00};
     uint8_t status = STATUS_LF_TAG_NO_FOUND;
@@ -684,18 +724,21 @@ static void btn_fn_copy_lf(uint8_t slot, tag_specific_type_t type) {
         case TAG_TYPE_EM410X:
         case TAG_TYPE_EM410X_ELECTRA: {
             status = scan_em410x(id_buffer);
-            tag_specific_type_t detected_type = (id_buffer[0] << 8) | id_buffer[1];
-            tag_specific_type_t new_type =
-                detected_type == TAG_TYPE_EM410X_ELECTRA ? TAG_TYPE_EM410X_ELECTRA : TAG_TYPE_EM410X;
+            if (status == STATUS_LF_TAG_OK) {
+                tag_specific_type_t detected_type = (id_buffer[0] << 8) | id_buffer[1];
+                tag_specific_type_t new_type =
+                    detected_type == TAG_TYPE_EM410X_ELECTRA ? TAG_TYPE_EM410X_ELECTRA : TAG_TYPE_EM410X;
 
-            // If we read Electra but the slot was classic (or vice versa), switch slot type automatically.
-            if (new_type != type) {
-                tag_emulation_change_type(slot, new_type);
-                type = new_type;
+                // If we read Electra but the slot was classic (or vice versa), switch slot type automatically.
+                if (new_type != type) {
+                    tag_emulation_change_type(slot, new_type);
+                    type = new_type;
+                }
+
+                size = new_type == TAG_TYPE_EM410X_ELECTRA
+                       ? LF_EM410X_ELECTRA_TAG_ID_SIZE : LF_EM410X_TAG_ID_SIZE;
+                data = id_buffer + 2;  // skip tag type
             }
-
-            size = (new_type == TAG_TYPE_EM410X_ELECTRA) ? LF_EM410X_ELECTRA_TAG_ID_SIZE : LF_EM410X_TAG_ID_SIZE;
-            data = id_buffer + 2;  // skip tag type
             break;
         }
         case TAG_TYPE_VIKING:
@@ -715,11 +758,26 @@ static void btn_fn_copy_lf(uint8_t slot, tag_specific_type_t type) {
 
     if (status == STATUS_LF_TAG_OK) {
         memcpy(buffer->buffer, data, size);
-        tag_emulation_load_by_buffer(type, false);
+        if (!tag_emulation_load_by_buffer(type, false)) {
+            if (type != previous_type) {
+                tag_emulation_change_type(slot, previous_type);
+            }
+            buffer = get_buffer_by_tag_type(previous_type);
+            if (buffer != NULL) {
+                memcpy(buffer->buffer, previous_data, buffer->length);
+                buffer->actual_length = previous_length;
+                *buffer->crc = previous_crc;
+                buffer->crc_valid = previous_crc_valid;
+                (void)tag_emulation_load_by_buffer(previous_type, false);
+            }
+            NRF_LOG_ERROR("Offline LF clone could not load emulator data")
+            offline_status_error();
+            return;
+        }
         NRF_LOG_INFO("Offline lf tag copied")
 
         char *nick = "cloned";
-        uint8_t nick_buffer[36];
+        uint8_t nick_buffer[36] = {0};
         nick_buffer[0] = strlen(nick);
         memcpy(nick_buffer + 1, nick, nick_buffer[0]);
 
@@ -735,7 +793,7 @@ static void btn_fn_copy_lf(uint8_t slot, tag_specific_type_t type) {
 
 static void btn_fn_copy_hf(uint8_t slot, tag_specific_type_t type) {
     tag_data_buffer_t *buffer = get_buffer_by_tag_type(type);
-    if (buffer == NULL) {
+    if (buffer == NULL || !tag_emulation_is_active_type_loaded(type)) {
         // empty HF slot, nothing to do
         return;
     }
@@ -775,6 +833,7 @@ static void btn_fn_copy_hf(uint8_t slot, tag_specific_type_t type) {
         return;
     }
 
+    iso_dep_session_abort();
     pcd_14a_reader_antenna_on();
     bsp_delay_ms(8);
     // select a tag
@@ -796,7 +855,7 @@ static void btn_fn_copy_hf(uint8_t slot, tag_specific_type_t type) {
         NRF_LOG_INFO("Offline HF uid copied")
 
         char *nick = "cloned";
-        uint8_t nick_buffer[36];
+        uint8_t nick_buffer[36] = {0};
         nick_buffer[0] = strlen(nick);
         memcpy(nick_buffer + 1, nick, nick_buffer[0]);
 
@@ -854,6 +913,10 @@ static void btn_fn_toggle_reader_keys(void) {
         NRF_LOG_INFO("Reader-keys button: active slot HF is not MIFARE Classic");
         return;
     }
+    if (!tag_emulation_is_active_type_loaded(tag_types.tag_hf)) {
+        NRF_LOG_INFO("Reader-keys button: active MIFARE Classic data is not loaded");
+        return;
+    }
     if (rgb_marquee_is_reader_keys_anim()) {
         rgb_marquee_set_reader_keys_anim(false);
         nfc_tag_mf1_set_detection_enable(false);
@@ -875,6 +938,7 @@ static void btn_fn_ble_restart(void) {
     ble_central_flood_stop();
     ble_central_kick(1);                  // best-effort: drop any central link
     ble_adv_flood_stop();                 // stop environment-wide adv spam
+    ble_adv_lab_stop();                   // stop custom advertising lab
     if (is_ble_scanning()) {
         ble_scan_stop();
     }
@@ -909,6 +973,7 @@ static void run_button_function_by_settings(settings_button_function_t sbf) {
             btn_fn_copy_ic_uid();
             break;
         case SettingsButtonNfcFieldGenerator:
+            iso_dep_session_abort();
             if (!m_is_field_on) {
                 // Initialize reader hardware if not already in reader mode
                 device_mode_t current_mode = get_device_mode();
@@ -979,6 +1044,12 @@ extern bool g_usb_led_marquee_enable;
 static void button_press_process(void) {
     // Make sure that one of the AB buttons has a click event
     if (m_is_b_btn_release || m_is_a_btn_release) {
+        if (app_cmd_active_slot_snapshot_is_active()) {
+            m_is_a_btn_release = false;
+            m_is_b_btn_release = false;
+            m_is_btn_long_press = false;
+            return;
+        }
         // While a BLE attack / stress / broadcast is running, the BLE-active
         // (blue, outside -> centre) animation is on. In that mode, button A
         // OR button B — short or long press — cancels the in-progress attack
@@ -1057,7 +1128,7 @@ static void blink_usb_led_status(void) {
 }
 
 static void lesc_event_process(void) {
-    if (settings_get_ble_pairing_enable_first_load()) {
+    if (settings_get_ble_pairing_enable()) {
         ret_code_t err_code;
         err_code = nrf_ble_lesc_request_handler();
         APP_ERROR_CHECK(err_code);
@@ -1065,9 +1136,7 @@ static void lesc_event_process(void) {
 }
 
 static void ble_passkey_init(void) {
-    if (settings_get_ble_pairing_enable_first_load()) {
-        set_ble_connect_key(settings_get_ble_connect_key());
-    }
+    set_ble_connect_key(settings_get_ble_connect_key());
 }
 
 /**@brief Application main function.
@@ -1139,6 +1208,9 @@ int main(void) {
         }
 
         lf_tag_emulation_process();
+#if defined(PROJECT_CHAMELEON_ULTRA)
+        iso_dep_session_process();
+#endif
         // Apply queued USB session changes before dispatching another command.
         while (app_usbd_event_queue_process());
         // Data pack process
@@ -1146,6 +1218,16 @@ int main(void) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
         app_cmd_hf_capture_process();
 #endif
+        bool keyboard_was_running = keyboard_payload_is_running();
+        if (keyboard_was_running && !keyboard_payload_command_link_alive()) {
+            keyboard_payload_cancel_command_link();
+        }
+        keyboard_hid_process();
+        keyboard_payload_process();
+        ble_adv_lab_process();
+        if (keyboard_was_running && !keyboard_payload_is_running()) {
+            sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
+        }
         // Log print process
         while (NRF_LOG_PROCESS());
         // USB event process

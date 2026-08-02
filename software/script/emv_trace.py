@@ -14,7 +14,30 @@ OPT_TIMING = 0x04
 OPT_RECORD_GRID = 0x08
 OPT_TRANSACTION_LOG = 0x10
 OPT_PDOL_FALLBACK = 0x20
-OPT_ALL = 0x3F
+OPT_EXPRESS_TRANSIT = 0x40
+OPT_TERMINAL_PROFILE = 0x80
+OPT_ALL = 0xFF
+
+PROFILE_AUTO = 0x00
+PROFILE_APPLE_TRANSIT = 0x01
+PROFILE_ONLINE_NO_ODA = 0x02
+PROFILE_BROAD_MOBILE = 0x03
+PROFILE_QVSDC_ONLINE = 0x04
+PROFILE_MINIMAL_ONLINE = 0x05
+PROFILE_MSD_QVSDC = 0x06
+PROFILE_CUSTOM = 0xFE
+PROFILE_SWEEP = 0xFF
+VALID_PROFILES = frozenset(range(7)) | {PROFILE_CUSTOM, PROFILE_SWEEP}
+
+BEHAVIOR_DIRECT_AID_FALLBACK = 0x01
+BEHAVIOR_ADAPTIVE_PROFILES = 0x02
+BEHAVIOR_REACQUIRE_PROFILES = 0x04
+BEHAVIOR_ALL = 0x07
+
+POLLING_DEFAULT = 0
+POLLING_FAST = 1
+POLLING_BALANCED = 2
+POLLING_PATIENT = 3
 
 TRACE_COMPLETE = 0x00000001
 TRACE_TIMEOUT = 0x00000002
@@ -25,7 +48,8 @@ TRACE_APP_LIMIT = 0x00000020
 TRACE_TIMING_VALID = 0x00000040
 TRACE_MAXIMUM_PROCESSING = 0x00000080
 TRACE_TRANSPORT_ERROR = 0x00000100
-TRACE_ALL = 0x000001FF
+TRACE_EXPRESS_TRANSIT = 0x00000200
+TRACE_ALL = 0x000003FF
 
 VALID_STAGES = frozenset(range(10)) | {0xFF}
 
@@ -67,6 +91,13 @@ class EmvTraceRequest:
     date: bytes = b"\x00" * 3
     transaction_type: int = 0
     cryptogram_type: int = 0xFF
+    terminal_profile: Optional[int] = None
+    custom_ttq: bytes = b"\x00" * 4
+    polling_profile: int = POLLING_DEFAULT
+    behavior: int = 0
+    poll_retries: int = 0
+    poll_delay_ms: int = 0
+    poll_timeout_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -171,6 +202,8 @@ def encode_start_request(request: EmvTraceRequest) -> bytes:
     flags = _uint("flags", request.flags, 0xFF)
     if flags & ~OPT_ALL:
         raise EmvTraceError("flags contain reserved bits")
+    if flags & OPT_TERMINAL_PROFILE:
+        raise EmvTraceError("terminal profile flag is derived from terminal_profile")
     max_aids = _uint("max_aids", request.max_aids, 16)
     max_records = _uint("max_records", request.max_records, 64)
     max_apdus = _uint("max_apdus", request.max_apdus, 512)
@@ -196,6 +229,30 @@ def encode_start_request(request: EmvTraceRequest) -> bytes:
     )
     if len(payload) != 25:
         raise AssertionError("EMV trace START encoder produced the wrong size")
+    behavior = _uint("behavior", request.behavior, 0xFF)
+    if behavior & ~BEHAVIOR_ALL:
+        raise EmvTraceError("behavior contains reserved bits")
+    polling_profile = _uint("polling_profile", request.polling_profile, POLLING_PATIENT)
+    poll_retries = _uint("poll_retries", request.poll_retries, 100)
+    poll_delay_ms = _uint("poll_delay_ms", request.poll_delay_ms, 20)
+    poll_timeout_ms = _uint("poll_timeout_ms", request.poll_timeout_ms, 10)
+    has_behavior = any((behavior, polling_profile, poll_retries,
+                        poll_delay_ms, poll_timeout_ms))
+    if request.terminal_profile is not None or has_behavior:
+        profile = PROFILE_AUTO if request.terminal_profile is None else _uint(
+            "terminal_profile", request.terminal_profile, 0xFF)
+        if profile not in VALID_PROFILES:
+            raise EmvTraceError("unknown terminal_profile")
+        custom_ttq = _fixed_bytes("custom_ttq", request.custom_ttq, 4)
+        if profile != PROFILE_CUSTOM and custom_ttq != b"\x00" * 4:
+            raise EmvTraceError("custom_ttq requires PROFILE_CUSTOM")
+        payload = bytes([payload[0], payload[1] | OPT_TERMINAL_PROFILE]) + payload[2:]
+        payload += bytes([profile]) + custom_ttq
+        if has_behavior:
+            payload += bytes([polling_profile, behavior, poll_retries,
+                              poll_delay_ms, poll_timeout_ms])
+    elif request.custom_ttq != b"\x00" * 4:
+        raise EmvTraceError("custom_ttq requires terminal_profile")
     return payload
 
 

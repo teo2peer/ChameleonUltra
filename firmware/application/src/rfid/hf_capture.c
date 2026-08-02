@@ -115,12 +115,15 @@ static uint32_t ring_record_sequence(uint16_t offset) {
 }
 
 static uint64_t clock_update(void) {
+    uint32_t now;
+    uint32_t delta;
+    uint64_t elapsed;
     CRITICAL_REGION_ENTER();
-    uint32_t now = app_timer_cnt_get();
-    uint32_t delta = app_timer_cnt_diff_compute(now, m_last_clock_tick);
+    now = app_timer_cnt_get();
+    delta = app_timer_cnt_diff_compute(now, m_last_clock_tick);
     m_elapsed_ticks += delta;
     m_last_clock_tick = now;
-    uint64_t elapsed = m_elapsed_ticks;
+    elapsed = m_elapsed_ticks;
     CRITICAL_REGION_EXIT();
     return elapsed;
 }
@@ -150,24 +153,22 @@ static void append_record(uint8_t type, hf_capture_direction_t direction,
         m_meta_flags |= HF_CAPTURE_META_FLAG_OVERFLOW;
         m_notification_generation++;
         m_notification_pending = true;
-        CRITICAL_REGION_EXIT();
-        return;
+    } else {
+        put_u16(header, body_length);
+        header[2] = HF_CAPTURE_PROTOCOL_VERSION;
+        header[3] = type;
+        put_u32(&header[4], sequence);
+        put_u64(&header[8], timestamp);
+        header[16] = (uint8_t)direction;
+        header[17] = flags;
+        put_u16(&header[18], bit_length);
+        put_u16(&header[20], data_length);
+        ring_write(header, sizeof(header));
+        if (data_length > 0u) ring_write(data, data_length);
+        m_stored_records++;
+        m_notification_generation++;
+        m_notification_pending = true;
     }
-
-    put_u16(header, body_length);
-    header[2] = HF_CAPTURE_PROTOCOL_VERSION;
-    header[3] = type;
-    put_u32(&header[4], sequence);
-    put_u64(&header[8], timestamp);
-    header[16] = (uint8_t)direction;
-    header[17] = flags;
-    put_u16(&header[18], bit_length);
-    put_u16(&header[20], data_length);
-    ring_write(header, sizeof(header));
-    if (data_length > 0u) ring_write(data, data_length);
-    m_stored_records++;
-    m_notification_generation++;
-    m_notification_pending = true;
     CRITICAL_REGION_EXIT();
 }
 
@@ -234,14 +235,17 @@ hf_capture_result_t hf_capture_start(hf_capture_mode_t mode,
             !owner_valid(owner) || start_token == 0u) {
         return HF_CAPTURE_RESULT_INVALID;
     }
+    bool idempotent_retry;
+    bool previous_session_pending;
+    uint32_t active_session_id;
     CRITICAL_REGION_ENTER();
-    bool idempotent_retry = m_state == HF_CAPTURE_STATE_RUNNING &&
-                            m_mode == mode && m_owner == owner &&
-                            m_start_token == start_token;
-    bool previous_session_pending = m_state == HF_CAPTURE_STATE_RUNNING ||
-                                    (m_state == HF_CAPTURE_STATE_STOPPED &&
-                                     m_stored_records > 0u);
-    uint32_t active_session_id = m_session_id;
+    idempotent_retry = m_state == HF_CAPTURE_STATE_RUNNING &&
+                       m_mode == mode && m_owner == owner &&
+                       m_start_token == start_token;
+    previous_session_pending = m_state == HF_CAPTURE_STATE_RUNNING ||
+                               (m_state == HF_CAPTURE_STATE_STOPPED &&
+                                m_stored_records > 0u);
+    active_session_id = m_session_id;
     CRITICAL_REGION_EXIT();
     if (idempotent_retry) {
         *session_id = active_session_id;
@@ -332,8 +336,9 @@ hf_capture_result_t hf_capture_stop(uint32_t session_id,
             session_id != m_session_id || owner != m_owner) {
         return HF_CAPTURE_RESULT_SESSION;
     }
+    bool was_running;
     CRITICAL_REGION_ENTER();
-    bool was_running = m_state == HF_CAPTURE_STATE_RUNNING;
+    was_running = m_state == HF_CAPTURE_STATE_RUNNING;
     m_state = HF_CAPTURE_STATE_STOPPED;
     CRITICAL_REGION_EXIT();
     if (was_running) detach_source();
@@ -385,18 +390,28 @@ uint16_t hf_capture_build_meta(uint32_t session_id, uint8_t *response,
     if (response == NULL || response_capacity < HF_CAPTURE_META_SIZE ||
             m_state == HF_CAPTURE_STATE_EMPTY || session_id != m_session_id) return 0;
     uint64_t elapsed = clock_update();
+    uint8_t state;
+    hf_capture_mode_t mode;
+    uint8_t flags;
+    uint32_t active_session_id;
+    uint32_t next_sequence;
+    uint32_t stored_records;
+    uint32_t observed_records;
+    uint32_t dropped_records;
+    uint16_t used;
+    uint32_t first_sequence;
     CRITICAL_REGION_ENTER();
-    uint8_t state = m_state;
-    hf_capture_mode_t mode = m_mode;
-    uint8_t flags = m_meta_flags;
-    uint32_t active_session_id = m_session_id;
-    uint32_t next_sequence = m_next_sequence;
-    uint32_t stored_records = m_stored_records;
-    uint32_t observed_records = m_observed_records;
-    uint32_t dropped_records = m_dropped_records;
-    uint16_t used = m_used;
-    uint32_t first_sequence = stored_records == 0u ? next_sequence :
-                              ring_record_sequence(m_head);
+    state = m_state;
+    mode = m_mode;
+    flags = m_meta_flags;
+    active_session_id = m_session_id;
+    next_sequence = m_next_sequence;
+    stored_records = m_stored_records;
+    observed_records = m_observed_records;
+    dropped_records = m_dropped_records;
+    used = m_used;
+    first_sequence = stored_records == 0u ? next_sequence :
+                     ring_record_sequence(m_head);
     CRITICAL_REGION_EXIT();
     response[0] = HF_CAPTURE_PROTOCOL_VERSION;
     response[1] = state;
@@ -432,15 +447,21 @@ hf_capture_result_t hf_capture_get(uint32_t session_id, bool acknowledge_present
             session_id != m_session_id || owner != m_owner) {
         return HF_CAPTURE_RESULT_SESSION;
     }
+    bool acknowledged;
+    uint16_t cursor = 0;
+    uint32_t available_records = 0u;
+    uint32_t empty_sequence = 0u;
     CRITICAL_REGION_ENTER();
-    if (!acknowledge(acknowledge_present, ack_sequence, ack_delivery_token)) {
-        CRITICAL_REGION_EXIT();
+    acknowledged = acknowledge(acknowledge_present, ack_sequence, ack_delivery_token);
+    if (acknowledged) {
+        cursor = m_head;
+        available_records = m_stored_records;
+        empty_sequence = m_next_sequence;
+    }
+    CRITICAL_REGION_EXIT();
+    if (!acknowledged) {
         return HF_CAPTURE_RESULT_INVALID;
     }
-    uint16_t cursor = m_head;
-    uint32_t available_records = m_stored_records;
-    uint32_t empty_sequence = m_next_sequence;
-    CRITICAL_REGION_EXIT();
 
     uint16_t maximum = requested_bytes;
     if (maximum > response_capacity) maximum = response_capacity;

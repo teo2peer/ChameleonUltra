@@ -205,6 +205,11 @@ void pcd_14a_reader_trace_set(pcd_14a_trace_cb_t callback);
 void pcd_14a_reader_trace_clear(void);
 void pcd_14a_reader_capture_set(pcd_14a_trace_cb_t callback);
 void pcd_14a_reader_capture_clear(void);
+bool pcd_14a_reader_polling_annotation_set(const uint8_t *frame, uint8_t length);
+bool pcd_14a_reader_polling_annotation_timing_set(uint8_t retries,
+                                                   uint8_t delay_ms,
+                                                   uint8_t timeout_ms);
+void pcd_14a_reader_polling_annotation_clear(void);
 
 // Device communication interface
 uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command,

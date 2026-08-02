@@ -15,6 +15,7 @@
 #define ISO_DEP_PCB_S_WTX        0xF2u
 
 #define ISO_DEP_FRAME_MAX        64u
+#define ISO_DEP_RESPONSE_RETRIES 2u
 
 static const uint16_t m_frame_sizes[] = {16, 24, 32, 40, 48, 64, 96, 128, 256};
 
@@ -95,6 +96,20 @@ static uint8_t transceive_frame(const uint8_t *tx, uint8_t tx_len,
     return status;
 }
 
+static uint8_t request_response_retransmission(const iso_dep_reader_t *reader,
+                                               uint8_t block_num,
+                                               uint8_t *rx, uint16_t *rx_len) {
+    uint8_t rnak[4];
+    uint8_t rnak_len = 0u;
+    rnak[rnak_len++] = ISO_DEP_PCB_R_NAK | block_num |
+                       (reader->cid_enabled ? ISO_DEP_PCB_CID : 0u);
+    if (reader->cid_enabled) rnak[rnak_len++] = reader->cid;
+    crc_14a_append(rnak, rnak_len);
+    rnak_len += 2u;
+    pcd_14a_reader_timeout_set(reader->frame_timeout_ms);
+    return transceive_frame(rnak, rnak_len, rx, rx_len);
+}
+
 static bool parse_cid(const iso_dep_reader_t *reader, const uint8_t *frame,
                       uint16_t frame_len, uint8_t *offset) {
     bool has_cid = (frame[0] & ISO_DEP_PCB_CID) != 0;
@@ -135,6 +150,7 @@ static bool iso_dep_reader_transceive_impl(iso_dep_reader_t *reader,
     uint16_t rx_len = 0;
     uint8_t chain_guard = 0;
     uint8_t wtx_guard = 0;
+    uint32_t wtx_total_ms = 0;
 
     while (apdu_offset < apdu_len) {
         uint16_t remaining = apdu_len - apdu_offset;
@@ -155,6 +171,18 @@ static bool iso_dep_reader_transceive_impl(iso_dep_reader_t *reader,
             bsp_wdt_feed();
             pcd_14a_reader_timeout_set(reader->frame_timeout_ms);
             result->rf_status = transceive_frame(tx, tx_len, rx, &rx_len);
+            uint8_t response_retries = 0u;
+            while (!more && result->rf_status == STATUS_HF_TAG_NO &&
+                    response_retries++ < ISO_DEP_RESPONSE_RETRIES) {
+                uint16_t recovery_timeout = reader->frame_timeout_ms;
+                if (wtx_total_ms > ISO_DEP_READER_MAX_WTX_TOTAL_MS - recovery_timeout) {
+                    result->error = ISO_DEP_ERR_TIMEOUT;
+                    return false;
+                }
+                wtx_total_ms += recovery_timeout;
+                result->rf_status = request_response_retransmission(
+                    reader, tx_block_num, rx, &rx_len);
+            }
             if (result->rf_status != STATUS_HF_TAG_OK || rx_len < 3u) {
                 result->error = result->rf_status == STATUS_HF_TAG_NO ?
                                 ISO_DEP_ERR_TIMEOUT : ISO_DEP_ERR_TRANSPORT;
@@ -199,11 +227,24 @@ static bool iso_dep_reader_transceive_impl(iso_dep_reader_t *reader,
             uint8_t offset;
             if (!parse_cid(reader, rx, rx_len, &offset) ||
                     rx_len != (uint16_t)(offset + 3u) ||
-                    rx[offset] == 0u || rx[offset] > 59u ||
-                    ++wtx_guard > ISO_DEP_READER_MAX_WTX) {
+                    rx[offset] == 0u || rx[offset] > 59u) {
                 result->error = ISO_DEP_ERR_BLOCK;
                 return false;
             }
+            if (++wtx_guard > ISO_DEP_READER_MAX_WTX) {
+                result->wtx_count = wtx_guard;
+                result->error = ISO_DEP_ERR_BLOCK;
+                return false;
+            }
+            result->wtx_count = wtx_guard;
+            uint32_t requested_timeout = (uint32_t)reader->frame_timeout_ms * rx[offset];
+            uint16_t effective_timeout = (uint16_t)(requested_timeout > 5000u ?
+                                                    5000u : requested_timeout);
+            if (wtx_total_ms > ISO_DEP_READER_MAX_WTX_TOTAL_MS - effective_timeout) {
+                result->error = ISO_DEP_ERR_TIMEOUT;
+                return false;
+            }
+            wtx_total_ms += effective_timeout;
             uint8_t wtx[5];
             uint8_t wtx_len = 0;
             wtx[wtx_len++] = pcb;
@@ -211,9 +252,20 @@ static bool iso_dep_reader_transceive_impl(iso_dep_reader_t *reader,
             wtx[wtx_len++] = rx[offset];
             crc_14a_append(wtx, wtx_len);
             wtx_len += 2;
-            uint32_t timeout = (uint32_t)reader->frame_timeout_ms * rx[offset];
-            pcd_14a_reader_timeout_set((uint16_t)(timeout > 5000u ? 5000u : timeout));
+            pcd_14a_reader_timeout_set(effective_timeout);
             result->rf_status = transceive_frame(wtx, wtx_len, rx, &rx_len);
+            uint8_t recovery_retries = 0u;
+            while (result->rf_status == STATUS_HF_TAG_NO &&
+                    recovery_retries++ < ISO_DEP_RESPONSE_RETRIES) {
+                uint16_t recovery_timeout = reader->frame_timeout_ms;
+                if (wtx_total_ms > ISO_DEP_READER_MAX_WTX_TOTAL_MS - recovery_timeout) {
+                    result->error = ISO_DEP_ERR_TIMEOUT;
+                    return false;
+                }
+                wtx_total_ms += recovery_timeout;
+                result->rf_status = request_response_retransmission(
+                    reader, reader->rx_block_num, rx, &rx_len);
+            }
             if (result->rf_status != STATUS_HF_TAG_OK || rx_len < 3u) {
                 result->error = ISO_DEP_ERR_TIMEOUT;
                 return false;

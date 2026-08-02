@@ -15,7 +15,6 @@
 #include "nrf_log_default_backends.h"
 NRF_LOG_MODULE_REGISTER();
 
-#define FDS_SYNC_TIMEOUT_MS       15000U
 #define FDS_SYNC_WDT_FEED_MS      100U
 #define FDS_RECORD_OVERHEAD_WORDS 5U /* Three header words and two page-tag words. */
 #define FDS_MAX_RECORD_WORDS      (FDS_VIRTUAL_PAGE_SIZE - FDS_RECORD_OVERHEAD_WORDS)
@@ -132,7 +131,7 @@ static void fds_cancel_wait(void) {
 }
 
 static ret_code_t fds_wait(void) {
-    for (uint32_t elapsed = 0; elapsed < FDS_SYNC_TIMEOUT_MS; elapsed++) {
+    for (uint32_t elapsed = 0; elapsed < FDS_SYNC_OPERATION_TIMEOUT_MS; elapsed++) {
         bool complete;
         ret_code_t result;
 

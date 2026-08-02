@@ -1,6 +1,7 @@
 #include <stdlib.h>
 
 #include "nfc_mf0_ntag.h"
+#include "ntag_mirror_internal.h"
 #include "nfc_14a.h"
 #include "fds_util.h"
 #include "tag_persistence.h"
@@ -519,18 +520,6 @@ uint8_t *nfc_tag_mf0_ntag_get_counter_data_by_index(uint8_t index) {
     return get_counter_data_by_index(index, false);
 }
 
-static char hex_digit(int n) {
-    if (n < 10) return '0' + n;
-    else return 'A' + n - 10;
-}
-
-static void bytes2hex(const uint8_t *bytes, char *hex, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        *hex++ = hex_digit(bytes[i] >> 4);
-        *hex++ = hex_digit(bytes[i] & 0x0F);
-    }
-}
-
 static void handle_any_read(uint8_t block_num, uint8_t block_cnt, uint8_t block_max) {
     ASSERT(block_cnt <= block_max);
 
@@ -546,7 +535,7 @@ static void handle_any_read(uint8_t block_num, uint8_t block_cnt, uint8_t block_
     int mirror_byte_off = 0;
     int mirror_mode = 0;
     int mirror_size = 0;
-    uint8_t mirror_buf[MIRROR_UID_CNT_SIZE];
+    uint8_t mirror_buf[MIRROR_UID_CNT_SIZE] = {0};
     if (is_ntag()) {
         uint8_t mirror = m_tag_information->memory[first_cfg_page][CONF_MIRROR_BYTE];
         mirror_page_off = m_tag_information->memory[first_cfg_page][CONF_MIRROR_PAGE_BYTE];
@@ -577,15 +566,17 @@ static void handle_any_read(uint8_t block_num, uint8_t block_cnt, uint8_t block_
 
                 switch (mirror_mode) {
                     case MIRROR_CONF_UID:
-                        bytes2hex(m_tag_information->res_coll.uid, (char *)mirror_buf, 7);
+                        ntag_mirror_render_uid(m_tag_information->res_coll.uid, mirror_buf);
                         break;
                     case MIRROR_CONF_CNT:
-                        bytes2hex(get_counter_data_by_index(0, false), (char *)mirror_buf, 3);
+                        ntag_mirror_render_counter(get_counter_data_by_index(0, false), mirror_buf);
                         break;
                     case MIRROR_CONF_UID_CNT:
-                        bytes2hex(m_tag_information->res_coll.uid, (char *)mirror_buf, 7);
-                        mirror_buf[7] = 'x';
-                        bytes2hex(get_counter_data_by_index(0, false), (char *)&mirror_buf[8], 3);
+                        ntag_mirror_render_uid_counter(
+                            m_tag_information->res_coll.uid,
+                            get_counter_data_by_index(0, false),
+                            mirror_buf
+                        );
                         break;
                 }
             }
@@ -605,25 +596,14 @@ static void handle_any_read(uint8_t block_num, uint8_t block_cnt, uint8_t block_
 
         // apply mirroring if needed
         if ((mirror_page_off > 0) && (mirror_size > 0) && (block_to_read >= mirror_page_off) && (block_to_read < mirror_page_end)) {
-            // When accessing the first page that includes mirrored data the offset into the mirror buffer is
-            // definitely zero. Later pages need to account for the offset in the first page. Offset in the
-            // destination page chunk will be zero however.
-            int mirror_buf_off = (block_to_read - mirror_page_off) * NFC_TAG_MF0_NTAG_DATA_SIZE;
-            int offset_in_cur_block = mirror_byte_off;
-            if (mirror_buf_off != 0) {
-                mirror_buf_off -= mirror_byte_off;
-                offset_in_cur_block = 0;
-            }
-
-            int mirror_copy_size = mirror_size - mirror_buf_off;
-            if (mirror_copy_size > NFC_TAG_MF0_NTAG_DATA_SIZE) mirror_copy_size = NFC_TAG_MF0_NTAG_DATA_SIZE;
-
-            // Ensure we don't corrupt memory here.
-            ASSERT(offset_in_cur_block < NFC_TAG_MF0_NTAG_DATA_SIZE);
-            ASSERT(mirror_buf_off <= sizeof(mirror_buf));
-            ASSERT(mirror_copy_size <= (sizeof(mirror_buf) - mirror_buf_off));
-
-            memcpy(&tx_buf_ptr[offset_in_cur_block], &mirror_buf[mirror_buf_off], mirror_copy_size);
+            ntag_mirror_overlay_page(
+                tx_buf_ptr,
+                block_to_read,
+                (uint8_t)mirror_page_off,
+                (uint8_t)mirror_byte_off,
+                mirror_buf,
+                (size_t)mirror_size
+            );
         }
     }
 
@@ -1220,6 +1200,14 @@ int nfc_tag_mf0_ntag_data_savecb(tag_specific_type_t type, tag_data_buffer_t *bu
     } else {
         ASSERT(false);
         return 0;
+    }
+}
+
+void nfc_tag_mf0_ntag_data_save_failcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
+    (void)buffer;
+    if (m_tag_type == type && m_tag_information != NULL &&
+            m_tag_information->config.mode_block_write == NFC_TAG_MF0_NTAG_WRITE_SHADOW) {
+        m_tag_information->config.mode_block_write = NFC_TAG_MF0_NTAG_WRITE_SHADOW_REQ;
     }
 }
 

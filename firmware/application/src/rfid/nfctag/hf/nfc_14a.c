@@ -13,6 +13,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "crc_utils.h"
 #include "nfc_mf1.h"
 #include "byte_mirror.h"
+#include "nfc_14a_frame_internal.h"
 
 #include "rfid_main.h"
 #include "syssleep.h"
@@ -231,49 +232,7 @@ uint8_t nfc_tag_14a_wrap_frame(const uint8_t *pbtTx, const size_t szTxBits, cons
 * @retval :The data length of the bitstream packaging, note that the length of the data area is the length of the data area.retval / 8
 */
 size_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBits, uint8_t *pbtRx, uint8_t *pbtRxPar) {
-    uint8_t btFrame;
-    uint8_t btData;
-    uint8_t uiBitPos;
-    uint32_t uiDataPos = 0;
-    uint8_t *pbtFramePos = (uint8_t *)pbtFrame;
-    size_t szBitsLeft = szFrameBits;
-    size_t szRxBits = 0;
-
-    // Make sure we should frame at least something
-    if (szBitsLeft == 0)
-        return 0;
-
-    // Handle a short response (1byte) as a special case
-    if (szBitsLeft < 9) {
-        *pbtRx = *pbtFrame;
-        szRxBits = szFrameBits;
-        return szRxBits;
-    }
-
-    // Calculate the data length in bits
-    szRxBits = szFrameBits - (szFrameBits / 9);
-
-    // Parse the frame bytes, remove the parity bits and store them in the parity array
-    // This process is the reverse of WrapFrame(), look there for more info
-    while (1) {
-        for (uiBitPos = 0; uiBitPos < 8; uiBitPos++) {
-            btFrame = byte_mirror[pbtFramePos[uiDataPos]];
-            btData = (btFrame << uiBitPos);
-            btFrame = byte_mirror[pbtFramePos[uiDataPos + 1]];
-            btData |= (btFrame >> (8 - uiBitPos));
-            pbtRx[uiDataPos] = byte_mirror[btData];
-            if (pbtRxPar != NULL)
-                pbtRxPar[uiDataPos] = ((btFrame >> (7 - uiBitPos)) & 0x01);
-            // Increase the data (without parity bit) position
-            uiDataPos++;
-            // Test if we are done
-            if (szBitsLeft < 9)
-                return szRxBits;
-            szBitsLeft -= 9;
-        }
-        // Every 8 data bytes we lose one frame byte to the parities
-        pbtFramePos++;
-    }
+    return nfc_tag_14a_unwrap_frame_checked(pbtFrame, szFrameBits, pbtRx, pbtRxPar);
 }
 
 /**

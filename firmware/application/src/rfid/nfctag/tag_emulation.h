@@ -20,6 +20,7 @@ typedef struct {
     uint16_t actual_length; // bytes supplied by the current record/load
     uint8_t *buffer;
     uint16_t *crc;
+    bool crc_valid;         // baseline came from a successful load/write
 } tag_data_buffer_t;
 
 // Farming impact enable and closed energy switching function
@@ -28,6 +29,8 @@ typedef void (*tag_sense_switch_t)(bool enable);
 typedef int (*tag_datas_loadcb_t)(tag_specific_type_t type, tag_data_buffer_t *buffer);
 // The data should be saved to the registered person before Flash
 typedef int (*tag_datas_savecb_t)(tag_specific_type_t type, tag_data_buffer_t *buffer);
+// Roll back protocol state changed while preparing a write that FDS rejected.
+typedef void (*tag_datas_save_failcb_t)(tag_specific_type_t type, tag_data_buffer_t *buffer);
 // Data factory initialization function
 typedef bool (*tag_datas_factory_t)(uint8_t slot, tag_specific_type_t type);
 
@@ -37,9 +40,17 @@ typedef struct {
     tag_specific_type_t tag_type;
     tag_datas_loadcb_t data_on_load;
     tag_datas_savecb_t data_on_save;
+    tag_datas_save_failcb_t data_on_save_fail;
     tag_datas_factory_t data_factory;
     tag_data_buffer_t *data_buffer;
 } tag_base_handler_map_t;
+
+typedef enum {
+    TAG_SNAPSHOT_SAVE_OK = 0,
+    TAG_SNAPSHOT_SAVE_INVALID_STATE,
+    TAG_SNAPSHOT_SAVE_WRITE_MODE,
+    TAG_SNAPSHOT_SAVE_FLASH_FAIL,
+} tag_snapshot_save_result_t;
 
 /**
  * The storage configuration of parameters such as the type of card emulated in the card slot
@@ -78,7 +89,14 @@ STATIC_ASSERT(sizeof(tag_slot_config_t) == TAG_SLOT_CONFIG_CURRENT_SIZE);
 // The most basic emulation card initialization program
 void tag_emulation_init(void);
 // Some of the data stored in RAM can be saved to Flash through this interface
-void tag_emulation_save(void);
+bool tag_emulation_save(void);
+
+// Freeze the exact active MIFARE Classic HF buffer while a host snapshots it.
+bool tag_emulation_snapshot_begin(uint8_t *slot, tag_specific_type_t *tag_type,
+                                  uint32_t *owner_generation);
+tag_snapshot_save_result_t tag_emulation_snapshot_save(uint8_t slot, tag_specific_type_t tag_type);
+void tag_emulation_snapshot_release(void);
+bool tag_emulation_snapshot_is_active(void);
 
 // Starting and ending of the emulation card
 void tag_emulation_load_data(void);
@@ -88,13 +106,14 @@ void tag_emulation_sense_end(void);
 // Farming response enable state switching package function
 void tag_emulation_sense_switch(tag_sense_type_t type, bool enable);
 // Delete the type of card specified in the card slot
-void tag_emulation_delete_data(uint8_t slot, tag_sense_type_t sense_type);
+bool tag_emulation_delete_data(uint8_t slot, tag_sense_type_t sense_type);
 // Initial data of the factory data of the specified card slot into the factory of the specified type of card
 bool tag_emulation_factory_data(uint8_t slot, tag_specific_type_t tag_type);
 // Change the type of the card that is being emulated
 void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type);
 // Load the data from the memory to the emulation card buffer
 bool tag_emulation_load_by_buffer(tag_specific_type_t tag_type, bool update_crc);
+bool tag_emulation_is_active_type_loaded(tag_specific_type_t tag_type);
 
 tag_sense_type_t get_sense_type_from_tag_type(tag_specific_type_t type);
 tag_data_buffer_t *get_buffer_by_tag_type(tag_specific_type_t type);
@@ -104,7 +123,7 @@ void tag_emulation_set_slot(uint8_t index);
 // Get the card slot currently used
 uint8_t tag_emulation_get_slot(void);
 // Switch the card slot to control whether the passing parameter control is closed during the switching period to listen to
-void tag_emulation_change_slot(uint8_t index, bool sense_disable);
+bool tag_emulation_change_slot(uint8_t index, bool sense_disable);
 // Get the card slot to enable the state
 bool is_slot_enabled(uint8_t slot, tag_sense_type_t sense_type);
 // Set the card slot to enable

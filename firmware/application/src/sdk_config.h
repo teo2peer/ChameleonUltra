@@ -431,7 +431,7 @@
 
 
 #ifndef BLE_HIDS_ENABLED
-#define BLE_HIDS_ENABLED 0
+#define BLE_HIDS_ENABLED 1
 #endif
 
 // <q> BLE_HRS_C_ENABLED  - ble_hrs_c - Heart Rate Service Client
@@ -6675,7 +6675,7 @@
 // <e> APP_USBD_HID_ENABLED - app_usbd_hid - USB HID class
 //==========================================================
 #ifndef APP_USBD_HID_ENABLED
-#define APP_USBD_HID_ENABLED 0
+#define APP_USBD_HID_ENABLED 1
 #endif
 // <o> APP_USBD_HID_DEFAULT_IDLE_RATE - Default idle rate for HID class.   <0-255>
 
@@ -6708,7 +6708,7 @@
 
 
 #ifndef APP_USBD_HID_KBD_ENABLED
-#define APP_USBD_HID_KBD_ENABLED 0
+#define APP_USBD_HID_KBD_ENABLED 1
 #endif
 
 // <q> APP_USBD_HID_MOUSE_ENABLED  - app_usbd_hid_mouse - USB HID mouse

@@ -43,5 +43,8 @@ data_frame_tx_t *cmd_processor_ble_flood_count(uint16_t cmd, uint16_t status, ui
 data_frame_tx_t *cmd_processor_ble_kick(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data);
 data_frame_tx_t *cmd_processor_ble_adv_flood_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data);
 data_frame_tx_t *cmd_processor_ble_adv_flood_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data);
+data_frame_tx_t *cmd_processor_ble_adv_lab_start(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data);
+data_frame_tx_t *cmd_processor_ble_adv_lab_status(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data);
+data_frame_tx_t *cmd_processor_ble_adv_lab_stop(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data);
 
 #endif

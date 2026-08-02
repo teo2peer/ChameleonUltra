@@ -12,8 +12,14 @@ sys.path.append(CURRENT_DIR.rsplit(os.sep, 1)[0])
 from emv_trace import (  # noqa: E402
     ApduPayload,
     AppPayload,
+    BEHAVIOR_ADAPTIVE_PROFILES,
+    BEHAVIOR_DIRECT_AID_FALLBACK,
+    BEHAVIOR_REACQUIRE_PROFILES,
     EmvTraceError,
     EmvTraceRequest,
+    PROFILE_CUSTOM,
+    PROFILE_SWEEP,
+    POLLING_PATIENT,
     RfPayload,
     SummaryPayload,
     download_emv_trace,
@@ -81,17 +87,47 @@ class TestEmvTraceEncoding(unittest.TestCase):
         self.assertEqual(encode_meta_request(0x01020304),
                          bytes.fromhex("0101020304"))
         self.assertEqual(encode_get_request(0x01020304, 0x05060708, 0x1234),
-                         bytes.fromhex("0101020304050607081234"))
+                          bytes.fromhex("0101020304050607081234"))
+
+    def test_express_transit_option_uses_reserved_v1_bit(self):
+        encoded = encode_start_request(EmvTraceRequest(flags=0x40))
+        self.assertEqual(len(encoded), 25)
+        self.assertEqual(encoded[:2], bytes.fromhex("0140"))
+
+    def test_extended_terminal_profiles_are_explicit(self):
+        sweep = encode_start_request(EmvTraceRequest(
+            flags=0x40, terminal_profile=PROFILE_SWEEP))
+        self.assertEqual(len(sweep), 30)
+        self.assertEqual(sweep[:2], bytes.fromhex("01c0"))
+        self.assertEqual(sweep[25:], bytes.fromhex("ff00000000"))
+
+        custom = encode_start_request(EmvTraceRequest(
+            terminal_profile=PROFILE_CUSTOM,
+            custom_ttq=bytes.fromhex("12345678")))
+        self.assertEqual(custom[25:], bytes.fromhex("fe12345678"))
+
+        adaptive = encode_start_request(EmvTraceRequest(
+            terminal_profile=PROFILE_SWEEP,
+            polling_profile=POLLING_PATIENT,
+            behavior=BEHAVIOR_DIRECT_AID_FALLBACK |
+                     BEHAVIOR_ADAPTIVE_PROFILES |
+                     BEHAVIOR_REACQUIRE_PROFILES))
+        self.assertEqual(len(adaptive), 35)
+        self.assertEqual(adaptive[25:], bytes.fromhex("ff000000000307000000"))
 
     def test_invalid_request_fields_are_rejected(self):
         invalid = [
-            EmvTraceRequest(flags=0x40),
+            EmvTraceRequest(flags=0x80),
             EmvTraceRequest(max_aids=17),
             EmvTraceRequest(max_records=65),
             EmvTraceRequest(max_apdus=513),
             EmvTraceRequest(budget_ms=30001),
             EmvTraceRequest(amount=b"short"),
             EmvTraceRequest(cryptogram_type=1),
+            EmvTraceRequest(terminal_profile=7),
+            EmvTraceRequest(terminal_profile=PROFILE_CUSTOM, custom_ttq=b"bad"),
+            EmvTraceRequest(behavior=0x80),
+            EmvTraceRequest(polling_profile=4),
         ]
         for request in invalid:
             with self.subTest(request=request), self.assertRaises(EmvTraceError):
