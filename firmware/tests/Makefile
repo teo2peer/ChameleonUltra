@@ -29,6 +29,7 @@ TESTS := \
 	$(BUILD_DIR)/test_crc_utils \
 	$(BUILD_DIR)/test_circular_buffer \
 	$(BUILD_DIR)/test_dataframe \
+	$(BUILD_DIR)/test_hf_capture \
 	$(BUILD_DIR)/test_iso_dep_reader \
 	$(BUILD_DIR)/test_lf_helpers
 
@@ -53,6 +54,9 @@ $(BUILD_DIR)/test_circular_buffer: test_circular_buffer.c $(LF_UTILS)/circular_b
 
 $(BUILD_DIR)/test_dataframe: test_dataframe.c $(APP_SRC)/utils/dataframe.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/test_hf_capture: test_hf_capture.c $(APP_SRC)/rfid/hf_capture.c | $(BUILD_DIR)
+	$(CC) -DHF_CAPTURE_TEST -Icapture_stubs $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/test_iso_dep_reader: test_iso_dep_reader.c $(HF_READER)/iso_dep_reader.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@

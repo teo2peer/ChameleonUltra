@@ -36,6 +36,7 @@ static bool m_reader_is_init = false;
 static uint16_t g_com_timeout_ms = DEF_COM_TIMEOUT;
 static autotimer *g_timeout_auto_timer;
 static pcd_14a_trace_cb_t m_trace_callback;
+static pcd_14a_trace_cb_t m_capture_trace_callback;
 static bool m_trace_inside_bits;
 
 void pcd_14a_reader_trace_set(pcd_14a_trace_cb_t callback) {
@@ -45,6 +46,23 @@ void pcd_14a_reader_trace_set(pcd_14a_trace_cb_t callback) {
 void pcd_14a_reader_trace_clear(void) {
     m_trace_callback = NULL;
     m_trace_inside_bits = false;
+}
+
+void pcd_14a_reader_capture_set(pcd_14a_trace_cb_t callback) {
+    m_capture_trace_callback = callback;
+}
+
+void pcd_14a_reader_capture_clear(void) {
+    m_capture_trace_callback = NULL;
+}
+
+static void trace_emit(bool tx, const uint8_t *data, uint16_t bit_length,
+                       uint8_t status) {
+    if (m_trace_callback != NULL) m_trace_callback(tx, data, bit_length, status);
+    if (m_capture_trace_callback != NULL &&
+            m_capture_trace_callback != m_trace_callback) {
+        m_capture_trace_callback(tx, data, bit_length, status);
+    }
 }
 
 // RC522 SPI
@@ -341,8 +359,9 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
     if (pOutLenBit != NULL) *pOutLenBit = 0;
     m_spi_failed = false;
 
-    if (!m_trace_inside_bits && m_trace_callback != NULL && pIn != NULL && InLenByte > 0u) {
-        m_trace_callback(true, pIn, (uint16_t)InLenByte * 8u, STATUS_HF_TAG_OK);
+    if (Command == PCD_TRANSCEIVE && !m_trace_inside_bits &&
+            pIn != NULL && InLenByte > 0u) {
+        trace_emit(true, pIn, (uint16_t)InLenByte * 8u, STATUS_HF_TAG_OK);
     }
 
     switch (Command) {
@@ -461,9 +480,9 @@ uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command, uint8_t *pIn, uint8_t InL
         clear_register_mask(Status2Reg, 0x08);
     }
 
-    if (!m_trace_inside_bits && m_trace_callback != NULL && pOutLenBit != NULL) {
-        m_trace_callback(false, *pOutLenBit > 0u ? pOut : NULL,
-                         *pOutLenBit, status);
+    if (Command == PCD_TRANSCEIVE && !m_trace_inside_bits &&
+            pOutLenBit != NULL) {
+        trace_emit(false, *pOutLenBit > 0u ? pOut : NULL, *pOutLenBit, status);
     }
     // NRF_LOG_INFO("Com status: %d\n", status);
     return status;
@@ -525,8 +544,8 @@ uint8_t pcd_14a_reader_bits_transfer(uint8_t *pTx, uint16_t  szTxBits, uint8_t *
     set_register_mask(BitFramingReg, modulus);  // Set the last byte transmission n bit
     set_register_mask(MfRxReg, 0x10);  // Need to close the puppet school test to enable
 
-    if (m_trace_callback != NULL && pTx != NULL && szTxBits > 0u) {
-        m_trace_callback(true, pTx, szTxBits, STATUS_HF_TAG_OK);
+    if (pTx != NULL && szTxBits > 0u) {
+        trace_emit(true, pTx, szTxBits, STATUS_HF_TAG_OK);
     }
     m_trace_inside_bits = true;
     status = pcd_14a_reader_bytes_transfer(
@@ -545,7 +564,7 @@ uint8_t pcd_14a_reader_bits_transfer(uint8_t *pTx, uint16_t  szTxBits, uint8_t *
     // Simply judge the length of data transmission
     if (status != STATUS_HF_TAG_OK) {
         // NRF_LOG_INFO("pcd_14a_reader_bytes_transfer error status: %d\n", status);
-        if (m_trace_callback != NULL) m_trace_callback(false, NULL, 0, status);
+        trace_emit(false, NULL, 0, status);
         return status;
     }
 
@@ -576,8 +595,8 @@ uint8_t pcd_14a_reader_bits_transfer(uint8_t *pTx, uint16_t  szTxBits, uint8_t *
         }
         *pRxLenBit = decoded_bits;
     }
-    if (m_trace_callback != NULL && pRx != NULL && *pRxLenBit > 0u) {
-        m_trace_callback(false, pRx, *pRxLenBit, STATUS_HF_TAG_OK);
+    if (pRx != NULL && *pRxLenBit > 0u) {
+        trace_emit(false, pRx, *pRxLenBit, STATUS_HF_TAG_OK);
     }
     return STATUS_HF_TAG_OK;
 }

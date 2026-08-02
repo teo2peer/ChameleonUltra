@@ -349,6 +349,7 @@ LIB_FILES += \
 ifeq	(${CURRENT_DEVICE_TYPE}, ${CHAMELEON_ULTRA})
 # Append reader module source code to compile list.
   SRC_FILES +=\
+    $(PROJ_DIR)/rfid/hf_capture.c \
     $(PROJ_DIR)/rfid/reader/hf/mf1_toolbox.c \
     $(PROJ_DIR)/rfid/reader/hf/rc522.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_125khz_radio.c \

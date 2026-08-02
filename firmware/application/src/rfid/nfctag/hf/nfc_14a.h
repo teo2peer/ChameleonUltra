@@ -84,21 +84,29 @@ typedef struct {
 typedef void (*nfc_tag_14a_reset_handler_t)(void);
 typedef void (*nfc_tag_14a_activation_handler_t)(uint8_t fsdi, uint8_t cid);
 
-/* Sniff callback — called for every received frame before the tag handler.
- * data    : raw frame bytes (after parity strip)
- * szBits  : number of bits received */
-typedef void (*nfc_tag_14a_sniff_cb_t)(const uint8_t *data, uint16_t szBits);
+#define NFC_TAG_14A_TRACE_FLAG_PARITY_PACKED 0x01u
+#define NFC_TAG_14A_TRACE_FLAG_CRC_AUTO       0x02u
+
+/* Sniff callback called before the tag handler. Flags describe the buffer
+ * representation; callers must not infer parity from the bit length. */
+typedef void (*nfc_tag_14a_sniff_cb_t)(const uint8_t *data, uint16_t szBits,
+                                      uint8_t flags);
 
 void nfc_tag_14a_set_sniff_cb(nfc_tag_14a_sniff_cb_t cb);
 void nfc_tag_14a_clear_sniff_cb(void);
 
-/* TX sniff callback — fires at TX_FRAMESTART with the frame the tag is about
- * to send (card→reader direction).  Same signature as the RX sniff callback.
+/* TX sniff callback — fires immediately after TX is scheduled with the frame
+ * the tag is sending (card→reader direction). Same signature as RX.
  * Install alongside nfc_tag_14a_set_sniff_cb() to capture both directions. */
-typedef void (*nfc_tag_14a_tx_sniff_cb_t)(const uint8_t *data, uint16_t szBits);
+typedef void (*nfc_tag_14a_tx_sniff_cb_t)(const uint8_t *data, uint16_t szBits,
+                                         uint8_t flags);
 
 void nfc_tag_14a_set_tx_sniff_cb(nfc_tag_14a_tx_sniff_cb_t cb);
 void nfc_tag_14a_clear_tx_sniff_cb(void);
+
+typedef void (*nfc_tag_14a_field_sniff_cb_t)(bool present);
+void nfc_tag_14a_set_field_sniff_cb(nfc_tag_14a_field_sniff_cb_t cb);
+void nfc_tag_14a_clear_field_sniff_cb(void);
 
 /* Passive sniff mode: when true, suppresses all CU anticollision responses
  * (ATQA, UID, SAK) so the CU does not collide with real cards in the field.

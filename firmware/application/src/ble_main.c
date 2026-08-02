@@ -33,6 +33,7 @@
 #include "app_cmd.h"
 #include "rfid_main.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
+#include "hf_capture.h"
 #include "iso_dep_session.h"
 #endif
 
@@ -450,6 +451,7 @@ static void nus_data_handler(ble_nus_evt_t *p_evt) {
     if (p_evt->type == BLE_NUS_EVT_COMM_STOPPED) {
         runtime_undercover_revoke();
 #if defined(PROJECT_CHAMELEON_ULTRA)
+        hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
         iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
         app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_BLE);
@@ -760,6 +762,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
                 break;
             }
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
             app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_BLE);
@@ -793,6 +796,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             NRF_LOG_INFO("Disconnected");
             runtime_undercover_revoke();
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
             app_cmd_transport_disconnected(DATA_FRAME_TRANSPORT_BLE);

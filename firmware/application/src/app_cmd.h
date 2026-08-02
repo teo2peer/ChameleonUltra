@@ -38,6 +38,11 @@ static inline uint32_t cmd_read_u32be(const uint8_t *data) {
            ((uint32_t)data[2] << 8) | data[3];
 }
 
+static inline uint64_t cmd_read_u64be(const uint8_t *data) {
+    return ((uint64_t)cmd_read_u32be(data) << 32) |
+           cmd_read_u32be(&data[4]);
+}
+
 static inline bool cmd_parse_count_u8(uint16_t length, uint16_t offset,
                                       uint8_t item_size, uint8_t *count) {
     if (item_size == 0u || length < offset ||
@@ -53,5 +58,6 @@ void on_data_frame_received(uint16_t cmd, uint16_t status, uint16_t length, uint
 void app_cmd_active_slot_snapshot_process(void);
 bool app_cmd_active_slot_snapshot_is_active(void);
 void app_cmd_transport_disconnected(data_frame_transport_t transport);
+void app_cmd_hf_capture_process(void);
 
 #endif

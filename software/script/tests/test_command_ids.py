@@ -30,6 +30,7 @@ HW_CONNECT_C = os.path.normpath(
 # firmware handler. Any addition here needs a concrete protocol reason.
 UNDISPATCHED_COMMANDS = {
     "EM4X05_READSNIFF": "reserved legacy command; no implementation exists",
+    "HF_CAPTURE_EVENT": "unsolicited capture notification; hosts must not request it",
 }
 
 # Unknown response codes remain integers in the client. Keep the firmware-only
