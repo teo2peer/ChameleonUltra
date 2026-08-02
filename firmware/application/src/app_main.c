@@ -46,6 +46,7 @@ NRF_LOG_MODULE_REGISTER();
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 #include "rc522.h"
+#include "hf_capture.h"
 #endif
 
 // Defining soft timers
@@ -811,6 +812,11 @@ static void btn_fn_copy_hf(uint8_t slot, tag_specific_type_t type) {
 
 // fast detect a 14a tag uid to sim
 static void btn_fn_copy_ic_uid(void) {
+    if (hf_capture_is_active()) {
+        NRF_LOG_INFO("Offline copy unavailable during HF capture.")
+        offline_status_error();
+        return;
+    }
     // get 14a tag res buffer;
     uint8_t slot_now = tag_emulation_get_slot();
     tag_slot_specific_type_t tag_types;
@@ -881,6 +887,12 @@ static void btn_fn_ble_restart(void) {
 }
 
 static void run_button_function_by_settings(settings_button_function_t sbf) {
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    if (hf_capture_is_active() && sbf != SettingsButtonShowBattery) {
+        NRF_LOG_INFO("RF button action unavailable during HF capture.")
+        return;
+    }
+#endif
     switch (sbf) {
         case SettingsButtonCycleSlot:
             cycle_slot(false);
@@ -1126,6 +1138,9 @@ int main(void) {
         lf_tag_emulation_process();
         // Data pack process
         data_frame_process();
+#if defined(PROJECT_CHAMELEON_ULTRA)
+        app_cmd_hf_capture_process();
+#endif
         // Log print process
         while (NRF_LOG_PROCESS());
         // USB event process
@@ -1135,6 +1150,14 @@ int main(void) {
         // No task to process, system sleep enter.
         // If system idle sometime, we can enter deep sleep state.
         // Some task process done, we can enter cpu sleep state.
+#if defined(PROJECT_CHAMELEON_ULTRA)
+        if (hf_capture_prevents_system_off()) {
+            nrf_pwr_mgmt_run();
+        } else {
+            sleep_system_run(system_off_enter, nrf_pwr_mgmt_run);
+        }
+#else
         sleep_system_run(system_off_enter, nrf_pwr_mgmt_run);
+#endif
     }
 }

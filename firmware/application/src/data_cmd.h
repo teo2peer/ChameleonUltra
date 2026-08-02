@@ -96,6 +96,11 @@
 #define DATA_CMD_HF14A_GET_CONFIG               (2200)
 #define DATA_CMD_HF14A_SET_CONFIG               (2201)
 #define DATA_CMD_HF14A_SNIFF                    (2020)
+#define DATA_CMD_HF_CAPTURE_START               (2021)
+#define DATA_CMD_HF_CAPTURE_STATUS              (2022)
+#define DATA_CMD_HF_CAPTURE_GET                 (2023)
+#define DATA_CMD_HF_CAPTURE_STOP                (2024)
+#define DATA_CMD_HF_CAPTURE_EVENT               (2025)  /* unsolicited notification; no request handler */
 
 //
 // ******************************************************************

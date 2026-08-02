@@ -5,6 +5,7 @@
 #include "keyboard_hid.h"
 #include "settings.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
+#include "hf_capture.h"
 #include "iso_dep_session.h"
 #endif
 
@@ -138,6 +139,7 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
         case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN: {
             NRF_LOG_INFO("CDC ACM port opened");
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
             g_usb_port_opened = true;
@@ -152,6 +154,7 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const *p_inst, app_usb
         case APP_USBD_CDC_ACM_USER_EVT_PORT_CLOSE:
             NRF_LOG_INFO("CDC ACM port closed");
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
             g_usb_port_opened = false;
@@ -198,6 +201,7 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
         case APP_USBD_EVT_DRV_RESET:
             NRF_LOG_INFO("USB RESET");
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
             keyboard_hid_usb_reset();
@@ -217,6 +221,7 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
         case APP_USBD_EVT_STOPPED:
             NRF_LOG_INFO("USB STOPPED");
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
             g_usb_port_opened = false;
@@ -236,6 +241,7 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
             sleep_timer_start(SLEEP_DELAY_MS_USB_POWER_DISCONNECTED);
             NRF_LOG_INFO("USB power removed");
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_USB);
 #endif
             keyboard_hid_usb_reset();

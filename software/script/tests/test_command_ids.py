@@ -26,6 +26,7 @@ APP_CMD_C = os.path.join(os.path.dirname(DATA_CMD_H), "app_cmd.c")
 # firmware handler. Any addition here needs a concrete protocol reason.
 UNDISPATCHED_COMMANDS = {
     "EM4X05_READSNIFF": "reserved legacy command; no implementation exists",
+    "HF_CAPTURE_EVENT": "unsolicited capture notification; hosts must not request it",
 }
 
 # Unknown response codes remain integers in the client. Keep the firmware-only

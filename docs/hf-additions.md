@@ -1,7 +1,47 @@
 # HF reader additions
 
-Recent additions to the high-frequency (13.56 MHz) reader tooling, reachable
-from the Python CLI in `software/script/`.
+Recent additions to the high-frequency (13.56 MHz) reader tooling and Python
+command layer in `software/script/`. Sections with a CLI command show its syntax.
+
+## Continuous ISO14443-A capture (commands 2021-2025)
+
+Protocol v2 adds a retained 8 KiB firmware ring for long-running capture in tag
+emulation, passive monitor, and active-reader trace modes. Every record carries
+a sequence number, accumulated `app_timer` timestamp, direction, exact bit
+length, representation/error flags, and payload. Metadata exposes observed,
+buffered, and dropped counts plus an overflow flag; sequence numbers advance for
+dropped records so loss cannot be mistaken for a clean trace.
+
+The host retrieves versioned pages with an IEEE CRC32. `HF_CAPTURE_GET` applies
+the previous page's acknowledgement before returning the next page, so clients
+must validate and durably persist a page before acknowledging its final
+sequence and 64-bit delivery token. The token makes duplicate ACKs idempotent
+without confusing a reused 32-bit sequence after wrap. `HF_CAPTURE_STOP` stops RF acquisition without deleting unread data,
+and `HF_CAPTURE_STATUS` rebinds a retained session to a reconnected USB or BLE
+transport. Command 2025 is an unsolicited metadata notification used only to
+wake a draining host; periodic GET remains the correctness fallback.
+
+Metadata includes a random per-boot identifier and the non-zero 32-bit token supplied
+by START. An exact START retry with the same mode, transport, and token returns
+the existing session instead of creating another one. Flutter also binds each active
+manifest to the device chip ID, persists complete wire pages with an additional
+full-file CRC, validates every page before its first reconnect ACK, and drains
+stopped sessions after reconnect. GET uses a separate ACK-present byte so all
+32-bit sequence values remain acknowledgeable after wrap. A new START cannot
+discard unread records, and storage failures stop acquisition before any unsafe
+ACK. Before START, the GUI writes the token and transport type to a pending
+manifest; if the response is lost, capability-checked `STATUS(0)` recovers only
+the matching session on the same USB/BLE transport type. A link loss invalidates
+the owner and suppresses events until STATUS presents that token. On iOS,
+`bluetooth-central` permits eligible BLE background wakeups but
+does not guarantee timer execution or process survival; retained firmware data
+and explicit overflow counters remain the reconnect fallback.
+
+Passive mode never transmits, but one Ultra can guarantee only reader-to-card
+traffic because its NFCT front end cannot simultaneously receive an external
+card's load-modulated response. Reader mode traces RF work initiated by reader
+commands; START does not autonomously poll a card. DESFire/ISO-DEP traffic can be
+captured and decoded, but ordinary traces do not reveal AES or 3DES keys.
 
 ## MIFARE Classic — fast sector read (`hf mf rdsc`)
 

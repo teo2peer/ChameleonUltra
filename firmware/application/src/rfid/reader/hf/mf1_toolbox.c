@@ -1019,15 +1019,47 @@ uint16_t auth_key_use_522_hw(uint8_t block, uint8_t type, uint8_t *key) {
     return pcd_14a_reader_mf1_auth(p_tag_info, type, block, key);
 }
 
-inline void mf1_toolbox_antenna_restart() {
-    pcd_14a_reader_reset();
-    pcd_14a_reader_antenna_on();
-    bsp_delay_ms(8);
-}
-
 inline void mf1_toolbox_report_healthy() {
     bsp_wdt_feed();
     while (NRF_LOG_PROCESS());
+}
+
+static uint16_t mf1_toolbox_check_key_candidates(
+    uint8_t block,
+    uint8_t key_type,
+    mf1_key_t *keys,
+    uint8_t keys_len,
+    bool *tag_selected,
+    uint32_t *cuid,
+    mf1_key_t *found_key
+) {
+    struct Crypto1State crypto = {0, 0};
+
+    for (uint8_t i = 0; i < keys_len; i++) {
+        mf1_toolbox_report_healthy();
+
+        uint16_t status;
+        if (!*tag_selected) {
+            status = pcd_14a_reader_scan_auto(p_tag_info);
+            if (status != STATUS_HF_TAG_OK) return status;
+            *cuid = get_u32_tag_uid(p_tag_info);
+            *tag_selected = true;
+        } else {
+            status = pcd_14a_reader_fast_select(p_tag_info);
+            if (status != STATUS_HF_TAG_OK) return status;
+        }
+
+        status = authex(&crypto, *cuid, block, key_type,
+                        bytes_to_num(keys[i].key, sizeof(keys[i].key)),
+                        AUTH_FIRST, NULL);
+        if (status == STATUS_HF_TAG_OK) {
+            *found_key = keys[i];
+            return STATUS_HF_TAG_OK;
+        }
+        if (status == STATUS_HF_TAG_NO) return status;
+    }
+
+    return STATUS_MF_ERR_AUTH;
 }
 
 uint16_t mf1_toolbox_check_keys_of_sectors(
@@ -1050,7 +1082,8 @@ uint16_t mf1_toolbox_check_keys_of_sectors(
         }
     }
 
-    uint16_t status = STATUS_HF_TAG_OK;
+    uint32_t cuid = 0;
+    bool tag_selected = false;
     bool skipKeyB;
     for (i = 0; i < 40; i++) {
         maskShift = 6 - i % 4 * 2;
@@ -1058,44 +1091,56 @@ uint16_t mf1_toolbox_check_keys_of_sectors(
         trailerNo = i < 32 ? i * 4 + 3 : i * 16 - 369; // trailerNo of sector
         skipKeyB = (maskSector & 0b1) > 0;
         if ((maskSector & 0b10) == 0) {
-            for (j = 0; j < in->keys_len; j++) {
-                mf1_toolbox_report_healthy();
-                if (status != STATUS_HF_TAG_OK) mf1_toolbox_antenna_restart();
-
-                status = auth_key_use_522_hw(trailerNo, PICC_AUTHENT1A, in->keys[j].key);
-                if (status != STATUS_HF_TAG_OK) { // auth failed
-                    if (status == STATUS_HF_TAG_NO) return STATUS_HF_TAG_NO;
-                    continue;
-                }
+            uint16_t status = mf1_toolbox_check_key_candidates(
+                                  trailerNo, PICC_AUTHENT1A,
+                                  in->keys, in->keys_len,
+                                  &tag_selected, &cuid, &out->keys[i][0]);
+            if (status == STATUS_HF_TAG_NO) return status;
+            if (status == STATUS_HF_TAG_OK) {
                 // key A found
                 out->found.b[i / 4] |= 0b10 << maskShift;
-                out->keys[i][0] = in->keys[j];
-                // try to read keyB from trailer of sector
-                status = pcd_14a_reader_mf1_read(trailerNo, trailer);
-                // key B not in trailer
-                if (status != STATUS_HF_TAG_OK || 0 == *(uint64_t *) &trailer[10]) break;
-                // key B found
-                skipKeyB = true;
-                out->found.b[i / 4] |= 0b1 << maskShift;
-                out->keys[i][1] = *(mf1_key_t*)&trailer[10];
-                break;
+                // Software Crypto1 auth does not arm the RC522 cipher. Re-auth
+                // in hardware before reading a potentially exposed Key B.
+                if (!skipKeyB) {
+                    status = pcd_14a_reader_fast_select(p_tag_info);
+                    if (status == STATUS_HF_TAG_NO) return status;
+                    if (status == STATUS_HF_TAG_OK) {
+                        status = pcd_14a_reader_mf1_auth(
+                                     p_tag_info, PICC_AUTHENT1A, trailerNo,
+                                     out->keys[i][0].key);
+                    }
+                    if (status == STATUS_HF_TAG_OK) {
+                        status = pcd_14a_reader_mf1_read(trailerNo, trailer);
+                    }
+                }
+                if (!skipKeyB && status == STATUS_HF_TAG_OK) {
+                    mf1_key_t readable_key_b;
+                    memcpy(readable_key_b.key, &trailer[10],
+                           sizeof(readable_key_b.key));
+                    // Trailer bytes can be data under some access conditions.
+                    // Authenticate before reporting them as a real Key B.
+                    status = mf1_toolbox_check_key_candidates(
+                                 trailerNo, PICC_AUTHENT1B,
+                                 &readable_key_b, 1u,
+                                 &tag_selected, &cuid, &out->keys[i][1]);
+                    if (status == STATUS_HF_TAG_NO) return status;
+                    if (status == STATUS_HF_TAG_OK) {
+                        skipKeyB = true;
+                        out->found.b[i / 4] |= 0b1 << maskShift;
+                    }
+                }
             }
         }
         if (skipKeyB) continue;
 
-        for (j = 0; j < in->keys_len; j++) {
-            mf1_toolbox_report_healthy();
-            if (status != STATUS_HF_TAG_OK) mf1_toolbox_antenna_restart();
-
-            status = auth_key_use_522_hw(trailerNo, PICC_AUTHENT1B, in->keys[j].key);
-            if (status != STATUS_HF_TAG_OK) { // auth failed
-                if (status == STATUS_HF_TAG_NO) return STATUS_HF_TAG_NO;
-                continue;
-            }
+        uint16_t status = mf1_toolbox_check_key_candidates(
+                              trailerNo, PICC_AUTHENT1B,
+                              in->keys, in->keys_len,
+                              &tag_selected, &cuid, &out->keys[i][1]);
+        if (status == STATUS_HF_TAG_NO) return status;
+        if (status == STATUS_HF_TAG_OK) {
             // key B found
             out->found.b[i / 4] |= 0b1 << maskShift;
-            out->keys[i][1] = in->keys[j];
-            break;
         }
     }
 
@@ -1295,40 +1340,14 @@ uint16_t mf1_toolbox_check_keys_on_block(
 ) {
     memset(out, 0, sizeof(mf1_toolbox_check_keys_on_block_out_t));
 
-    struct Crypto1State mpcs = {0, 0};
-    struct Crypto1State *pcs = &mpcs;
-    uint16_t status = STATUS_HF_TAG_OK;
     uint32_t cuid = 0;
-    bool have_uid = false;
-
-    for (int i = 0; i < in->keys_len; i++) {
-        mf1_toolbox_report_healthy();
-
-        if (have_uid == false) {
-            status = pcd_14a_reader_scan_auto(p_tag_info);
-            if (status != STATUS_HF_TAG_OK) {
-                return status;
-            }
-            cuid = get_u32_tag_uid(p_tag_info);
-            have_uid = true;
-        } else {
-            status = pcd_14a_reader_fast_select(p_tag_info);
-            if (status != STATUS_HF_TAG_OK) {
-                return status;
-            }
-        }
-
-        uint32_t nt1 = 0;
-        uint64_t key_u64 = bytes_to_num(in->keys[i].key, 6);
-        status = authex(pcs, cuid, in->block, in->key_type, key_u64, AUTH_FIRST, &nt1);
-        if (status != STATUS_HF_TAG_OK) {
-            if (status == STATUS_HF_TAG_NO) return STATUS_HF_TAG_NO;
-            continue;
-        }
+    bool tag_selected = false;
+    uint16_t status = mf1_toolbox_check_key_candidates(
+                          in->block, in->key_type,
+                          in->keys, in->keys_len,
+                          &tag_selected, &cuid, &out->key);
+    if (status == STATUS_HF_TAG_OK) {
         out->found = 1;
-        out->key = in->keys[i];
-        return STATUS_HF_TAG_OK;
     }
-
-    return STATUS_MF_ERR_AUTH;
+    return status;
 }

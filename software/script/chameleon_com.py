@@ -73,6 +73,7 @@ class ChameleonCom:
         self.transport: Union[serial.Serial, socket.socket, None] = None
         self.transport_type = TransportType.NONE
         self.send_data_queue = queue.Queue()
+        self.unsolicited_response_queue = queue.Queue(maxsize=1)
         self.wait_response_map = {}
         self.event_closing = threading.Event()
 
@@ -128,6 +129,7 @@ class ChameleonCom:
                 self.transport.settimeout(THREAD_BLOCKING_TIMEOUT)
             # clear variable
             self.send_data_queue.queue.clear()
+            self.unsolicited_response_queue.queue.clear()
             self.wait_response_map.clear()
             # Start a sub thread to process data
             self.event_closing.clear()
@@ -280,6 +282,14 @@ class ChameleonCom:
                                 else:
                                     self.wait_response_map[data_cmd]['response'] = Response(data_cmd, data_status,
                                                                                             data_response)
+                            elif data_cmd == Command.HF_CAPTURE_EVENT:
+                                try:
+                                    self.unsolicited_response_queue.get_nowait()
+                                except queue.Empty:
+                                    pass
+                                self.unsolicited_response_queue.put(
+                                    Response(data_cmd, data_status, data_response)
+                                )
                             else:
                                 print(f"No task wait process: ${data_cmd}")
                         else:

@@ -31,6 +31,7 @@
 #include "keyboard_hid.h"
 #include "keyboard_payload.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
+#include "hf_capture.h"
 #include "iso_dep_session.h"
 #endif
 
@@ -406,6 +407,7 @@ static void nus_data_handler(ble_nus_evt_t *p_evt) {
     }
     if (p_evt->type == BLE_NUS_EVT_COMM_STOPPED) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
+        hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
         iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
         m_nus_comm_started = false;
@@ -704,6 +706,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
                 break;
             }
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
             sleep_timer_stop();
@@ -736,6 +739,7 @@ static void ble_evt_handler(ble_evt_t const *p_ble_evt, void *p_context) {
             }
             NRF_LOG_INFO("Disconnected");
 #if defined(PROJECT_CHAMELEON_ULTRA)
+            hf_capture_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
             iso_dep_session_owner_disconnected(DATA_FRAME_TRANSPORT_BLE);
 #endif
             // LED indication will be changed when advertising starts.

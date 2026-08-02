@@ -19,6 +19,7 @@ void delete_bonds_all(void);
 void nus_data_response(uint8_t *p_data, uint16_t length);
 uint32_t nus_data_response_try(const uint8_t *p_data, uint16_t length);
 bool is_nus_working(void);
+bool is_nus_tx_idle(void);
 bool ble_command_link_authorized(void);
 void set_ble_connect_key(uint8_t *key);
 

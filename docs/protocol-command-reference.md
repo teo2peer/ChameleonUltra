@@ -68,7 +68,7 @@ payload[length] | LRC3
 | Rango | Uso | IDs asignados/huecos principales |
 |---|---|---|
 | 1000-1999 | Dispositivo, slots, ajustes, teclado | 1000-1021, 1023-1052; 1022 y 1053-1999 libres |
-| 2000-2999 | Lector HF | 2000-2018, 2020, 2100-2101, 2200-2201 |
+| 2000-2999 | Lector HF | 2000-2018, 2020-2025, 2100-2101, 2200-2201 |
 | 3000-3999 | Lector LF | 3000-3006, 3009-3016, 3018-3020, 3030-3032 |
 | 4000-4999 | Emulación HF | 4000-4001, 4004-4044 |
 | 5000-5999 | Emulación LF | 5000-5013 |
@@ -215,7 +215,7 @@ el campo, el firmware selecciona la tarjeta, ejecuta la operación y apaga RF.
 | 2009 | `MF1_WRITE_ONE_BLOCK` | `key_type, block, key[6], data[16]` | Escribe bloque físico |
 | 2010 | `HF14A_RAW` | `options, timeout_ms:u16be, tx_bits:u16be, tx_data` | Datos RF raw, máximo 64 bytes |
 | 2011 | `MF1_MANIPULATE_VALUE_BLOCK` | `src_type, src_block, src_key[6], op, operand:u32be, dst_type, dst_block, dst_key[6]` | Increment/decrement/restore y transfer |
-| 2012 | `MF1_CHECK_KEYS_OF_SECTORS` | `mask[10], keys[N*6]` | `found_mask[10]` y 80 claves de 6 bytes |
+| 2012 | `MF1_CHECK_KEYS_OF_SECTORS` | `mask[10], keys[N*6]` | `found_mask[10]` y 80 claves de 6 bytes; selección inicial y reselección rápida entre intentos |
 | 2013 | `MF1_HARDNESTED_ACQUIRE` | `slow, known_type, known_block, key[6], target_type, target_block` | Registros de 9 bytes `nt1enc, nt2enc, parity`; sin contador |
 | 2014 | `MF1_ENC_NESTED_ACQUIRE` | `backdoor_key[6], sector_count, start_sector` | `cuid[4]` y 14 bytes por sector (A+B) |
 | 2015 | `MF1_CHECK_KEYS_ON_BLOCK` | `block, key_type, key_count, keys[N*6]` | `found:u8, key[6]` |
@@ -223,6 +223,11 @@ el campo, el firmware selecciona la tarjeta, ejecuta la operación y apaga RF.
 | 2017 | `HF14A_AUTH_TRACE` | `key_type, block, key[6]` y timeout opcional `u16be` | Registros `bits_direction:u16be, frame[...]` |
 | 2018 | `MF1_READ_BLOCKS` | `key_type, start_block, count, key[6]` | 1..16 bloques del mismo sector tras una autenticación |
 | 2020 | `HF14A_SNIFF` | timeout opcional `u16be` | Hasta 3800 bytes de registros de frames; pensado para emulator mode |
+| 2021 | `HF_CAPTURE_START` | `version=2, mode:u8, start_token:u32be` | Metadata v2 de 48 bytes; el token no cero hace idempotente un reintento exacto en el mismo transporte |
+| 2022 | `HF_CAPTURE_STATUS` | `version=2, session_id:u32be, start_token:u32be` | Metadata v2; exige la capacidad exacta antes de reasignar ownership o recuperar ID 0 |
+| 2023 | `HF_CAPTURE_GET` | `version=2, session_id:u32be, ack_present:u8, ack_sequence:u32be, ack_delivery_token:u64be, requested_bytes:u16be` | Respuesta de 72..4096 bytes con CRC32; `requested_bytes` debe ser 605..4096 y el ACK se aplica antes de construirla |
+| 2024 | `HF_CAPTURE_STOP` | `version=2, session_id:u32be` | Detiene RF pero conserva registros no confirmados; devuelve metadata |
+| 2025 | `HF_CAPTURE_EVENT` | Nunca se solicita | Evento no solicitado con metadata v2 cuando hay datos o overflow |
 | 2100 | `HF14A_SET_FIELD_ON` | vacío obligatorio | Enciende y mantiene el campo HF |
 | 2101 | `HF14A_SET_FIELD_OFF` | vacío obligatorio | Aborta sesión ISO-DEP y apaga HF |
 | 2200 | `HF14A_GET_CONFIG` | ignorado | 4 bytes: force BCC, CL2, CL3, RATS |
@@ -231,6 +236,62 @@ el campo, el firmware selecciona la tarjeta, ejecuta la operación y apaga RF.
 Opciones de 2010: `04` check/strip CRC RX, `08` mantener RF, `10`
 auto-select, `20` añadir CRC TX, `40` esperar respuesta, `80` activar RF.
 El tamaño TX máximo es 64 bytes (62 al añadir CRC).
+
+### Captura HF continua 2021-2025
+
+Los modos son `0` emulación, `1` monitor pasivo y `2` trazado lector. El modo
+pasivo no transmite ni entra en la máquina de emulación, pero con un único Ultra
+solo garantiza reader→card: el front-end NFCT no puede observar simultáneamente
+la respuesta de una tarjeta externa. El modo lector registra las operaciones RF
+que ejecuten comandos lectores; START por sí solo no genera sondeos.
+
+Metadata v2, 48 bytes:
+
+```
+version:u8, state:u8, mode:u8, flags:u8,
+session_id:u32be, first_sequence:u32be, next_sequence:u32be,
+stored_records:u32be, observed_records:u32be, dropped_records:u32be,
+used_bytes:u16be, capacity_bytes:u16be, elapsed_ticks:u64be,
+boot_id:u32be, start_token:u32be
+```
+
+`state` es 1 running o 2 stopped. `flags bit0` indica que hubo overflow. Los
+`boot_id` cambia al reiniciar firmware y evita reanudar una sesión homónima de
+otro arranque. `start_token` identifica el intento START que creó la sesión y
+permite distinguir una respuesta perdida de una sesión anterior. Los timestamps
+usan ticks acumulados de `app_timer`; la secuencia avanza incluso
+para registros descartados, de modo que los huecos y `dropped_records` son
+evidencia explícita de pérdida.
+
+Cabecera de página v2, 72 bytes: la metadata anterior seguida de
+`page_first_sequence:u32be, page_next_sequence:u32be, record_count:u16be,
+record_bytes:u16be, crc32:u32be, delivery_token:u64be`. El token usa el rango
+positivo `1..7FFFFFFFFFFFFFFF`. El CRC32 IEEE cubre solo el stream de
+registros. Cada registro es:
+
+```
+body_length:u16be, version:u8, type:u8, sequence:u32be,
+timestamp_ticks:u64be, direction:u8, flags:u8,
+bit_length:u16be, data_length:u16be, data[data_length]
+```
+
+Tipos: 1 frame, 2 cambio de campo. Direcciones: 0 reader→card, 1 card→reader,
+2 evento. Flags de frame: bit0 paridad empaquetada, bit1 CRC añadido por
+hardware y bit2 error RF.
+
+`ack_present=0` no confirma nada y usa secuencia/token cero; con
+`ack_present=1`, el firmware acepta
+únicamente el token de la página entregada más reciente y una secuencia presente
+en su prefijo; entonces elimina los registros hasta ella inclusive, incluida
+`FFFFFFFF`. Repetir el mismo par token/secuencia es idempotente, incluso después
+de reutilizar una secuencia por wrap. El ACK debe enviarse solo después de
+persistir y validar la página completa. GET y STOP rechazan transportes no
+propietarios. STOP conserva datos para el drenaje final y un nuevo START se
+rechaza mientras queden registros. Al perderse el enlace, firmware invalida el
+owner y deja de emitir eventos hasta que STATUS presente el token exacto. Un ID
+de sesión exacto puede reasignar ownership a otro transporte con esa capacidad.
+El ID 0 se reserva para recuperar un START de respuesta incierta y solo funciona
+desde el mismo tipo de transporte que creó la sesión.
 
 ## 3000-3032: lector LF (solo Ultra)
 
@@ -562,7 +623,7 @@ Los siguientes IDs no tienen handler en esta versión:
 ```text
 1022
 1051-1999
-2019, 2021-2099, 2102-2199, 2202-2999
+2019, 2026-2099, 2102-2199, 2202-2999
 3007-3008, 3017, 3021-3029
 3032 (nombre reservado pero sin dispatch), 3033-3999
 4002-4003, 4045-4999

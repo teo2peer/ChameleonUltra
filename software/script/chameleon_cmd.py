@@ -1,5 +1,6 @@
 import struct
 import ctypes
+import secrets
 import zlib
 from typing import Optional, Union
 
@@ -1898,6 +1899,60 @@ class ChameleonCMD:
         payload = bytes([(timeout_ms >> 8) & 0xFF, timeout_ms & 0xFF])
         timeout_s = (timeout_ms // 1000) + 5
         return self.device.send_cmd_sync(Command.HF14A_SNIFF, payload, timeout=timeout_s)
+
+    def hf_capture_start(self, mode: int = 0, start_token: int = None):
+        """Start a continuous HF capture session.
+
+        mode: 0=tag emulation, 1=passive reader-command monitor, 2=active reader trace.
+        """
+        if mode not in (0, 1, 2):
+            raise ValueError("mode must be 0 (emulation), 1 (passive), or 2 (reader)")
+        if start_token is None:
+            start_token = secrets.randbelow(0xFFFFFFFF) + 1
+        if start_token <= 0 or start_token > 0xFFFFFFFF:
+            raise ValueError("start_token must fit in a non-zero unsigned 32-bit integer")
+        return self.device.send_cmd_sync(
+            Command.HF_CAPTURE_START,
+            bytes([2, mode]) + start_token.to_bytes(4, "big"),
+        )
+
+    def hf_capture_status(self, session_id: int, start_token: int):
+        """Read metadata and rebind a retained capture to this transport."""
+        if session_id < 0 or session_id > 0xFFFFFFFF:
+            raise ValueError("session_id must fit in an unsigned 32-bit integer")
+        if start_token <= 0 or start_token > 0xFFFFFFFF:
+            raise ValueError("start_token must fit in a non-zero unsigned 32-bit integer")
+        payload = (bytes([2]) + session_id.to_bytes(4, "big") +
+                   start_token.to_bytes(4, "big"))
+        return self.device.send_cmd_sync(Command.HF_CAPTURE_STATUS, payload)
+
+    def hf_capture_get(self, session_id: int, ack_sequence=None,
+                       ack_delivery_token=None,
+                       requested_bytes: int = 4096):
+        """Get an idempotent capture page and acknowledge a persisted page."""
+        if session_id <= 0 or session_id > 0xFFFFFFFF:
+            raise ValueError("session_id must fit in an unsigned 32-bit integer")
+        if (ack_sequence is None) != (ack_delivery_token is None):
+            raise ValueError("ack_sequence and ack_delivery_token must be supplied together")
+        ack = 0 if ack_sequence is None else ack_sequence
+        if ack < 0 or ack > 0xFFFFFFFF:
+            raise ValueError("ack_sequence must fit in an unsigned 32-bit integer")
+        delivery_token = 0 if ack_delivery_token is None else ack_delivery_token
+        if ack_delivery_token is not None and not 1 <= delivery_token <= 0x7FFFFFFFFFFFFFFF:
+            raise ValueError("ack_delivery_token must fit in a positive signed 64-bit integer")
+        requested_bytes = max(605, min(4096, int(requested_bytes)))
+        payload = (bytes([2]) + session_id.to_bytes(4, "big") +
+                    bytes([ack_sequence is not None]) + ack.to_bytes(4, "big") +
+                    delivery_token.to_bytes(8, "big") +
+                    requested_bytes.to_bytes(2, "big"))
+        return self.device.send_cmd_sync(Command.HF_CAPTURE_GET, payload)
+
+    def hf_capture_stop(self, session_id: int):
+        """Stop RF acquisition while retaining unread capture records."""
+        if session_id <= 0 or session_id > 0xFFFFFFFF:
+            raise ValueError("session_id must fit in an unsigned 32-bit integer")
+        payload = bytes([2]) + session_id.to_bytes(4, "big")
+        return self.device.send_cmd_sync(Command.HF_CAPTURE_STOP, payload)
 
     def hf14a_auth_trace(self, block: int, key_type: int, key: bytes, timeout_ms: int = 5000):
         """

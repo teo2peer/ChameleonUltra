@@ -74,8 +74,9 @@ void nfc_tag_14a_clear_sniff_cb(void) {
     m_sniff_cb = NULL;
 }
 
-/* TX sniff: captures card→reader frames at TX_FRAMESTART */
+/* TX sniff: captures card→reader frames after TX has been scheduled. */
 static nfc_tag_14a_tx_sniff_cb_t m_tx_sniff_cb = NULL;
+static nfc_tag_14a_field_sniff_cb_t m_field_sniff_cb = NULL;
 
 void nfc_tag_14a_set_tx_sniff_cb(nfc_tag_14a_tx_sniff_cb_t cb) {
     m_tx_sniff_cb = cb;
@@ -83,6 +84,14 @@ void nfc_tag_14a_set_tx_sniff_cb(nfc_tag_14a_tx_sniff_cb_t cb) {
 
 void nfc_tag_14a_clear_tx_sniff_cb(void) {
     m_tx_sniff_cb = NULL;
+}
+
+void nfc_tag_14a_set_field_sniff_cb(nfc_tag_14a_field_sniff_cb_t cb) {
+    m_field_sniff_cb = cb;
+}
+
+void nfc_tag_14a_clear_field_sniff_cb(void) {
+    m_field_sniff_cb = NULL;
 }
 
 /* Passive sniff mode: suppress all tag TX responses so the CU does not
@@ -299,6 +308,10 @@ size_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBit
 void nfc_tag_14a_tx_bytes(uint8_t *data, uint32_t bytes, bool appendCrc) {
     if (data == NULL || bytes == 0 || bytes > MAX_NFC_TX_BUFFER_SIZE) return;
     NFC_14A_TX_BYTE_CORE(data, bytes, appendCrc, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
+    if (m_tx_sniff_cb != NULL) {
+        m_tx_sniff_cb(m_nfc_tx_buffer, (uint16_t)(bytes * 8u),
+                      appendCrc ? NFC_TAG_14A_TRACE_FLAG_CRC_AUTO : 0u);
+    }
 }
 
 /**
@@ -329,6 +342,10 @@ void nfc_tag_14a_tx_bits(uint8_t *data, uint32_t bits) {
     m_is_responded = true;
     memcpy(m_nfc_tx_buffer, data, bytes);
     NFC_14A_TX_BITS_CORE(bits, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
+    if (m_tx_sniff_cb != NULL) {
+        m_tx_sniff_cb(m_nfc_tx_buffer, (uint16_t)bits,
+                      bits >= 9u ? NFC_TAG_14A_TRACE_FLAG_PARITY_PACKED : 0u);
+    }
 }
 
 /**@brief The function of sending n bits is implemented, and this implementation is automatically sent SOF
@@ -341,6 +358,9 @@ void nfc_tag_14a_tx_nbit(uint8_t data, uint32_t bits) {
     m_is_responded = true;
     m_nfc_tx_buffer[0] = data;
     NFC_14A_TX_BITS_CORE(bits, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
+    if (m_tx_sniff_cb != NULL) {
+        m_tx_sniff_cb(m_nfc_tx_buffer, (uint16_t)bits, 0u);
+    }
 }
 
 /**
@@ -369,8 +389,12 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
 
     /* Sniff hook — fire before any tag response logic */
     if (m_sniff_cb != NULL) {
-        m_sniff_cb(p_data, szDataBits);
+        m_sniff_cb(p_data, szDataBits,
+                   szDataBits >= 9u ? NFC_TAG_14A_TRACE_FLAG_PARITY_PACKED : 0u);
     }
+    /* A passive monitor must never enter the emulation state machine: later
+     * handlers can transmit RATS/APDU or tag-specific responses. */
+    if (m_sniff_passive) return;
     // Manually draw frame, separate data and strange school inspection
 #if !NFC_TAG_14A_RX_PARITY_AUTO_DEL_ENABLE
     if (szDataBits >= 9) {
@@ -663,6 +687,7 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
     // Select action to process.
     switch (p_event->evt_id) {
         case NRFX_NFCT_EVT_FIELD_DETECTED: {
+            if (m_field_sniff_cb != NULL) m_field_sniff_cb(true);
             sleep_timer_stop();
 
             g_is_tag_emulating = true;
@@ -688,6 +713,7 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             break;
         }
         case NRFX_NFCT_EVT_FIELD_LOST: {
+            if (m_field_sniff_cb != NULL) m_field_sniff_cb(false);
             g_is_tag_emulating = false;
             // call sleep_timer_start *after* unsetting g_is_tag_emulating
             sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
@@ -706,20 +732,6 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             break;
         }
         case NRFX_NFCT_EVT_TX_FRAMESTART: {
-            // NRF_LOG_INFO("TX start.\n");
-            if (m_tx_sniff_cb != NULL) {
-                uint32_t amt  = NRF_NFCT->TXD.AMOUNT;
-                uint16_t tx_bytes = (amt >> NFCT_TXD_AMOUNT_TXDATABYTES_Pos)
-                                    & (NFCT_TXD_AMOUNT_TXDATABYTES_Msk >> NFCT_TXD_AMOUNT_TXDATABYTES_Pos);
-                uint16_t tx_bits_rem = (amt >> NFCT_TXD_AMOUNT_TXDATABITS_Pos)
-                                       & (NFCT_TXD_AMOUNT_TXDATABITS_Msk >> NFCT_TXD_AMOUNT_TXDATABITS_Pos);
-                uint16_t tx_bits = (tx_bits_rem > 0)
-                                   ? ((tx_bytes - 1) * 8 + tx_bits_rem)
-                                   : (tx_bytes * 8);
-                if (tx_bits > 0 && tx_bytes <= MAX_NFC_TX_BUFFER_SIZE) {
-                    m_tx_sniff_cb(m_nfc_tx_buffer, tx_bits);
-                }
-            }
             break;
         }
         case NRFX_NFCT_EVT_TX_FRAMEEND: {

@@ -32,14 +32,9 @@
 #include "emv_trace.h"
 #include "mf1_crapto1.h"
 #include "parity.h"
+#include "hf_capture.h"
 #endif
 #include "nfc_14a.h"
-/* Forward declarations for functions added to nfc_14a.c/h in this PR.
- * These are declared here to avoid build failure if nfc_14a.h is not yet
- * updated on the build system. */
-extern void nfc_tag_14a_set_tx_sniff_cb(void (*cb)(const uint8_t *, uint16_t));
-extern void nfc_tag_14a_clear_tx_sniff_cb(void);
-extern void nfc_tag_14a_set_sniff_passive(bool passive);
 #include "nfc_14a_4.h"
 
 #define NRF_LOG_MODULE_NAME app_cmd
@@ -159,6 +154,11 @@ static data_frame_tx_t *cmd_processor_change_device_mode(uint16_t cmd, uint16_t 
     if ((length != 1) || (data[0] > 1)) {
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    if (hf_capture_is_active()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
+#endif
 
     if (data[0] == 1) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -2688,18 +2688,25 @@ static void hf14a_sniff_store(const uint8_t *data, uint16_t szBits, bool is_tx) 
     m_sniff_buf_len += szBytes;
 }
 
-static void hf14a_sniff_frame_cb(const uint8_t *data, uint16_t szBits) {
+static void hf14a_sniff_frame_cb(const uint8_t *data, uint16_t szBits,
+                                 uint8_t flags) {
+    (void)flags;
     m_sniff_cb_count++;   /* count even if buffer full or inactive */
     if (!m_sniff_active) return;
     hf14a_sniff_store(data, szBits, false);  /* reader→card */
 }
 
-static void hf14a_sniff_tx_frame_cb(const uint8_t *data, uint16_t szBits) {
+static void hf14a_sniff_tx_frame_cb(const uint8_t *data, uint16_t szBits,
+                                    uint8_t flags) {
+    (void)flags;
     if (!m_sniff_active) return;
     hf14a_sniff_store(data, szBits, true);   /* card→reader */
 }
 
 static data_frame_tx_t *cmd_processor_hf14a_sniff(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (hf_capture_is_active()) {
+        return data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+    }
     /* Optional 2-byte big-endian timeout in ms (default 5000ms) */
     uint32_t timeout_ms = 5000;
     if (length >= 2) {
@@ -2752,6 +2759,119 @@ static data_frame_tx_t *cmd_processor_hf14a_sniff(uint16_t cmd, uint16_t status,
         return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
     }
     return data_frame_make(cmd, STATUS_SUCCESS, m_sniff_buf_len, m_sniff_buf);
+}
+
+static uint8_t m_hf_capture_response[NETDATA_MAX_DATA_LENGTH];
+
+static uint16_t hf_capture_result_status(hf_capture_result_t result) {
+    switch (result) {
+        case HF_CAPTURE_RESULT_OK: return STATUS_SUCCESS;
+        case HF_CAPTURE_RESULT_BUSY: return STATUS_DEVICE_MODE_ERROR;
+        case HF_CAPTURE_RESULT_SESSION: return STATUS_CMD_ERR;
+        default: return STATUS_PAR_ERR;
+    }
+}
+
+static data_frame_tx_t *cmd_processor_hf_capture_start(uint16_t cmd,
+                                                        uint16_t status,
+                                                        uint16_t length,
+                                                        uint8_t *data) {
+    (void)status;
+    if (!cmd_payload_exact(length, data, 6u) ||
+            data[0] != HF_CAPTURE_PROTOCOL_VERSION ||
+            data[1] > HF_CAPTURE_MODE_READER || cmd_read_u32be(&data[2]) == 0u) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t session_id = 0;
+    hf_capture_result_t result = hf_capture_start((hf_capture_mode_t)data[1],
+                                                   data_frame_get_transport(),
+                                                   cmd_read_u32be(&data[2]),
+                                                   &session_id);
+    if (result != HF_CAPTURE_RESULT_OK) {
+        return data_frame_make(cmd, hf_capture_result_status(result), 0, NULL);
+    }
+    uint16_t response_length = hf_capture_build_meta(
+                                   session_id, m_hf_capture_response,
+                                   sizeof(m_hf_capture_response));
+    return data_frame_make(cmd, STATUS_SUCCESS, response_length,
+                           m_hf_capture_response);
+}
+
+static data_frame_tx_t *cmd_processor_hf_capture_status(uint16_t cmd,
+                                                         uint16_t status,
+                                                         uint16_t length,
+                                                         uint8_t *data) {
+    (void)status;
+    if (!cmd_payload_exact(length, data, 9u) ||
+            data[0] != HF_CAPTURE_PROTOCOL_VERSION) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t session_id = cmd_read_u32be(&data[1]);
+    hf_capture_result_t result = hf_capture_resume(session_id,
+                                                    cmd_read_u32be(&data[5]),
+                                                    data_frame_get_transport());
+    if (result != HF_CAPTURE_RESULT_OK) {
+        return data_frame_make(cmd, hf_capture_result_status(result), 0, NULL);
+    }
+    session_id = hf_capture_session_id();
+    uint16_t response_length = hf_capture_build_meta(
+                                   session_id, m_hf_capture_response,
+                                   sizeof(m_hf_capture_response));
+    return data_frame_make(cmd, STATUS_SUCCESS, response_length,
+                           m_hf_capture_response);
+}
+
+static data_frame_tx_t *cmd_processor_hf_capture_get(uint16_t cmd,
+                                                      uint16_t status,
+                                                      uint16_t length,
+                                                      uint8_t *data) {
+    (void)status;
+    if (!cmd_payload_exact(length, data, 20u) ||
+            data[0] != HF_CAPTURE_PROTOCOL_VERSION || data[5] > 1u) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t session_id = cmd_read_u32be(&data[1]);
+    bool acknowledge_present = data[5] == 1u;
+    uint32_t ack_sequence = cmd_read_u32be(&data[6]);
+    uint64_t ack_delivery_token = cmd_read_u64be(&data[10]);
+    if (!acknowledge_present &&
+            (ack_sequence != 0u || ack_delivery_token != 0u)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t requested_bytes = cmd_read_u16be(&data[18]);
+    uint16_t response_length = 0;
+    hf_capture_result_t result = hf_capture_get(
+                                     session_id, acknowledge_present,
+                                     ack_sequence, ack_delivery_token,
+                                     data_frame_get_transport(), requested_bytes,
+                                     m_hf_capture_response,
+                                     sizeof(m_hf_capture_response),
+                                     &response_length);
+    return data_frame_make(cmd, hf_capture_result_status(result),
+                           result == HF_CAPTURE_RESULT_OK ? response_length : 0u,
+                           m_hf_capture_response);
+}
+
+static data_frame_tx_t *cmd_processor_hf_capture_stop(uint16_t cmd,
+                                                       uint16_t status,
+                                                       uint16_t length,
+                                                       uint8_t *data) {
+    (void)status;
+    if (!cmd_payload_exact(length, data, 5u) ||
+            data[0] != HF_CAPTURE_PROTOCOL_VERSION) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint32_t session_id = cmd_read_u32be(&data[1]);
+    hf_capture_result_t result = hf_capture_stop(
+                                     session_id, data_frame_get_transport());
+    if (result != HF_CAPTURE_RESULT_OK) {
+        return data_frame_make(cmd, hf_capture_result_status(result), 0, NULL);
+    }
+    uint16_t response_length = hf_capture_build_meta(
+                                   session_id, m_hf_capture_response,
+                                   sizeof(m_hf_capture_response));
+    return data_frame_make(cmd, STATUS_SUCCESS, response_length,
+                           m_hf_capture_response);
 }
 
 /* ========================================================================
@@ -3995,6 +4115,10 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_EM4X05_SCAN,                  before_reader_run,           cmd_processor_em4x05_scan,                   NULL                   },
     {    DATA_CMD_LF_SNIFF,                     before_reader_run,           cmd_processor_lf_sniff,                      NULL                   },
     {    DATA_CMD_HF14A_SNIFF,                  NULL,                        cmd_processor_hf14a_sniff,                   NULL                   },
+    {    DATA_CMD_HF_CAPTURE_START,             NULL,                        cmd_processor_hf_capture_start,              NULL                   },
+    {    DATA_CMD_HF_CAPTURE_STATUS,            NULL,                        cmd_processor_hf_capture_status,             NULL                   },
+    {    DATA_CMD_HF_CAPTURE_GET,               NULL,                        cmd_processor_hf_capture_get,                NULL                   },
+    {    DATA_CMD_HF_CAPTURE_STOP,              NULL,                        cmd_processor_hf_capture_stop,               NULL                   },
     {    DATA_CMD_HF14A_AUTH_TRACE,             before_hf_reader_run,        cmd_processor_hf14a_auth_trace,              after_hf_reader_run    },
 
 #endif
@@ -4112,6 +4236,55 @@ static void auto_response_data(data_frame_tx_t *resp) {
     }
 }
 
+#if defined(PROJECT_CHAMELEON_ULTRA)
+static bool hf_capture_blocks_command(uint16_t cmd) {
+    if (!hf_capture_is_active()) return false;
+    switch (cmd) {
+        case DATA_CMD_CHANGE_DEVICE_MODE:
+        case DATA_CMD_SET_ACTIVE_SLOT:
+        case DATA_CMD_SET_SLOT_TAG_TYPE:
+        case DATA_CMD_SET_SLOT_DATA_DEFAULT:
+        case DATA_CMD_SET_SLOT_ENABLE:
+        case DATA_CMD_SLOT_DATA_CONFIG_SAVE:
+        case DATA_CMD_WIPE_FDS:
+        case DATA_CMD_DELETE_SLOT_SENSE_TYPE:
+        case DATA_CMD_ACTIVE_SLOT_SNAPSHOT:
+            return true;
+        default:
+            return false;
+    }
+}
+#endif
+
+void app_cmd_hf_capture_process(void) {
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    hf_capture_clock_process();
+    if (!hf_capture_notification_due()) return;
+
+    data_frame_transport_t owner = hf_capture_owner();
+    bool ready = (owner == DATA_FRAME_TRANSPORT_USB && is_usb_working() &&
+                  is_usb_tx_idle()) ||
+                 (owner == DATA_FRAME_TRANSPORT_BLE && is_nus_working() &&
+                  is_nus_tx_idle());
+    if (!ready) return;
+
+    uint16_t payload_length = hf_capture_build_meta(
+                                  hf_capture_session_id(),
+                                  m_hf_capture_response,
+                                  sizeof(m_hf_capture_response));
+    if (payload_length == 0u) return;
+    data_frame_tx_t *event = data_frame_make(DATA_CMD_HF_CAPTURE_EVENT,
+                                             STATUS_SUCCESS,
+                                             payload_length,
+                                             m_hf_capture_response);
+    if (event == NULL) return;
+    uint32_t result = owner == DATA_FRAME_TRANSPORT_USB ?
+                      usb_cdc_write_try(event->buffer, event->length) :
+                      nus_data_response_try(event->buffer, event->length);
+    if (result == NRF_SUCCESS) hf_capture_notification_sent();
+#endif
+}
+
 
 /**@brief Function to process data frame(cmd)
  */
@@ -4128,6 +4301,11 @@ void on_data_frame_received(uint16_t cmd, uint16_t status, uint16_t length, uint
     }
     app_cmd_active_slot_snapshot_process();
 #if defined(PROJECT_CHAMELEON_ULTRA)
+    if (hf_capture_blocks_command(cmd)) {
+        response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);
+        auto_response_data(response);
+        return;
+    }
     if (iso_dep_session_is_active() &&
             !iso_dep_session_is_current_transport_owner()) {
         response = data_frame_make(cmd, STATUS_DEVICE_MODE_ERROR, 0, NULL);

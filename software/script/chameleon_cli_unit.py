@@ -22,6 +22,7 @@ from pathlib import Path
 from platform import uname
 from datetime import datetime
 import hardnested_utils
+from mifare_key_batches import mf1_bounded_target_masks, mf1_unmasked_slots
 
 import chameleon_com
 import chameleon_cmd
@@ -4462,32 +4463,83 @@ class HFMFFCHK(ReaderRequiredUnit):
         parser.set_defaults(maxSectors=16)
         return parser
 
-    def check_keys(self, mask: bytearray, keys: list[bytes], chunkSize=20):
+    def check_keys(
+        self,
+        mask: bytearray,
+        keys: list[bytes],
+        chunkSize=12,
+        attemptBudget=48,
+    ):
         sectorKeys = dict()
+        interrupted = False
+        capabilities = self.cmd.device.commands
+        bulk_supported = not capabilities or Command.MF1_CHECK_KEYS_OF_SECTORS in capabilities
 
-        for i in range(0, len(keys), chunkSize):
-            # print("mask = {}".format(mask.hex(sep=' ', bytes_per_sep=1)))
+        bulk_offsets = range(0, len(keys), chunkSize) if bulk_supported else ()
+        for i in bulk_offsets:
             chunkKeys = keys[i: i + chunkSize]
+            target_masks = mf1_bounded_target_masks(
+                mask,
+                len(chunkKeys),
+                attemptBudget,
+            )
+            if not target_masks:
+                break
             print(
                 f' - progress of checking keys... {color_string((CY, i))} / {len(keys)} ({color_string((CY, f"{100 * i / len(keys):.1f}"))} %)'
             )
-            resp = self.cmd.mf1_check_keys_of_sectors(mask, chunkKeys)
-            # print(resp)
+            for request_mask in target_masks:
+                try:
+                    resp = self.cmd.mf1_check_keys_of_sectors(
+                        request_mask,
+                        chunkKeys,
+                    )
+                except chameleon_com.CMDInvalidException:
+                    bulk_supported = False
+                    break
+                if resp["status"] != Status.HF_TAG_OK:
+                    print(
+                        f' - check interrupted, reason: {color_string((CR, Status(resp["status"])))}'
+                    )
+                    interrupted = True
+                    break
+                if "sectorKeys" not in resp:
+                    continue
 
-            if resp["status"] != Status.HF_TAG_OK:
-                print(
-                    f' - check interrupted, reason: {color_string((CR, Status(resp["status"])))}'
-                )
+                for slot, key in resp["sectorKeys"].items():
+                    sector = slot // 2
+                    trailer = sector * 4 + 3 if sector < 32 else sector * 16 - 369
+                    key_type = MfcKeyType.A if slot % 2 == 0 else MfcKeyType.B
+                    if not self.cmd.mf1_auth_one_key_block(
+                        trailer,
+                        key_type,
+                        key,
+                    ):
+                        continue
+                    mask[slot // 8] |= 1 << (7 - slot % 8)
+                    sectorKeys[slot] = key
+            if not bulk_supported:
                 break
-            elif "sectorKeys" not in resp:
-                print(
-                    f' - check interrupted, reason: {color_string((CG, "All sectorKey is found or masked"))}'
-                )
+            if interrupted:
                 break
 
-            for j in range(10):
-                mask[j] |= resp["found"][j]
-            sectorKeys.update(resp["sectorKeys"])
+        if not bulk_supported and not interrupted:
+            for slot in mf1_unmasked_slots(mask):
+                sector = slot // 2
+                trailer = sector * 4 + 3 if sector < 32 else sector * 16 - 369
+                key_type = MfcKeyType.A if slot % 2 == 0 else MfcKeyType.B
+                for offset in range(0, len(keys), chunkSize):
+                    found = self.cmd.mf1_check_keys_on_block(
+                        trailer,
+                        key_type,
+                        keys[offset: offset + chunkSize],
+                    )
+                    if found is None:
+                        continue
+                    if self.cmd.mf1_auth_one_key_block(trailer, key_type, found):
+                        mask[slot // 8] |= 1 << (7 - slot % 8)
+                        sectorKeys[slot] = found
+                    break
 
         return sectorKeys
 

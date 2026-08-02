@@ -20,12 +20,14 @@ shrinks as keys are found.
 
 ## Dictionary check (`checkKeys`)
 
-- **Bulk sector prepass deferred.** Firmware supports `MF1_CHECK_KEYS_OF_SECTORS`
-  (2012), but the GUI currently keeps the default per-sector path because an
-  all-sector check can exceed host response timeouts on real cards and
-  desynchronise the command stream. Re-enable this only with firmware-side
-  bounded batches/cancellation; every accepted key must still be authenticated
-  on-card.
+- **Bounded multi-sector prepass.** Firmware command
+  `MF1_CHECK_KEYS_OF_SECTORS` (2012) now selects the card once and uses fast
+  UID-pinned reselection between failed candidates. Hosts never send the old
+  unbounded all-sector workload: Flutter limits each call to 16 authentication
+  attempts over BLE or 48 over USB, while the Python CLI uses 48. The budget
+  reserves the hardware-auth/readable-Key-B overhead. Every returned key is
+  authenticated again before it is trusted, card identity is checked around
+  each GUI batch, and unsupported firmware falls back to command 2015 per sector.
 - **Dedup + build-once.** The candidate key list (selected dictionary + default
   keys) is de-duplicated and built a single time instead of being rebuilt per
   sector.
@@ -35,8 +37,8 @@ shrinks as keys are found.
   breaks on the first hit, this turns an average half-list scan into an early hit
   in the common case. (`prioritiseCandidates`)
 - **Back-propagation.** When a key is found it is immediately tried on **every**
-  still-unknown sector (`recheckKey`), so a reused key resolves the whole card
-  with cheap single authentications instead of repeated attacks.
+  still-unknown sector (`recheckKey`) through the same bounded masks, so a
+  reused key resolves the whole card without one host round-trip per target.
 - **Readable Key B confirmation.** When Key A opens a sector trailer and bytes
   10..15 expose a candidate Key B, Autopwn now authenticates with that candidate
   before saving or propagating it. This recovers a cheap missed key without

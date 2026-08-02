@@ -203,6 +203,8 @@ uint16_t pcd_14a_reader_timeout_get(void);
 void pcd_14a_reader_timeout_set(uint16_t timeout_ms);
 void pcd_14a_reader_trace_set(pcd_14a_trace_cb_t callback);
 void pcd_14a_reader_trace_clear(void);
+void pcd_14a_reader_capture_set(pcd_14a_trace_cb_t callback);
+void pcd_14a_reader_capture_clear(void);
 
 // Device communication interface
 uint8_t pcd_14a_reader_bytes_transfer(uint8_t Command,
