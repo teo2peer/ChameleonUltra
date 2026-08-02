@@ -74,9 +74,12 @@ void nfc_tag_14a_clear_sniff_cb(void) {
     m_sniff_cb = NULL;
 }
 
-/* TX sniff: captures card→reader frames after TX has been scheduled. */
+/* TX sniff: captures card→reader frames after NFCT starts transmission. */
 static nfc_tag_14a_tx_sniff_cb_t m_tx_sniff_cb = NULL;
 static nfc_tag_14a_field_sniff_cb_t m_field_sniff_cb = NULL;
+static bool m_tx_sniff_pending;
+static uint16_t m_tx_sniff_pending_bits;
+static uint8_t m_tx_sniff_pending_flags;
 
 void nfc_tag_14a_set_tx_sniff_cb(nfc_tag_14a_tx_sniff_cb_t cb) {
     m_tx_sniff_cb = cb;
@@ -84,6 +87,7 @@ void nfc_tag_14a_set_tx_sniff_cb(nfc_tag_14a_tx_sniff_cb_t cb) {
 
 void nfc_tag_14a_clear_tx_sniff_cb(void) {
     m_tx_sniff_cb = NULL;
+    m_tx_sniff_pending = false;
 }
 
 void nfc_tag_14a_set_field_sniff_cb(nfc_tag_14a_field_sniff_cb_t cb) {
@@ -307,11 +311,10 @@ size_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBit
  */
 void nfc_tag_14a_tx_bytes(uint8_t *data, uint32_t bytes, bool appendCrc) {
     if (data == NULL || bytes == 0 || bytes > MAX_NFC_TX_BUFFER_SIZE) return;
+    m_tx_sniff_pending = m_tx_sniff_cb != NULL;
+    m_tx_sniff_pending_bits = (uint16_t)(bytes * 8u);
+    m_tx_sniff_pending_flags = appendCrc ? NFC_TAG_14A_TRACE_FLAG_CRC_AUTO : 0u;
     NFC_14A_TX_BYTE_CORE(data, bytes, appendCrc, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
-    if (m_tx_sniff_cb != NULL) {
-        m_tx_sniff_cb(m_nfc_tx_buffer, (uint16_t)(bytes * 8u),
-                      appendCrc ? NFC_TAG_14A_TRACE_FLAG_CRC_AUTO : 0u);
-    }
 }
 
 /**
@@ -341,11 +344,10 @@ void nfc_tag_14a_tx_bits(uint8_t *data, uint32_t bits) {
     if (data == NULL || bits == 0 || bytes > MAX_NFC_TX_BUFFER_SIZE) return;
     m_is_responded = true;
     memcpy(m_nfc_tx_buffer, data, bytes);
+    m_tx_sniff_pending = m_tx_sniff_cb != NULL;
+    m_tx_sniff_pending_bits = (uint16_t)bits;
+    m_tx_sniff_pending_flags = bits >= 9u ? NFC_TAG_14A_TRACE_FLAG_PARITY_PACKED : 0u;
     NFC_14A_TX_BITS_CORE(bits, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
-    if (m_tx_sniff_cb != NULL) {
-        m_tx_sniff_cb(m_nfc_tx_buffer, (uint16_t)bits,
-                      bits >= 9u ? NFC_TAG_14A_TRACE_FLAG_PARITY_PACKED : 0u);
-    }
 }
 
 /**@brief The function of sending n bits is implemented, and this implementation is automatically sent SOF
@@ -357,10 +359,10 @@ void nfc_tag_14a_tx_nbit(uint8_t data, uint32_t bits) {
     if (bits == 0 || bits > 8) return;
     m_is_responded = true;
     m_nfc_tx_buffer[0] = data;
+    m_tx_sniff_pending = m_tx_sniff_cb != NULL;
+    m_tx_sniff_pending_bits = (uint16_t)bits;
+    m_tx_sniff_pending_flags = 0u;
     NFC_14A_TX_BITS_CORE(bits, NRF_NFCT_FRAME_DELAY_MODE_WINDOWGRID);
-    if (m_tx_sniff_cb != NULL) {
-        m_tx_sniff_cb(m_nfc_tx_buffer, (uint16_t)bits, 0u);
-    }
 }
 
 /**
@@ -713,6 +715,7 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             break;
         }
         case NRFX_NFCT_EVT_FIELD_LOST: {
+            m_tx_sniff_pending = false;
             if (m_field_sniff_cb != NULL) m_field_sniff_cb(false);
             g_is_tag_emulating = false;
             // call sleep_timer_start *after* unsetting g_is_tag_emulating
@@ -732,6 +735,11 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             break;
         }
         case NRFX_NFCT_EVT_TX_FRAMESTART: {
+            if (m_tx_sniff_pending && m_tx_sniff_cb != NULL) {
+                m_tx_sniff_pending = false;
+                m_tx_sniff_cb(m_nfc_tx_buffer, m_tx_sniff_pending_bits,
+                              m_tx_sniff_pending_flags);
+            }
             break;
         }
         case NRFX_NFCT_EVT_TX_FRAMEEND: {
@@ -761,6 +769,7 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             break;
         }
         case NRFX_NFCT_EVT_ERROR: {
+            m_tx_sniff_pending = false;
             // According to the error reasons, the log prints to help the development of the possibilities during development
             switch (p_event->params.error.reason) {
                 case NRFX_NFCT_ERROR_FRAMEDELAYTIMEOUT: {

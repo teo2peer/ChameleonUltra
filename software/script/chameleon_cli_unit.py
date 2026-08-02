@@ -4463,6 +4463,18 @@ class HFMFFCHK(ReaderRequiredUnit):
         parser.set_defaults(maxSectors=16)
         return parser
 
+    def _current_card_identity(self):
+        response = self.cmd.hf14a_scan()
+        cards = response.parsed
+        if len(cards) != 1:
+            raise RuntimeError("Keep exactly one MIFARE Classic card presented")
+        card = cards[0]
+        return (card["uid"], card["atqa"], card["sak"], card["ats"])
+
+    def _verify_card_identity(self, expected):
+        if self._current_card_identity() != expected:
+            raise RuntimeError("The card changed during the key check")
+
     def check_keys(
         self,
         mask: bytearray,
@@ -4470,6 +4482,7 @@ class HFMFFCHK(ReaderRequiredUnit):
         chunkSize=12,
         attemptBudget=48,
     ):
+        expected_card = self._current_card_identity()
         sectorKeys = dict()
         interrupted = False
         capabilities = self.cmd.device.commands
@@ -4498,14 +4511,14 @@ class HFMFFCHK(ReaderRequiredUnit):
                     bulk_supported = False
                     break
                 if resp["status"] != Status.HF_TAG_OK:
-                    print(
-                        f' - check interrupted, reason: {color_string((CR, Status(resp["status"])))}'
+                    raise RuntimeError(
+                        f'Key check interrupted: {Status(resp["status"])}'
                     )
-                    interrupted = True
-                    break
+                self._verify_card_identity(expected_card)
                 if "sectorKeys" not in resp:
                     continue
 
+                verified = []
                 for slot, key in resp["sectorKeys"].items():
                     sector = slot // 2
                     trailer = sector * 4 + 3 if sector < 32 else sector * 16 - 369
@@ -4516,6 +4529,10 @@ class HFMFFCHK(ReaderRequiredUnit):
                         key,
                     ):
                         continue
+                    verified.append((slot, key))
+                if verified:
+                    self._verify_card_identity(expected_card)
+                for slot, key in verified:
                     mask[slot // 8] |= 1 << (7 - slot % 8)
                     sectorKeys[slot] = key
             if not bulk_supported:
@@ -4536,10 +4553,12 @@ class HFMFFCHK(ReaderRequiredUnit):
                     )
                     if found is None:
                         continue
+                    self._verify_card_identity(expected_card)
                     if self.cmd.mf1_auth_one_key_block(trailer, key_type, found):
+                        self._verify_card_identity(expected_card)
                         mask[slot // 8] |= 1 << (7 - slot % 8)
                         sectorKeys[slot] = found
-                    break
+                        break
 
         return sectorKeys
 
@@ -4584,6 +4603,7 @@ class HFMFFCHK(ReaderRequiredUnit):
 
         # check keys
         startedAt = datetime.now()
+        print(" - Keep the same card presented until key checking completes")
         sectorKeys = self.check_keys(mask, list(keys))
         endedAt = datetime.now()
         duration = endedAt - startedAt

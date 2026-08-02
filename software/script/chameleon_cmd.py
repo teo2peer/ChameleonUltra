@@ -1,6 +1,5 @@
 import struct
 import ctypes
-import secrets
 import zlib
 from typing import Optional, Union
 
@@ -1908,7 +1907,7 @@ class ChameleonCMD:
         if mode not in (0, 1, 2):
             raise ValueError("mode must be 0 (emulation), 1 (passive), or 2 (reader)")
         if start_token is None:
-            start_token = secrets.randbelow(0xFFFFFFFF) + 1
+            raise ValueError("start_token is required so a timed-out START can be recovered")
         if start_token <= 0 or start_token > 0xFFFFFFFF:
             raise ValueError("start_token must fit in a non-zero unsigned 32-bit integer")
         return self.device.send_cmd_sync(

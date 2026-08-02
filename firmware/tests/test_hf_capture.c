@@ -179,6 +179,34 @@ int main(void) {
     assert(hf_capture_stop(gap_session, DATA_FRAME_TRANSPORT_USB) ==
            HF_CAPTURE_RESULT_OK);
 
+    uint32_t scoped_delivery_session = 0;
+    assert(hf_capture_start(HF_CAPTURE_MODE_EMULATION,
+                            DATA_FRAME_TRANSPORT_USB,
+                            0x35363738u,
+                            &scoped_delivery_session) == HF_CAPTURE_RESULT_OK);
+    for (uint8_t i = 0; i < 30u; i++) rx_callback(request, 16u, 0u);
+    assert(hf_capture_get(scoped_delivery_session, false, 0u, 0u,
+                          DATA_FRAME_TRANSPORT_USB, sizeof(page), page,
+                          sizeof(page), &page_length) == HF_CAPTURE_RESULT_OK);
+    assert(read_u16(&page[56]) == 30u);
+    assert(hf_capture_get(scoped_delivery_session, false, 0u, 0u,
+                          DATA_FRAME_TRANSPORT_USB, HF_CAPTURE_MIN_PAGE_SIZE,
+                          page, sizeof(page), &page_length) == HF_CAPTURE_RESULT_OK);
+    assert(read_u16(&page[56]) == 22u);
+    delivery_token = read_u64(&page[64]);
+    assert(hf_capture_get(scoped_delivery_session, true, 29u, delivery_token,
+                          DATA_FRAME_TRANSPORT_USB, sizeof(page), page,
+                          sizeof(page), &page_length) == HF_CAPTURE_RESULT_INVALID);
+    assert(hf_capture_get(scoped_delivery_session, true, 21u, delivery_token,
+                          DATA_FRAME_TRANSPORT_USB, sizeof(page), page,
+                          sizeof(page), &page_length) == HF_CAPTURE_RESULT_OK);
+    delivery_token = read_u64(&page[64]);
+    assert(hf_capture_stop(scoped_delivery_session, DATA_FRAME_TRANSPORT_USB) ==
+           HF_CAPTURE_RESULT_OK);
+    assert(hf_capture_get(scoped_delivery_session, true, 29u, delivery_token,
+                          DATA_FRAME_TRANSPORT_USB, sizeof(page), page,
+                          sizeof(page), &page_length) == HF_CAPTURE_RESULT_OK);
+
     uint32_t overflow_session = 0;
     assert(hf_capture_start(HF_CAPTURE_MODE_EMULATION,
                             DATA_FRAME_TRANSPORT_USB,

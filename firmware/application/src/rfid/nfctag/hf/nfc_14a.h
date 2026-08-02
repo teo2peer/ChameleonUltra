@@ -95,8 +95,8 @@ typedef void (*nfc_tag_14a_sniff_cb_t)(const uint8_t *data, uint16_t szBits,
 void nfc_tag_14a_set_sniff_cb(nfc_tag_14a_sniff_cb_t cb);
 void nfc_tag_14a_clear_sniff_cb(void);
 
-/* TX sniff callback — fires immediately after TX is scheduled with the frame
- * the tag is sending (card→reader direction). Same signature as RX.
+/* TX sniff callback — fires when NFCT confirms the frame started transmission
+ * in the card→reader direction. Same signature as RX.
  * Install alongside nfc_tag_14a_set_sniff_cb() to capture both directions. */
 typedef void (*nfc_tag_14a_tx_sniff_cb_t)(const uint8_t *data, uint16_t szBits,
                                          uint8_t flags);

@@ -60,6 +60,8 @@ class HfCaptureCommandTest(unittest.TestCase):
 
     def test_rejects_invalid_modes_and_session_ids(self):
         with self.assertRaises(ValueError):
+            self.commands.hf_capture_start(0)
+        with self.assertRaises(ValueError):
             self.commands.hf_capture_start(3)
         for start_token in (0, 0x100000000):
             with self.assertRaises(ValueError):
