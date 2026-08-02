@@ -59,7 +59,7 @@ that policy context.
 | `ble disconnect` | Disconnect from the target, freeing it to reconnect to its normal source. |
 | `ble advertise [on\|off\|toggle\|status] [--erase-bonds]` | Control the device's **own** advertising (discoverable state). |
 | `ble spoof-mac [show\|restore\|private\|nonresolv\|static <addr>]` | Change the device's **own** BLE GAP address/identity (static-random, random private resolvable/non-resolvable, or restore the FICR default). Mutates our radio only. |
-| `ble radio [on\|off\|toggle\|status]` | Turn the device's **own** BLE radio on/off. `off` = stealth: stops advertising + passive scan and drops any active central link. |
+| `ble radio [on\|off\|toggle\|status]` | Turn the device's **own** BLE radio on/off. `off` requires USB: it stops advertising + passive scan, drops central links, and disconnects a peripheral peer established by the advertising lab. |
 | `ble flood-ping --scope single\|buffer\|broadcast ...` | WRITE_CMD flood for single/buffer scopes, or non-connectable advertising spam for broadcast scope (`--fill`, `--interval-units 1..102`). Buffer scope uses the scan buffer and defaults an omitted count to a bounded per-peer run. |
 | `ble kick [cycles] --scope single\|buffer` | One disconnect for the current central link (`scope=single` requires `cycles=1`), or repeated connect/disconnect cycles for connectable peers in the scan buffer. |
 | `ble broadcast [--fill hex] [--interval-units 1..102] [--stop]` | Environment-wide non-connectable advertising broadcast. |
@@ -123,6 +123,7 @@ BLE commands occupy the **7000** block of the request/response command protocol
 | 7040–7043 | Own-radio address / radio power |
 | 7044–7047 | Stress: flood start/stop/count, kick |
 | 7050–7051 | Environment-wide advertising flood start/stop |
+| 7052–7054 | Vendor-neutral advertising lab start/status/stop |
 
 There is no async command-event push channel; continuous data (scan results,
 fuzz log, notifications) is buffered in firmware and paged out by record index.

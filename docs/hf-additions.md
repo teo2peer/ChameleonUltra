@@ -68,6 +68,40 @@ hf 14a field off
 ```
 (`HF14A_SET_FIELD_ON`/`OFF`, commands 2100/2101.)
 
+## ISO-DEP - persistent reader session (`hf 14a session`)
+
+Commands `6011`-`6014` select one real ISO-DEP card once and preserve RF field,
+ISO-DEP block numbers, chaining state, and ATS-derived timing across host APDU
+round trips:
+
+```text
+hf 14a session start
+hf 14a session start --express-transit
+hf 14a session exchange <session-id> 00A404000E325041592E5359532E444446303100
+hf 14a session stop <session-id>
+```
+
+Normal START uses command 6011. `--express-transit` uses command 6014 to send the
+TfL Apple ECP2 frame before WUPA/SELECT/RATS; both variants return the same
+metadata and continue with 6012/6013. ECP2 success means that ISO-DEP activation
+succeeded, not that Wallet policy changed or a transaction was approved.
+
+The session ID is a nonzero 32-bit token for the current boot. The session has no
+inactivity timeout and is bound to the USB or BLE command transport that opened it;
+commands from the other transport are rejected while it is active. Explicit STOP
+or reset, a replacement START from the owner transport, RF failure, reader-mode
+exit or another owner-safe invalidation, and loss of the owner USB/BLE link close
+the session and power down the field.
+
+A timed-out or otherwise uncertain 6012 EXCHANGE must never be retried. On the same
+still-valid owner connection, an ordered empty 6013 response with status `0x68`,
+`0x60`, or `0x66` confirms the old session is closed and lets a host clear only its
+6012 quarantine.
+Reconnect only if that reset cannot be confirmed or framing/transport was itself
+invalidated. This is the backend used by the Android authorized payment HCE relay.
+See the
+[complete relay and protocol guide](authorized-iso-dep-relay.md).
+
 ## DESFire — fast enumeration (`hf des enum`)
 
 `HF14A_4_DESFIRE_SCAN` (command 6006) performs the whole DESFire enumeration in a
@@ -98,8 +132,8 @@ bit length, PCB/control traffic, CRC bytes, transport status, and relative timin
 Metadata explicitly reports timeouts, transport failures, dropped RF detail, and
 logical trace/response truncation. Older firmware falls back to bounded command 6005.
 
-The explicit maximum-processing option reactivates and processes every discovered
-AID independently, builds the card's PDOL in its declared order, runs GPO, validates
+The explicit maximum-processing option processes every discovered AID in the same
+RF session, builds the card's PDOL in its declared order, runs GPO, validates
 format-1/format-2 AIP+AFL, reads AFL records, and issues GENERATE AC only when a
 complete CDOL1 exists. Visa applications that already return cryptogram data from
 GPO do not receive a generic GENERATE AC. This mode can advance ATC or other card
@@ -131,6 +165,49 @@ The GPO/CDOL builder fills terminal country/currency/date/type, amount, TTQ and 
 fresh unpredictable number in the card-declared order. Unknown DOL objects are
 zero-filled and malformed or oversized DOLs are rejected rather than partially
 sent. Record discovery uses valid SFI 1..30 and configurable smart/grid limits.
+Express Transit requests use the Apple-compatible Visa TTQ `33804000`, including
+the ODA-for-online capability required by this mobile profile. The investigative
+reader does not validate ODA or an issuer response, so this remains protocol
+evidence rather than an approval result. Express requests also skip the generic
+empty-PDOL fallback.
+
+Extended START requests can select a bounded terminal profile: automatic,
+Apple-transit `33804000`, online-without-ODA `32804000`, broad-mobile
+`3600C000`, qVSDC-online `26804000`, minimal-online `22804000`, MSD+qVSDC
+`B600C000`, or a caller-supplied TTQ. The compatibility sweep tries those six
+named profiles in that order, reselecting the application between attempts. It
+continues only for GPO status `6985`, `6986`, or `6A80`, and stops on success,
+transport failure, or any other response. Trace APDUs retain every attempted GPO.
+The DOL builder also supplies bounded values for amount-other, TVR, terminal and
+additional capabilities, merchant category/identifier/name, transaction sequence,
+and transaction category when an application requests them; unknown tags remain
+zero-filled.
+
+The extended request can additionally select fast, balanced, or patient ECP
+polling, override the bounded retry/delay/timeout values, request scheme-adaptive
+profile ordering, and cycle RF/re-run ECP before each rejected profile. Visa,
+Mastercard/Maestro, American Express, Discover, JCB, UnionPay, and Interac are
+classified by RID/AID. When explicitly enabled and PPSE is unavailable or empty,
+firmware probes one fixed application AID for each of those schemes; it does not
+enumerate arbitrary AIDs. Adaptive sweeps use Visa-, Mastercard-, or other-scheme
+orders, continue only after `6985`, `6986`, or `6A80`, and remain bounded by six
+profiles plus the request APDU/time limits. GUI reports retain each GPO command,
+PDOL payload, recognized TTQ, status word, scheme, order, and successful attempt
+for side-by-side comparison.
+
+The GUI can instead coordinate six completely separate ECP/RF sessions, one fixed
+profile per session with a field-off delay, and stop at the first successful GPO.
+This is distinct from firmware's in-session sweep and is useful when a wallet
+enters a retry state after rejecting GPO. Exported reports include every session.
+Copied reports can be replayed offline: raw record framing, status duplication,
+record stream equality, and CRC-32 are revalidated before the assessment is
+recomputed. ODA diagnostics decode SDA/DDA/CDA support and inventory the issuer/
+ICC certificate, exponent, signed-static-data, and CAPK-index tags. They remain
+explicitly `cryptographicallyVerified: false` until a matching trusted CAPK and
+full EMV signed-data reconstruction are available; tag presence or TTQ never
+counts as ODA verification. Terminal presets now also provide no-CVM results,
+floor limit, and profile-specific attended/unattended terminal type when requested
+through PDOL/CDOL.
 Transaction-log records are read only when requested and a valid `9F4D` Log Entry
 is present. This is investigative tooling, not a certified EMV Level-2 kernel and
 does not perform CVM, issuer authorization, issuer scripts, or cryptogram validation.
