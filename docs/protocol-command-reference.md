@@ -67,7 +67,7 @@ payload[length] | LRC3
 
 | Rango | Uso | IDs asignados/huecos principales |
 |---|---|---|
-| 1000-1999 | Dispositivo, slots, ajustes, teclado | 1000-1021, 1023-1052; 1022 y 1053-1999 libres |
+| 1000-1999 | Dispositivo, slots, ajustes, teclado | 1000-1021, 1023-1053; 1022 y 1054-1999 libres |
 | 2000-2999 | Lector HF | 2000-2018, 2020, 2100-2101, 2200-2201 |
 | 3000-3999 | Lector LF | 3000-3006, 3009-3016, 3018-3020, 3030-3032 |
 | 4000-4999 | Emulación HF | 4000-4001, 4004-4044 |
@@ -79,7 +79,7 @@ payload[length] | LRC3
 un status word APDU. Si se envía como ID de comando, devuelve
 `STATUS_INVALID_CMD`. Lo mismo aplica a cualquier hueco no anunciado por 1035.
 
-## 1000-1050: dispositivo, slots y teclado
+## 1000-1053: dispositivo, slots y teclado
 
 Todos los comandos de este bloque están disponibles en Ultra y Lite. Los índices
 de slot enviados por cable son `0..7`; la interfaz suele mostrarlos como `1..8`.
@@ -129,6 +129,7 @@ Los tipos de sentido son `1=LF`, `2=HF`.
 | 1040 | `SET_SLEEP_TIMEOUT` | `seconds:u8` (`5..60`) | Cambia timeout; persistir con 1013 |
 | 1051 | `GET_KEYBOARD_HID_ENABLE` | ignorado | `enabled:u8` |
 | 1052 | `SET_KEYBOARD_HID_ENABLE` | `enabled:u8` (`0/1`) | Opt-in HID de teclado (off por defecto); cambia ajuste en RAM, persistir con 1013 y reiniciar para (des)exponer HID USB/BLE |
+| 1053 | `SET_RUNTIME_UNDERCOVER_MODE` | `enabled:u8` (`0/1`) | Sólo enlace NUS BLE activo. Suprime en RAM la barra RGB y el LED de campo; no persiste y se revoca automáticamente al desconectarse ese enlace periférico |
 
 Funciones de botón: `0=disabled`, `1=next slot`, `2=previous slot`,
 `3=clone UID`, `4=battery`, `5=NFC field`, `6=reader-key capture`.

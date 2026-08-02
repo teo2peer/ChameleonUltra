@@ -1,4 +1,5 @@
 #include <nrf_gpio.h>
+#include "app_util_platform.h"
 #include "hw_connect.h"
 
 
@@ -67,6 +68,44 @@ uint32_t m_rgb_array[MAX_RGB_NUM];
 
 
 static uint8_t m_hw_ver;
+static volatile bool m_undercover_leds;
+static bool m_field_led_requested;
+static chameleon_rgb_type_t m_slot_light_color = RGB_RED;
+
+
+static void apply_slot_light_color(chameleon_rgb_type_t color) {
+    nrf_gpio_pin_set(LED_R);
+    nrf_gpio_pin_set(LED_G);
+    nrf_gpio_pin_set(LED_B);
+    switch (color) {
+        case RGB_RED:
+            nrf_gpio_pin_clear(LED_R);
+            break;
+        case RGB_GREEN:
+            nrf_gpio_pin_clear(LED_G);
+            break;
+        case RGB_BLUE:
+            nrf_gpio_pin_clear(LED_B);
+            break;
+        case RGB_MAGENTA:
+            nrf_gpio_pin_clear(LED_B);
+            nrf_gpio_pin_clear(LED_R);
+            break;
+        case RGB_YELLOW:
+            nrf_gpio_pin_clear(LED_R);
+            nrf_gpio_pin_clear(LED_G);
+            break;
+        case RGB_CYAN:
+            nrf_gpio_pin_clear(LED_G);
+            nrf_gpio_pin_clear(LED_B);
+            break;
+        case RGB_WHITE:
+            nrf_gpio_pin_clear(LED_R);
+            nrf_gpio_pin_clear(LED_G);
+            nrf_gpio_pin_clear(LED_B);
+            break;
+    }
+}
 
 
 
@@ -231,7 +270,56 @@ void init_leds(void) {
 
     // set FIELD The LED pin is output and the field light is turned off
     nrf_gpio_cfg_output(LED_FIELD);
+    m_undercover_leds = false;
+    m_field_led_requested = false;
     TAG_FIELD_LED_OFF()
+}
+
+void hw_field_led_set(bool enabled) {
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    m_field_led_requested = enabled;
+    if (m_undercover_leds || !enabled) {
+        nrf_gpio_pin_set(LED_FIELD);
+    } else {
+        nrf_gpio_pin_clear(LED_FIELD);
+    }
+    app_util_critical_region_exit(nested);
+}
+
+void hw_leds_set_undercover(bool enabled) {
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    if (m_undercover_leds == enabled) {
+        app_util_critical_region_exit(nested);
+        return;
+    }
+
+    m_undercover_leds = enabled;
+    if (enabled) {
+        for (uint8_t i = 0; i < RGB_LIST_NUM; i++) {
+            nrf_gpio_pin_clear(m_led_array[i]);
+            nrf_gpio_cfg_input(m_led_array[i], NRF_GPIO_PIN_NOPULL);
+        }
+        nrf_gpio_pin_set(LED_R);
+        nrf_gpio_pin_set(LED_G);
+        nrf_gpio_pin_set(LED_B);
+        nrf_gpio_pin_set(LED_FIELD);
+        app_util_critical_region_exit(nested);
+        return;
+    }
+
+    for (uint8_t i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_clear(m_led_array[i]);
+        nrf_gpio_cfg_output(m_led_array[i]);
+    }
+    apply_slot_light_color(m_slot_light_color);
+    hw_field_led_set(m_field_led_requested);
+    app_util_critical_region_exit(nested);
+}
+
+bool hw_leds_are_undercover(void) {
+    return m_undercover_leds;
 }
 
 /**
@@ -239,35 +327,16 @@ void init_leds(void) {
  * @param color: 0 means r, 1 means g, 2 means b
  */
 void set_slot_light_color(chameleon_rgb_type_t color) {
-    nrf_gpio_pin_set(LED_R);
-    nrf_gpio_pin_set(LED_G);
-    nrf_gpio_pin_set(LED_B);
-    switch (color) {
-        case RGB_RED:
-            nrf_gpio_pin_clear(LED_R);
-            break;
-        case RGB_GREEN:
-            nrf_gpio_pin_clear(LED_G);
-            break;
-        case RGB_BLUE:
-            nrf_gpio_pin_clear(LED_B);
-            break;
-        case RGB_MAGENTA:
-            nrf_gpio_pin_clear(LED_B);
-            nrf_gpio_pin_clear(LED_R);
-            break;
-        case RGB_YELLOW:
-            nrf_gpio_pin_clear(LED_R);
-            nrf_gpio_pin_clear(LED_G);
-            break;
-        case RGB_CYAN:
-            nrf_gpio_pin_clear(LED_G);
-            nrf_gpio_pin_clear(LED_B);
-            break;
-        case RGB_WHITE:
-            nrf_gpio_pin_clear(LED_R);
-            nrf_gpio_pin_clear(LED_G);
-            nrf_gpio_pin_clear(LED_B);
-            break;
+    uint8_t nested = 0;
+    app_util_critical_region_enter(&nested);
+    m_slot_light_color = color;
+    if (m_undercover_leds) {
+        nrf_gpio_pin_set(LED_R);
+        nrf_gpio_pin_set(LED_G);
+        nrf_gpio_pin_set(LED_B);
+        app_util_critical_region_exit(nested);
+        return;
     }
+    apply_slot_light_color(color);
+    app_util_critical_region_exit(nested);
 }

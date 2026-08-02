@@ -4,6 +4,7 @@
 #ifndef HW_CONNECT_H_
 #define HW_CONNECT_H_
 
+#include <stdbool.h>
 #include "nrf_lpcomp.h"
 #include "nrf_saadc.h"
 #include "device_info.h"
@@ -96,8 +97,8 @@ extern uint32_t g_reader_power;
 
 
 // Operational Definitions for General Field Lights
-#define TAG_FIELD_LED_ON()     nrf_gpio_pin_clear(LED_FIELD);
-#define TAG_FIELD_LED_OFF()    nrf_gpio_pin_set(LED_FIELD);
+#define TAG_FIELD_LED_ON()     hw_field_led_set(true);
+#define TAG_FIELD_LED_OFF()    hw_field_led_set(false);
 
 
 void hw_connect_init(void);
@@ -108,6 +109,9 @@ uint32_t *hw_get_rgb_array(void);
 chameleon_device_type_t hw_get_device_type(void);
 uint8_t hw_get_version_code(void);
 void set_slot_light_color(chameleon_rgb_type_t color);
+void hw_field_led_set(bool enabled);
+void hw_leds_set_undercover(bool enabled);
+bool hw_leds_are_undercover(void);
 
 
 #endif

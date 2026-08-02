@@ -59,6 +59,22 @@ void rgb_marquee_reset(void) {
     rgb_marquee_usb_open_step = 0;
 }
 
+void rgb_marquee_set_undercover(bool enabled) {
+    if (hw_leds_are_undercover() == enabled) return;
+    if (enabled) {
+        // Gate the shared color bus before releasing PWM to prevent a flash.
+        hw_leds_set_undercover(true);
+        rgb_marquee_stop();
+    } else {
+        rgb_marquee_reset();
+        hw_leds_set_undercover(false);
+    }
+}
+
+bool rgb_marquee_is_undercover(void) {
+    return hw_leds_are_undercover();
+}
+
 // Brightness to PWM value
 uint16_t get_pwmduty(uint8_t light_level) {
     return PWM_MAX - (PWM_MAX * pow(((double)light_level / LIGHT_LEVEL_MAX), 2.2));
@@ -67,6 +83,7 @@ uint16_t get_pwmduty(uint8_t light_level) {
 // 4 Lights and the level of brightness levels (no return)
 //COLOR 0-R,1-G,2-B
 void rgb_marquee_usb_open_sweep(uint8_t color, uint8_t dir) {
+    if (hw_leds_are_undercover()) return;
     static uint8_t startled = 0;
     static uint8_t setled = 0;
     uint32_t *led_pins_arr;
@@ -124,6 +141,7 @@ void rgb_marquee_usb_open_sweep(uint8_t color, uint8_t dir) {
 }
 
 void rgb_marquee_usb_open_symmetric(uint8_t color) {
+    if (hw_leds_are_undercover()) return;
     static uint8_t startled = 0;
     static uint8_t setled = 0;
     uint32_t *led_pins_arr = hw_get_led_array();
@@ -176,6 +194,7 @@ void rgb_marquee_usb_open_symmetric(uint8_t color) {
 //dir 0-from 1 card slot to 8 card slot, 1-from 8 card slot to 1 card slot (Direction, the end point is determined by the END parameter)
 //end To scan the number of lamps, decide the final animation area with the direction
 void rgb_marquee_sweep_to(uint8_t color, uint8_t dir, uint8_t end) {
+    if (hw_leds_are_undercover()) return;
     uint8_t startled = 0;
     uint8_t setled = 0;
     uint8_t leds2turnon = 0;
@@ -262,6 +281,7 @@ static void rgb_marquee_slot_switch_pwm_callback(nrfx_pwm_evt_type_t event_type)
     }
 }
 void rgb_marquee_slot_switch(uint8_t led_down, uint8_t color_led_down, uint8_t led_up, uint8_t color_led_up) {
+    if (hw_leds_are_undercover()) return;
     int16_t light_level = 99; //ledBrightnessValue
     uint32_t *led_pins = hw_get_led_array();
     if (led_down >= 0 && led_down <= 7) {
@@ -326,6 +346,7 @@ void rgb_marquee_slot_switch(uint8_t led_down, uint8_t color_led_down, uint8_t l
 //end To scan the number of lamps, decide the final animation area with the direction
 //start_light stop_light 0-99 Indicate gradient brightness
 void rgb_marquee_sweep_fade(uint8_t color, uint8_t dir, uint8_t end, uint8_t start_light, uint8_t stop_light) {
+    if (hw_leds_are_undercover()) return;
     uint8_t startled = 0;
     uint8_t setled = 0;
     uint8_t leds2turnon = 0;
@@ -400,6 +421,7 @@ void rgb_marquee_sweep_fade(uint8_t color, uint8_t dir, uint8_t end, uint8_t sta
 //start Start the lamp position
 //stop Stop lamp position
 void rgb_marquee_sweep_from_to(uint8_t color, uint8_t start, uint8_t stop) {
+    if (hw_leds_are_undercover()) return;
     int8_t setled = start;
     uint32_t *led_pins = hw_get_led_array();
     //Set the brightness
@@ -434,6 +456,7 @@ void rgb_marquee_usb_idle_pwm_callback(nrfx_pwm_evt_type_t event_type) {
     }
 }
 void rgb_marquee_usb_idle(void) {
+    if (hw_leds_are_undercover()) return;
     uint32_t *led_array = hw_get_led_array();
     const uint16_t delay_time = 25;
     static int16_t light_level = 99; //LED brightness value
@@ -540,6 +563,7 @@ void rgb_marquee_usb_idle(void) {
 }
 
 void rgb_marquee_symmetric_out(uint8_t color, uint8_t slot) {
+    if (hw_leds_are_undercover()) return;
     uint32_t *led_pins = hw_get_led_array();
 
     //Adjust the color
@@ -600,6 +624,7 @@ void rgb_marquee_symmetric_out(uint8_t color, uint8_t slot) {
 }
 
 void rgb_marquee_symmetric_in(uint8_t color, uint8_t slot) {
+    if (hw_leds_are_undercover()) return;
     uint32_t *led_pins = hw_get_led_array();
 
     //Adjust the color
@@ -666,7 +691,7 @@ void rgb_marquee_symmetric_in(uint8_t color, uint8_t slot) {
  * @return false The state is prohibited, in the state of ordinary card slot indicator
  */
 bool rgb_marquee_is_enabled(void) {
-    return g_usb_led_marquee_enable;
+    return g_usb_led_marquee_enable && !hw_leds_are_undercover();
 }
 
 /**
@@ -703,6 +728,7 @@ bool rgb_marquee_is_reader_keys_anim(void) {
  * non-blocking: it advances one frame per call, throttled with app_timer.
  */
 void rgb_marquee_reader_keys_loop(void) {
+    if (hw_leds_are_undercover()) return;
     static uint8_t radius = 1;         // 1..4 concentric pairs lit, from the centre
     static uint8_t color_index = 0;
     static uint32_t last_update = 0;
@@ -768,6 +794,7 @@ bool rgb_marquee_is_ble_test_anim(void) {
  * one frame per call, throttled with app_timer.
  */
 void rgb_marquee_ble_test_loop(void) {
+    if (hw_leds_are_undercover()) return;
     static uint8_t step = 0;           // 0..3 pairs lit, growing from the edges in
     static uint8_t color_index = 0;
     static uint32_t last_update = 0;
@@ -829,6 +856,7 @@ bool rgb_marquee_is_ble_active_anim(void) {
 }
 
 void rgb_marquee_ble_active_loop(void) {
+    if (hw_leds_are_undercover()) return;
     static uint8_t step = 0;        // 0..3 pairs lit, growing from the edges in
     static uint32_t last_update = 0;
 
