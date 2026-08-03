@@ -1450,6 +1450,131 @@ static data_frame_tx_t *cmd_processor_idteck_get_emu_id(uint16_t cmd, uint16_t s
     return data_frame_make(cmd, STATUS_SUCCESS, LF_IDTECK_TAG_ID_SIZE, buffer->buffer);
 }
 
+static bool seos_info_lengths_valid(const nfc_tag_seos_information_t *info) {
+    return info != NULL &&
+           info->oid_len <= NFC_TAG_SEOS_OID_MAX &&
+           info->data_tag_len <= NFC_TAG_SEOS_DATA_TAG_MAX &&
+           info->diversifier_len <= NFC_TAG_SEOS_DIVERSIFIER_MAX &&
+           info->hash_alg == NFC_TAG_SEOS_HASHING_SHA256 &&
+           info->encr_alg == NFC_TAG_SEOS_ENCRYPTION_AES;
+}
+
+static bool seos_parse_field(const uint8_t *data, uint16_t length,
+                             uint16_t *offset, uint8_t max_length,
+                             const uint8_t **value, uint8_t *value_length) {
+    if (data == NULL || offset == NULL || value == NULL || value_length == NULL ||
+            *offset >= length) {
+        return false;
+    }
+    uint8_t field_length = data[(*offset)++];
+    if (field_length > max_length || field_length > length - *offset) {
+        return false;
+    }
+    *value = &data[*offset];
+    *value_length = field_length;
+    *offset += field_length;
+    return true;
+}
+
+static data_frame_tx_t *cmd_processor_seos_read_emu_data(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 0u) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_SEOS);
+    if (buffer == NULL) return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+    nfc_tag_seos_information_t *info = (nfc_tag_seos_information_t *)buffer->buffer;
+    uint8_t output[4 + NFC_TAG_SEOS_DATA_MAX + NFC_TAG_SEOS_OID_MAX +
+                   NFC_TAG_SEOS_DATA_TAG_MAX + NFC_TAG_SEOS_DIVERSIFIER_MAX + 2];
+    uint16_t offset = 0;
+
+    CRITICAL_REGION_ENTER();
+    bool valid = seos_info_lengths_valid(info);
+    if (valid) {
+        output[offset++] = info->data_len;
+        memcpy(output + offset, info->data, info->data_len);
+        offset += info->data_len;
+        output[offset++] = info->oid_len;
+        memcpy(output + offset, info->oid, info->oid_len);
+        offset += info->oid_len;
+        output[offset++] = info->data_tag_len;
+        memcpy(output + offset, info->data_tag, info->data_tag_len);
+        offset += info->data_tag_len;
+        output[offset++] = info->diversifier_len;
+        memcpy(output + offset, info->diversifier, info->diversifier_len);
+        offset += info->diversifier_len;
+        output[offset++] = info->hash_alg;
+        output[offset++] = info->encr_alg;
+    }
+    CRITICAL_REGION_EXIT();
+    return valid ? data_frame_make(cmd, STATUS_SUCCESS, offset, output) :
+           data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_seos_write_emu_data(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length < 6u || data == NULL) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_SEOS);
+    if (buffer == NULL) return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+    nfc_tag_seos_information_t *info = (nfc_tag_seos_information_t *)buffer->buffer;
+    uint16_t offset = 0;
+    const uint8_t *new_data;
+    const uint8_t *new_oid;
+    const uint8_t *new_tag;
+    const uint8_t *new_diversifier;
+    uint8_t data_len;
+    uint8_t oid_len;
+    uint8_t tag_len;
+    uint8_t diversifier_len;
+    if (!seos_parse_field(data, length, &offset, NFC_TAG_SEOS_DATA_MAX,
+                          &new_data, &data_len) ||
+            !seos_parse_field(data, length, &offset, NFC_TAG_SEOS_OID_MAX,
+                              &new_oid, &oid_len) ||
+            !seos_parse_field(data, length, &offset, NFC_TAG_SEOS_DATA_TAG_MAX,
+                              &new_tag, &tag_len) ||
+            !seos_parse_field(data, length, &offset, NFC_TAG_SEOS_DIVERSIFIER_MAX,
+                              &new_diversifier, &diversifier_len) ||
+            length - offset != 2u ||
+            data[offset] != NFC_TAG_SEOS_HASHING_SHA256 ||
+            data[offset + 1u] != NFC_TAG_SEOS_ENCRYPTION_AES) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+
+    nfc_tag_seos_information_t updated;
+    memcpy(&updated, info, sizeof(updated));
+    memcpy(updated.data, new_data, data_len);
+    updated.data_len = data_len;
+    memcpy(updated.oid, new_oid, oid_len);
+    updated.oid_len = oid_len;
+    memcpy(updated.data_tag, new_tag, tag_len);
+    updated.data_tag_len = tag_len;
+    memcpy(updated.diversifier, new_diversifier, diversifier_len);
+    updated.diversifier_len = diversifier_len;
+    updated.hash_alg = data[offset++];
+    updated.encr_alg = data[offset];
+
+    CRITICAL_REGION_ENTER();
+    memcpy(info, &updated, sizeof(updated));
+    CRITICAL_REGION_EXIT();
+
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_seos_write_emu_keys(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 16 * 3 || data == NULL) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_SEOS);
+    if (buffer == NULL) return data_frame_make(cmd, STATUS_CMD_ERR, 0, NULL);
+    nfc_tag_seos_information_t *info = (nfc_tag_seos_information_t *)buffer->buffer;
+
+    CRITICAL_REGION_ENTER();
+    memcpy(info->authkey, data, 16);
+    memcpy(info->privenc, data + 16, 16);
+    memcpy(info->privmac, data + 32, 16);
+    CRITICAL_REGION_EXIT();
+
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 #if defined(PROJECT_CHAMELEON_ULTRA)
 // T55xx clone is only available on Chameleon Ultra; the Lite firmware
 // has no LF reader hardware and does not compile the write_*_to_t55xx
@@ -1689,6 +1814,13 @@ static data_frame_tx_t *before_mf0_ntag_emulator_loaded(uint16_t cmd, uint16_t s
     return NULL;
 }
 
+static data_frame_tx_t *before_seos_emulator_loaded(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (!tag_emulation_is_active_type_loaded(TAG_TYPE_SEOS)) {
+        return data_frame_make(cmd, STATUS_INVALID_SLOT_TYPE, 0, NULL);
+    }
+    return NULL;
+}
+
 #if defined(PROJECT_CHAMELEON_ULTRA)
 static data_frame_tx_t *before_hf14a_4_emulator_loaded(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     if (!tag_emulation_is_active_type_loaded(TAG_TYPE_HF14A_4)) {
@@ -1724,6 +1856,9 @@ static nfc_tag_14a_coll_res_reference_t *get_coll_res_data(bool write) {
             break;
         case TAG_TYPE_HF14A_4:
             info = nfc_tag_14a_4_get_coll_res();
+            break;
+        case TAG_TYPE_SEOS:
+            info = nfc_tag_seos_get_coll_res();
             break;
         default:
             // no collision resolution data for slot
@@ -4261,6 +4396,12 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_JABLOTRON_GET_EMU_ID,           NULL,                      cmd_processor_jablotron_get_emu_id,          NULL                   },
     {    DATA_CMD_IDTECK_SET_EMU_ID,              NULL,                      cmd_processor_idteck_set_emu_id,             NULL                   },
     {    DATA_CMD_IDTECK_GET_EMU_ID,              NULL,                      cmd_processor_idteck_get_emu_id,             NULL                   },
+
+    {    DATA_CMD_SEOS_READ_EMU_DATA,             before_seos_emulator_loaded, cmd_processor_seos_read_emu_data,          NULL                   },
+    {    DATA_CMD_SEOS_WRITE_EMU_DATA,            before_seos_emulator_loaded, cmd_processor_seos_write_emu_data,         NULL                   },
+    {    DATA_CMD_SEOS_WRITE_EMU_KEYS,            before_seos_emulator_loaded, cmd_processor_seos_write_emu_keys,         NULL                   },
+
+    /* ISO14443-4 T=CL emulation */
 #if defined(PROJECT_CHAMELEON_ULTRA)
     /* ISO14443-4 T=CL emulation */
     {    DATA_CMD_HF14A_4_APDU_RECV,              before_hf14a_4_emulator_loaded, cmd_processor_hf14a_4_apdu_recv,          NULL                   },

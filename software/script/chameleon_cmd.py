@@ -3340,6 +3340,69 @@ class ChameleonCMD:
         data = struct.pack('!B', enabled)
         return self.device.send_cmd_sync(Command.MF1_SET_FIELD_OFF_DO_RESET, data)
 
+    @expect_response(Status.SUCCESS)
+    def seos_read_emu_data(self):
+        resp = self.device.send_cmd_sync(Command.SEOS_READ_EMU_DATA, None)
+        if resp.status == Status.SUCCESS:
+            offset = 0
+
+            def extract_next(label, max_length):
+                nonlocal offset
+                if offset >= len(resp.data):
+                    raise ValueError(f"malformed SEOS response: missing {label} length")
+                length = resp.data[offset]
+                offset += 1
+                if length > max_length or length > len(resp.data) - offset:
+                    raise ValueError(f"malformed SEOS response: invalid {label} length")
+                value = resp.data[offset:offset + length]
+                offset += length
+                return value
+
+            data = extract_next("data", 255)
+            oid = extract_next("OID", 32)
+            tag = extract_next("tag", 2)
+            diversifier = extract_next("diversifier", 16)
+            if len(resp.data) - offset != 2:
+                raise ValueError("malformed SEOS response: invalid algorithm trailer")
+            hash_alg, encr_alg = struct.unpack_from('!BB', resp.data, offset)
+            if hash_alg != 0x07 or encr_alg != 0x09:
+                raise ValueError("malformed SEOS response: unsupported algorithms")
+            resp.parsed = {
+                "data": data, "oid": oid, "tag": tag, "diversifier": diversifier,
+                "hash_alg": hash_alg, "encr_alg": encr_alg
+            }
+
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def seos_write_emu_data(self, data: bytes, oid: bytes, tag: bytes, diversifier: bytes, hash_alg: int, encr_alg: int):
+        if hash_alg != 0x07 or encr_alg != 0x09:
+            raise ValueError("SEOS currently supports only SHA-256 and AES")
+        for label, value, max_length in (
+            ("data", data, 255), ("OID", oid, 32), ("tag", tag, 2),
+            ("diversifier", diversifier, 16),
+        ):
+            if len(value) > max_length:
+                raise ValueError(f"SEOS {label} exceeds {max_length} bytes")
+        data = bytes([len(data)]) + data
+        oid = bytes([len(oid)]) + oid
+        tag = bytes([len(tag)]) + tag
+        diversifier = bytes([len(diversifier)]) + diversifier
+
+        payload = (
+            data + oid + tag + diversifier +
+            struct.pack('!BB', hash_alg, encr_alg)
+        )
+
+        return self.device.send_cmd_sync(Command.SEOS_WRITE_EMU_DATA, payload)
+
+    @expect_response(Status.SUCCESS)
+    def seos_write_emu_keys(self, auth: bytes, privenc: bytes, privmac: bytes):
+        if len(auth) != 16 or len(privenc) != 16 or len(privmac) != 16:
+            raise ValueError("SEOS keys must each be exactly 16 bytes")
+        payload = auth + privenc + privmac
+        return self.device.send_cmd_sync(Command.SEOS_WRITE_EMU_KEYS, payload)
+
 
 def test_fn():
     # connect to chameleon

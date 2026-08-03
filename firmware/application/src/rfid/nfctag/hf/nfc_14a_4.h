@@ -48,8 +48,48 @@ typedef struct __attribute__((packed)) {
 }
 nfc_tag_14a_4_information_t;
 
+/* Independent T=CL session state used by protocol-specific emulators. */
+typedef struct {
+    uint8_t  m_rx_block_num;
+    uint8_t  m_tx_block_num;
+    uint16_t m_pcd_frame_size;
+    bool     m_cid_available;
+    bool     m_cid_active;
+    uint8_t  m_cid;
+    bool     m_nad_available;
+    bool     m_nad_active;
+    uint8_t  m_nad;
+    uint8_t  m_apdu_buf[NFC_14A_4_MAX_APDU];
+    uint16_t m_apdu_len;
+    bool     m_rx_chaining;
+    volatile bool m_apdu_pending;
+    uint8_t  m_resp_buf[NFC_14A_4_MAX_APDU];
+    uint16_t m_resp_len;
+    uint16_t m_resp_offset;
+    volatile bool m_response_ready;
+    bool     m_wtx_pending;
+    uint8_t  m_wtxm;
+    uint8_t  m_last_reply[NFC_14A_4_MAX_APDU + 4];
+    uint16_t m_last_reply_len;
+    bool     m_last_reply_valid;
+    uint8_t  m_last_iblock[NFC_14A_4_MAX_APDU + 4];
+    uint16_t m_last_iblock_len;
+    uint8_t  m_last_iblock_num;
+    bool     m_last_iblock_chained;
+    bool     m_last_iblock_valid;
+}
+nfc_tag_14a_4_tcl_state_t;
+
 /* Anti-collision resource — used by get_coll_res_data in app_cmd.c */
 nfc_tag_14a_coll_res_reference_t *nfc_tag_14a_4_get_coll_res(void);
+
+/* Handles the low-level ISO14443-4 communication. Returns true when a complete APDU has been read and is ready for response. */
+bool nfc_tag_14a_4_base_handler(nfc_tag_14a_4_tcl_state_t *state,
+                               const uint8_t *data, uint16_t szBytes);
+void nfc_tag_14a_4_base_respond(nfc_tag_14a_4_tcl_state_t *state);
+void nfc_tag_14a_4_base_activate(nfc_tag_14a_4_tcl_state_t *state,
+                                const nfc_14a_ats_t *ats,
+                                uint8_t fsdi, uint8_t cid);
 
 /* tag_base_map callbacks */
 int  nfc_tag_14a_4_data_loadcb(tag_specific_type_t type, tag_data_buffer_t *buffer);
@@ -66,6 +106,7 @@ bool nfc_tag_14a_4_get_pending_apdu(uint8_t *buf, uint16_t *length);
 void nfc_tag_14a_4_set_response(const uint8_t *data, uint16_t length);
 
 /* Reset handler */
+void nfc_tag_14a_4_reset_state(nfc_tag_14a_4_tcl_state_t *state);
 void nfc_tag_14a_4_reset_handler(void);
 
 /* RATS activation parameters supplied by the shared ISO14443-A layer. */

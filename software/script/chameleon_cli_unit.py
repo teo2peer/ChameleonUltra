@@ -33,7 +33,9 @@ from chameleon_utils import (
     execute_tool,
     tqdm_if_exists,
     print_key_table,
+    default_cwd
 )
+
 from chameleon_utils import CLITree
 from chameleon_utils import CR, CG, CB, CC, CY, C0, color_string
 from chameleon_utils import print_mem_dump
@@ -101,12 +103,10 @@ type_id_SAK_dict = {
     0x18: "MIFARE Classic 4K | Plus S 4K | Plus X 4K",
     0x19: "MIFARE Classic 2K",
     0x20: "MIFARE Plus EV1/EV2 | DESFire EV1/EV2/EV3 | DESFire Light | NTAG 4xx | "
-    "MIFARE Plus S 2/4K | MIFARE Plus X 2/4K | MIFARE Plus SE 1K",
+    "MIFARE Plus S 2/4K | MIFARE Plus X 2/4K | MIFARE Plus SE 1K | SEOS",
     0x28: "SmartMX with MIFARE Classic 1K",
     0x38: "SmartMX with MIFARE Classic 4K",
 }
-
-default_cwd = Path.cwd() / Path(__file__).with_name("bin")
 
 
 def load_key_file(import_key, keys):
@@ -944,6 +944,7 @@ hf_mf = hf.subgroup("mf", "MIFARE Classic commands")
 hf_mf_readerkeys = hf_mf.subgroup("readerkeys", "Capture reader keys (MFKey32) by emulating a card")
 hf_mfu = hf.subgroup("mfu", "MIFARE Ultralight / NTAG commands")
 hf_des = hf.subgroup("des", "MIFARE DESFire commands")
+hf_seos = hf.subgroup("seos", "SEOS commands")
 
 lf = root.subgroup("lf", "Low Frequency commands")
 lf_em = lf.subgroup("em", "EM commands")
@@ -7898,7 +7899,7 @@ class LFIOProxRead(LFIOProxReadArgsUnit, ReaderRequiredUnit):
 
     def on_exec(self, args: argparse.Namespace):
         ver, fc, cn, raw8, *futureuse = self.cmd.ioprox_scan()
-        print(f"ioProx XSF format")
+        print("ioProx XSF format")
         print(f"   Version: {color_string((CG, ver))}")
         print(f"   Facility: {color_string((CG, f'{fc} [0x{fc:02X}]'))}")
         print(f"   ID: {color_string((CY, cn))}")
@@ -7933,9 +7934,9 @@ class LFIOProxWriteT55xx(LFIOProxIdArgsUnit, ReaderRequiredUnit):
             cn & 0xFFFF,
             raw8
         )
-        result = self.cmd.ioprox_write_to_t55xx(payload16)
+        self.cmd.ioprox_write_to_t55xx(payload16)
 
-        print(f"ioProx XSF format")
+        print("ioProx XSF format")
         print(f"   Version: {color_string((CG, ver))}")
         print(f"   Facility: {color_string((CG, f'{fc} [0x{fc:02X}]'))}")
         print(f"   ID: {color_string((CY, cn))}")
@@ -7984,9 +7985,9 @@ class LFIOProxEconfig(SlotIndexArgsAndGoUnit, LFIOProxIdArgsUnit):
                 raw8
             )
 
-            result = self.cmd.ioprox_set_emu_id(payload16)
+            self.cmd.ioprox_set_emu_id(payload16)
 
-            print(f"ioProx XSF format")
+            print("ioProx XSF format")
             print(f"   Version: {color_string((CG, ver))}")
             print(f"   Facility: {color_string((CG, f'{fc} [0x{fc:02X}]'))}")
             print(f"   ID: {color_string((CY, cn))}")
@@ -7995,7 +7996,7 @@ class LFIOProxEconfig(SlotIndexArgsAndGoUnit, LFIOProxIdArgsUnit):
         else:
             # GET
             ver, fc, cn, raw8, *futureuse = self.cmd.ioprox_get_emu_id()
-            print(f"ioProx XSF format")
+            print("ioProx XSF format")
             print(f"   Version: {color_string((CG, ver))}")
             print(f"   Facility: {color_string((CG, f'{fc} [0x{fc:02X}]'))}")
             print(f"   ID: {color_string((CY, cn))}")
@@ -8367,7 +8368,7 @@ class LFT55xxClone(ReaderRequiredUnit):
     def on_exec(self, args: argparse.Namespace):
         # Clone requires LF writer — only available on Chameleon Ultra (not Lite)
         if self.cmd.get_device_model() != 0:
-            print(f" - Error: LF clone requires Chameleon Ultra. Lite has no LF writer.")
+            print(" - Error: LF clone requires Chameleon Ultra. Lite has no LF writer.")
             return
         t = args.type
 
@@ -8405,7 +8406,7 @@ class LFT55xxClone(ReaderRequiredUnit):
                 oem,
             )
             self.cmd.hidprox_write_to_t55xx(id_bytes)
-            print(f" - HID Prox cloned to T55xx")
+            print(" - HID Prox cloned to T55xx")
             print(f"   Format : {fmt.name}")
             if fc:
                 print(f"   FC     : {fc}")
@@ -8427,7 +8428,7 @@ class LFT55xxClone(ReaderRequiredUnit):
                 raw8 = res[3]
             payload16 = struct.pack(">BBH8s4x", ver & 0xFF, fc & 0xFF, cn & 0xFFFF, raw8)
             self.cmd.ioprox_write_to_t55xx(payload16)
-            print(f" - ioProx cloned to T55xx")
+            print(" - ioProx cloned to T55xx")
             print(f"   Ver    : {ver}")
             print(f"   FC     : {fc} [0x{fc:02X}]")
             print(f"   CN     : {cn}")
@@ -9455,7 +9456,7 @@ class HWRaw(DeviceRequiredUnit):
         if response.data:
             print(f"   Data (HEX): {response.data.hex()}")
         else:
-            print(f"   Data (HEX): (none)")
+            print("   Data (HEX): (none)")
 
 
 @hf_14a.command("raw")
@@ -10703,9 +10704,8 @@ class DataPlot(BaseCLIUnit):
         if not args.ascii:
             # Try PyQt5 first, then matplotlib
             try:
-                from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
-                from PyQt5.QtCore import Qt
-                import pyqtgraph as pg
+                __import__('PyQt5')
+                __import__('pyqtgraph')
                 _plot_pyqtgraph(xs, view, mean, threshold, start, end)
                 return
             except ImportError:
@@ -10713,13 +10713,13 @@ class DataPlot(BaseCLIUnit):
             try:
                 import matplotlib
                 matplotlib.use('Qt5Agg')
-                import matplotlib.pyplot as plt
+                __import__('matplotlib.pyplot')
                 _plot_matplotlib(xs, view, mean, threshold, start, end)
                 return
             except ImportError:
                 pass
             try:
-                import matplotlib.pyplot as plt
+                __import__('matplotlib.pyplot')
                 _plot_matplotlib(xs, view, mean, threshold, start, end)
                 return
             except ImportError:
@@ -10798,9 +10798,7 @@ def _plot_matplotlib(xs, ys, mean, threshold, start, end):
 
 def _plot_pyqtgraph(xs, ys, mean, threshold, start, end):
     import sys
-    from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel
-    from PyQt5.QtCore import Qt
-    from PyQt5.QtGui import QFont
+    from PyQt5.QtWidgets import QApplication
     import pyqtgraph as pg
 
     pg.setConfigOption('background', '#0d1117')
@@ -10990,10 +10988,6 @@ class DataModulation(BaseCLIUnit):
         if len(runs) < 4:
             print(f" Modulation: {CR}insufficient transitions{C0}")
             return
-
-        runs_sorted = sorted(runs)
-        # Remove outliers (top/bottom 10%)
-        trim = max(1, len(runs) // 10)
 
         # Estimate clock: most common run length = half-period
         from collections import Counter
@@ -11703,7 +11697,7 @@ class EMVScan(DeviceRequiredUnit):
         tags[0x9F12] = app_tags[0x9F12]
         tags[0x50] = app_tags[0x50]
 
-        print(f'')
+        print('')
         print(f' {CG}── Card Details ──────────────────────{C0}')
 
         # App label — show first unique label only
@@ -11916,7 +11910,7 @@ class EMVScan(DeviceRequiredUnit):
                 cryptogram_fields['IssuerApplicationData'] = v.hex().upper()
                 break
         if cryptogram_fields:
-            print(f'')
+            print('')
             print(f' {CG}── Transaction Cryptogram ───────────{C0}')
             if 'ApplicationCryptogram' in cryptogram_fields:
                 print(f' {CG}Cryptogram    :{C0} {CY}{cryptogram_fields["ApplicationCryptogram"]}{C0}')
@@ -12142,32 +12136,32 @@ class EMVLoad(DeviceRequiredUnit):
 
         try:
             v = data['PPSE']['FCITemplate']['value'].replace(' ', '')
-            l = data['PPSE']['FCITemplate']['length']
+            length = data['PPSE']['FCITemplate']['length']
             static_pairs.append((
                 bytes.fromhex('00a404000e325041592e5359532e4444463031'),
-                tlv_resp('6F', l, v),
+                tlv_resp('6F', length, v),
                 'SELECT PPSE'))
         except Exception as e:
             print(f' {CR}PPSE: {e}{C0}')
 
         try:
             v = data['Application']['FCITemplate']['value'].replace(' ', '')
-            l = data['Application']['FCITemplate']['length']
+            length = data['Application']['FCITemplate']['length']
             aid = data['Application']['AID'].replace(' ', '')
             static_pairs.append((
                 bytes.fromhex('00a4040007' + aid),
-                tlv_resp('6F', l, v),
+                tlv_resp('6F', length, v),
                 'SELECT AID'))
         except Exception as e:
             print(f' {CR}Application FCI: {e}{C0}')
 
         try:
             v = data['Application']['GPO']['value'].replace(' ', '')
-            l = data['Application']['GPO']['length']
+            length = data['Application']['GPO']['length']
             tag = data['Application']['GPO'].get('tag', '77')
             static_pairs.append((
                 bytes.fromhex('80a80000'),
-                tlv_resp(tag, l, v),
+                tlv_resp(tag, length, v),
                 'GPO'))
         except Exception as e:
             print(f' {CR}GPO: {e}{C0}')
@@ -12177,12 +12171,12 @@ class EMVLoad(DeviceRequiredUnit):
                 sfi_n = int(rec['SFI'], 16)
                 rec_n = int(rec['RecordNum'], 16)
                 v = rec['Data']['value'].replace(' ', '')
-                l = rec['Data']['length']
+                length = rec['Data']['length']
                 tag = rec['Data'].get('tag', '70')
                 p2 = (sfi_n << 3) | 4
                 static_pairs.append((
                     bytes([0x00, 0xB2, rec_n, p2, 0x00]),
-                    tlv_resp(tag, l, v),
+                    tlv_resp(tag, length, v),
                     f'READ RECORD SFI={sfi_n} rec={rec_n}'))
         except Exception as e:
             print(f' {CR}Records: {e}{C0}')
@@ -12238,7 +12232,7 @@ class EMVApdu(DeviceRequiredUnit):
         timeout_ms = max(1000, min(60000, args.timeout))
 
         print(f' {CY}ISO14443-4 T=CL APDU relay started{C0}')
-        print(f' Waiting for a reader to connect (SAK=20 slot required)...')
+        print(' Waiting for a reader to connect (SAK=20 slot required)...')
         print(f' Type {CY}quit{C0} to exit, or enter hex response bytes when prompted.')
 
         exchange_count = 0
@@ -12582,41 +12576,61 @@ def _desfire_get_version(cmd) -> dict:
     info: dict = {}
     hw = resp[:-1]
     # HW frame — individual guards so a short frame still populates what it has
-    if len(hw) >= 1: info['hw_vendor']  = hw[0]
-    if len(hw) >= 2: info['hw_type']    = hw[1]
-    if len(hw) >= 3: info['hw_subtype'] = hw[2]
-    if len(hw) >= 4: info['hw_major']   = hw[3]
-    if len(hw) >= 5: info['hw_minor']   = hw[4]
-    if len(hw) >= 6: info['hw_storage'] = hw[5]
-    if len(hw) >= 7: info['hw_proto']   = hw[6]
+    if len(hw) >= 1:
+        info['hw_vendor'] = hw[0]
+    if len(hw) >= 2:
+        info['hw_type'] = hw[1]
+    if len(hw) >= 3:
+        info['hw_subtype'] = hw[2]
+    if len(hw) >= 4:
+        info['hw_major'] = hw[3]
+    if len(hw) >= 5:
+        info['hw_minor'] = hw[4]
+    if len(hw) >= 6:
+        info['hw_storage'] = hw[5]
+    if len(hw) >= 7:
+        info['hw_proto'] = hw[6]
 
     if resp[-1] == 0xAF:
         resp2 = _des_transceive(cmd, 0xAF)
         sw = resp2[:-1]
         # SW frame — same per-field guards
-        if len(sw) >= 1: info['sw_vendor']  = sw[0]
-        if len(sw) >= 2: info['sw_type']    = sw[1]
-        if len(sw) >= 3: info['sw_subtype'] = sw[2]
-        if len(sw) >= 4: info['sw_major']   = sw[3]
-        if len(sw) >= 5: info['sw_minor']   = sw[4]
-        if len(sw) >= 6: info['sw_storage'] = sw[5]
-        if len(sw) >= 7: info['sw_proto']   = sw[6]
+        if len(sw) >= 1:
+            info['sw_vendor'] = sw[0]
+        if len(sw) >= 2:
+            info['sw_type'] = sw[1]
+        if len(sw) >= 3:
+            info['sw_subtype'] = sw[2]
+        if len(sw) >= 4:
+            info['sw_major'] = sw[3]
+        if len(sw) >= 5:
+            info['sw_minor'] = sw[4]
+        if len(sw) >= 6:
+            info['sw_storage'] = sw[5]
+        if len(sw) >= 7:
+            info['sw_proto'] = sw[6]
 
         # Fallback: derive SW fields from HW when SW frame payload is empty
         if 'sw_major' not in info and 'hw_major' in info:
             info['sw_major'] = _DESFIRE_HW_MAJOR_TO_SW_MAJOR.get(
                 info['hw_major'], info['hw_major'])
             info['sw_minor'] = 0
-        if 'sw_storage' not in info: info['sw_storage'] = info.get('hw_storage')
-        if 'sw_proto'   not in info: info['sw_proto']   = info.get('hw_proto')
+        if 'sw_storage' not in info:
+            info['sw_storage'] = info.get('hw_storage')
+        if 'sw_proto' not in info:
+            info['sw_proto'] = info.get('hw_proto')
 
         if resp2[-1] == 0xAF:
             resp3 = _des_transceive(cmd, 0xAF)
             p3 = resp3[:-1]
-            if len(p3) >= 7:  info['uid']       = p3[:7].hex().upper()
-            if len(p3) >= 12: info['batch']     = p3[7:12].hex().upper()
-            if len(p3) >= 13: info['prod_week'] = p3[12]
-            if len(p3) >= 14: info['prod_year'] = p3[13]
+            if len(p3) >= 7:
+                info['uid'] = p3[:7].hex().upper()
+            if len(p3) >= 12:
+                info['batch'] = p3[7:12].hex().upper()
+            if len(p3) >= 13:
+                info['prod_week'] = p3[12]
+            if len(p3) >= 14:
+                info['prod_year'] = p3[13]
     return info
 
 
@@ -12703,7 +12717,7 @@ class HfDesInfo(ReaderRequiredUnit):
                 for aid in aids:
                     print(f"   AID: {aid.hex().upper()}  ({int.from_bytes(aid, 'little'):06X})")
             else:
-                print(f"\n Applications  : none")
+                print("\n Applications  : none")
         except Exception as e:
             print(f" {CY}[!] GetApplicationIDs failed: {e}{C0}")
 
@@ -12726,19 +12740,30 @@ class HfDesEnum(ReaderRequiredUnit):
         d = bytes(resp.data)
         try:
             off = 0
-            uid_len = d[off]; off += 1
-            uid = d[off:off + uid_len]; off += uid_len
-            atqa = d[off:off + 2]; off += 2
-            sak = d[off]; off += 1
-            ats_len = d[off]; off += 1
-            ats = d[off:off + ats_len]; off += ats_len
-            num = d[off]; off += 1
+            uid_len = d[off]
+            off += 1
+            uid = d[off:off + uid_len]
+            off += uid_len
+            atqa = d[off:off + 2]
+            off += 2
+            sak = d[off]
+            off += 1
+            ats_len = d[off]
+            off += 1
+            ats = d[off:off + ats_len]
+            off += ats_len
+            num = d[off]
+            off += 1
             pairs = []
             for _ in range(num):
-                cl = d[off]; off += 1
-                c = d[off:off + cl]; off += cl
-                rl = d[off] | (d[off + 1] << 8); off += 2
-                r = d[off:off + rl]; off += rl
+                cl = d[off]
+                off += 1
+                c = d[off:off + cl]
+                off += cl
+                rl = d[off] | (d[off + 1] << 8)
+                off += 2
+                r = d[off:off + rl]
+                off += rl
                 pairs.append((c, r))
         except IndexError:
             print(f" {CR}Malformed scan response{C0}")
@@ -12789,7 +12814,7 @@ class HfDesEnum(ReaderRequiredUnit):
                 fstr = f"  files: {', '.join(f'{f:02X}' for f in fl)}" if fl else ""
                 print(f"   AID {aid_hex}  ({int.from_bytes(aid, 'little'):06X}){fstr}")
         else:
-            print(f"\n Applications  : none")
+            print("\n Applications  : none")
 
 
 @hf_des.command("chk")
@@ -12993,8 +13018,7 @@ class HfDesChk(ReaderRequiredUnit):
 
     def on_exec(self, args: argparse.Namespace):
         try:
-            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-            from cryptography.hazmat.backends import default_backend
+            __import__('cryptography')
         except ImportError:
             print(f" {CR}[!] 'cryptography' library required: pip install cryptography{C0}")
             return
@@ -13008,7 +13032,7 @@ class HfDesChk(ReaderRequiredUnit):
         key_no = args.keyno
 
         # Select card and get AID list
-        print(f" Selecting card...")
+        print(" Selecting card...")
         try:
             uid_bytes, sak, _ = _des_select(self.cmd)
         except RuntimeError as e:
@@ -13095,3 +13119,162 @@ class HfDesChk(ReaderRequiredUnit):
                 print(f"\n   {CG}{algo:8s}  AID {aid}  key#{kno}  {key_hex}{C0}")
         else:
             print(f"\n {CR}No keys found{C0}")
+
+
+@hf_seos.command("eview")
+class HFSeosEView(SlotIndexArgsAndGoUnit, DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "View data from emulator memory"
+        self.add_slot_args(parser)
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        selected_slot = self.cmd.get_active_slot()
+        slot_info = self.cmd.get_slot_info()
+        tag_type = TagSpecificType(slot_info[selected_slot]["hf"])
+
+        if tag_type != TagSpecificType.SEOS:
+            raise Exception(
+                "Card in current slot is not SEOS"
+            )
+        data = self.cmd.seos_read_emu_data()
+
+        print("[=]        Data:", data["data"].hex().upper())
+        print("[=]         OID:", data["oid"].hex().upper())
+        print("[=]         Tag:", data["tag"].hex().upper())
+        print("[=] Diversifier:", data["diversifier"].hex().upper())
+
+
+@hf_seos.command("eload")
+class HFSeosELoad(SlotIndexArgsAndGoUnit, HF14AAntiCollArgsUnit, DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Load data into emulator memory"
+        self.add_slot_args(parser)
+        self.add_hf14a_anticoll_args(parser)
+        parser.add_argument("-d", "--data", type=str, default=None, metavar="<hex>",
+                            help="Data to present to reader (2-255 bytes). Must be valid BER-TLV.")
+        parser.add_argument("-o", "--oid", type=str, default=None, metavar="<hex>",
+                            help="Target OID (1-32 bytes).")
+        parser.add_argument("-t", "--tag", type=str, default=None, metavar="<hex>",
+                            help="Tag of presented data (1-2 bytes).")
+        parser.add_argument("--diversifier", type=str, default=None, metavar="<hex>",
+                            help="Simulated card diversifier (1-16 bytes).")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        selected_slot = self.cmd.get_active_slot()
+        slot_info = self.cmd.get_slot_info()
+        tag_type = TagSpecificType(slot_info[selected_slot]["hf"])
+
+        if tag_type != TagSpecificType.SEOS:
+            raise Exception(
+                "Card in current slot is not SEOS"
+            )
+
+        # Handle ISO14443-A anticollision changes
+        anti_coll_data = self.cmd.hf14a_get_anti_coll_data()
+        if anti_coll_data is None or len(anti_coll_data) == 0:
+            print(
+                color_string((CR, "Slot does not contain any HF 14A config"))
+            )
+            return
+        uid = anti_coll_data["uid"]
+        atqa = anti_coll_data["atqa"]
+        sak = anti_coll_data["sak"]
+        ats = anti_coll_data["ats"]
+
+        change_requested, _, _, _, _, _ = self.update_hf14a_anticoll(
+            args, uid, atqa, sak, ats
+        )
+
+        if (
+            args.data is None and
+            args.oid is None and
+            args.tag is None and
+            args.diversifier is None and
+            change_requested is False
+        ):
+            print(color_string((CR, "Error: No changes were requested.")))
+            return
+
+        seos_data = self.cmd.seos_read_emu_data()
+
+        # Parse args
+        data = bytes.fromhex(args.data) if args.data else seos_data["data"]
+        oid = bytes.fromhex(args.oid) if args.oid else seos_data["oid"]
+        tag = bytes.fromhex(args.tag) if args.tag else seos_data["tag"]
+        diversifier = bytes.fromhex(args.diversifier) if args.diversifier else seos_data["diversifier"]
+
+        # These are not currently configurable
+        hash_alg = seos_data["hash_alg"]
+        encr_alg = seos_data["encr_alg"]
+
+        if len(data) < 2 or len(data) > 255:
+            print(color_string((CR, "Error: invalid data length. Accepts 2-255 bytes.")))
+            return
+        if len(oid) < 1 or len(oid) > 32:
+            print(color_string((CR, "Error: invalid OID length. Accepts 1-32 bytes.")))
+            return
+        if len(tag) < 1 or len(tag) > 2:
+            print(color_string((CR, "Error: invalid tag length. Accepts 1-2 bytes.")))
+            return
+        if len(diversifier) < 1 or len(diversifier) > 16:
+            print(color_string((CR, "Error: invalid diversifier length. Accepts 1-16 bytes.")))
+            return
+
+        self.cmd.seos_write_emu_data(
+            data=data,
+            oid=oid,
+            tag=tag,
+            diversifier=diversifier,
+            hash_alg=hash_alg,
+            encr_alg=encr_alg
+        )
+
+
+@hf_seos.command("keys")
+class HFSeosKeys(SlotIndexArgsAndGoUnit, DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Load data into emulator memory"
+        self.add_slot_args(parser)
+        parser.add_argument("-a", "--auth", type=str, metavar="<hex>", required=True,
+                            help="Auth key (16 bytes)")
+        parser.add_argument("-e", "--privenc", type=str, metavar="<hex>", required=True,
+                            help="PrivEnc key (16 bytes)")
+        parser.add_argument("-m", "--privmac", type=str, metavar="<hex>", required=True,
+                            help="PrivMac key (16 bytes)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        selected_slot = self.cmd.get_active_slot()
+        slot_info = self.cmd.get_slot_info()
+        tag_type = TagSpecificType(slot_info[selected_slot]["hf"])
+
+        if tag_type != TagSpecificType.SEOS:
+            raise Exception(
+                "Card in current slot is not SEOS"
+            )
+
+        # Parse args
+        auth = bytes.fromhex(args.auth)
+        privenc = bytes.fromhex(args.privenc)
+        privmac = bytes.fromhex(args.privmac)
+
+        if len(auth) != 16:
+            print(color_string((CR, "Error: invalid auth key length. Accepts 16 bytes.")))
+            return
+        if len(privenc) != 16:
+            print(color_string((CR, "Error: invalid PrivEnc key length. Accepts 16 bytes.")))
+            return
+        if len(privmac) != 16:
+            print(color_string((CR, "Error: invalid PrivMac key length. Accepts 16 bytes.")))
+            return
+
+        self.cmd.seos_write_emu_keys(
+            auth=auth,
+            privenc=privenc,
+            privmac=privmac
+        )

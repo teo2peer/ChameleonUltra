@@ -143,6 +143,7 @@ void nfc_tag_mf1_data_save_failcb(tag_specific_type_t type, tag_data_buffer_t *b
 
 DEFINE_TAG_CALLBACKS(nfc_tag_mf0_ntag, 16)
 DEFINE_TAG_CALLBACKS(nfc_tag_14a_4, 16)
+DEFINE_TAG_CALLBACKS(nfc_tag_seos, 16)
 
 void nfc_tag_mf0_ntag_data_save_failcb(tag_specific_type_t type, tag_data_buffer_t *buffer) {
     (void)type;

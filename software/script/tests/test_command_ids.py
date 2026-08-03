@@ -136,6 +136,15 @@ class TestCommandMirror(unittest.TestCase):
         self.assertEqual(int(Command.HF14A_4_EMV_TRACE_META), 6008)
         self.assertEqual(int(Command.HF14A_4_EMV_TRACE_GET), 6009)
 
+    def test_seos_commands_follow_deployed_mf1_commands(self):
+        self.assertEqual(int(Command.MF1_SET_RANDOM_UID_MODE), 4042)
+        self.assertEqual(int(Command.MF1_GET_RANDOM_UID_MODE), 4043)
+        self.assertEqual(int(Command.MF1_SET_READER_KEYS_ANIM), 4044)
+        self.assertEqual(int(Command.MF1_READER_KEYS_RESELECT), 4045)
+        self.assertEqual(int(Command.SEOS_READ_EMU_DATA), 4046)
+        self.assertEqual(int(Command.SEOS_WRITE_EMU_DATA), 4047)
+        self.assertEqual(int(Command.SEOS_WRITE_EMU_KEYS), 4048)
+
     def test_iso_dep_reader_session_commands_mirrored(self):
         self.assertEqual(int(Command.HF14A_4_READER_SESSION_START), 6011)
         self.assertEqual(int(Command.HF14A_4_READER_SESSION_EXCHANGE), 6012)
@@ -260,11 +269,17 @@ class TestCommandMirror(unittest.TestCase):
             "HF14A_4_SET_ANTI_COLL",
             "HF14A_4_STATIC_RESP",
         }
+        seos = {
+            "SEOS_READ_EMU_DATA",
+            "SEOS_WRITE_EMU_DATA",
+            "SEOS_WRITE_EMU_KEYS",
+        }
         for names, expected in (
             (generic, "before_hf_emulator_loaded"),
             (mf1, "before_mf1_emulator_loaded"),
             (mf0, "before_mf0_ntag_emulator_loaded"),
             (hf14a4, "before_hf14a_4_emulator_loaded"),
+            (seos, "before_seos_emulator_loaded"),
         ):
             for name in names:
                 with self.subTest(command=name):

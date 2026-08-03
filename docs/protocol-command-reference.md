@@ -70,7 +70,7 @@ payload[length] | LRC3
 | 1000-1999 | Dispositivo, slots, ajustes, teclado | 1000-1021, 1023-1053; 1022 y 1054-1999 libres |
 | 2000-2999 | Lector HF | 2000-2018, 2020-2025, 2100-2101, 2200-2201 |
 | 3000-3999 | Lector LF | 3000-3006, 3009-3016, 3018-3020, 3030-3032 |
-| 4000-4999 | Emulación HF | 4000-4001, 4004-4045 |
+| 4000-4999 | Emulación HF | 4000-4001, 4004-4048 |
 | 5000-5999 | Emulación LF | 5000-5013 |
 | 6000-6999 | ISO-DEP/EMV | 6000-6014; 6015-6999 libres |
 | 7000-7999 | BLE | 7000-7006, 7010-7032, 7040-7047, 7050-7054 |
@@ -330,7 +330,7 @@ Descriptor HID Prox de 13 bytes:
 Descriptor ioProx de 16 bytes:
 `version, facility, card_number:u16be, raw[8], reserved[4]`.
 
-## 4000-4045: emulación HF (Ultra y Lite)
+## 4000-4048: emulación HF (Ultra y Lite)
 
 Los setters modifican RAM salvo que se indique otra cosa. Para persistir el slot
 activo use 1009, cambie de slot o apague de forma controlada. Los comandos host
@@ -339,8 +339,9 @@ Los comandos que leen o mutan el buffer MFC o MF0/NTAG requieren que el tipo
 configurado sea el owner exacto cargado del slot activo; 4001/4018 aceptan
 cualquier owner HF cargado. La telemetría retenida 4005/4006 y 4034/4035 no toca
 ese buffer y permanece descargable tras cambiar owner. Incompatibilidad o load
-fallido devuelve `INVALID_SLOT_TYPE`. 4044 es una animación reader-only y tampoco
-requiere owner de emulación.
+fallido devuelve `INVALID_SLOT_TYPE`. Los comandos 4046-4048 requieren un owner
+SEOS cargado. 4044 es una animación reader-only y tampoco requiere owner de
+emulación.
 
 | ID | Comando | Petición | Respuesta correcta/efecto |
 |---:|---|---|---|
@@ -388,6 +389,9 @@ requiere owner de emulación.
 | 4043 | `MF1_GET_RANDOM_UID_MODE` | ignorado | `enabled:u8` |
 | 4044 | `MF1_SET_READER_KEYS_ANIM` | `enabled:u8` | Animación rainbow RAM-only de captura Reader Keys |
 | 4045 | `MF1_READER_KEYS_RESELECT` | `mute_ms:u16be` (50..500) | Silencia y vuelve a presentar la emulación para reintentos automáticos |
+| 4046 | `SEOS_READ_EMU_DATA` | vacío obligatorio | Cuatro campos `len:u8,value[len]` en orden data/OID/tag/diversifier, seguidos por `hash_alg:u8,encr_alg:u8`; longitudes persistidas inválidas devuelven `CMD_ERR` |
+| 4047 | `SEOS_WRITE_EMU_DATA` | Mismo layout de cuatro campos, seguido por `hash_alg:u8,encr_alg:u8`; máximos 255/32/2/16 | Actualiza todo el conjunto en RAM solo tras validar el payload completo |
+| 4048 | `SEOS_WRITE_EMU_KEYS` | `auth[16],privenc[16],privmac[16]` | Actualiza las tres claves SEOS en RAM como una sola operación |
 
 Registro 4006, exactamente 18 bytes:
 
@@ -630,7 +634,7 @@ Los siguientes IDs no tienen handler en esta versión:
 2019, 2026-2099, 2102-2199, 2202-2999
 3007-3008, 3017, 3021-3029
 3032 (nombre reservado pero sin dispatch), 3033-3999
-4002-4003, 4045-4999
+4002-4003, 4049-4999
 5014-5999
 6015-6999 (incluye 6400)
 7007-7009, 7033-7039, 7048-7049, 7055-7999
