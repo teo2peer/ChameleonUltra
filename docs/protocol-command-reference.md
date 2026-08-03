@@ -70,7 +70,7 @@ payload[length] | LRC3
 | 1000-1999 | Dispositivo, slots, ajustes, teclado | 1000-1021, 1023-1053; 1022 y 1054-1999 libres |
 | 2000-2999 | Lector HF | 2000-2018, 2020-2025, 2100-2101, 2200-2201 |
 | 3000-3999 | Lector LF | 3000-3006, 3009-3016, 3018-3020, 3030-3032 |
-| 4000-4999 | Emulación HF | 4000-4001, 4004-4044 |
+| 4000-4999 | Emulación HF | 4000-4001, 4004-4045 |
 | 5000-5999 | Emulación LF | 5000-5013 |
 | 6000-6999 | ISO-DEP/EMV | 6000-6014; 6015-6999 libres |
 | 7000-7999 | BLE | 7000-7006, 7010-7032, 7040-7047, 7050-7054 |
@@ -330,7 +330,7 @@ Descriptor HID Prox de 13 bytes:
 Descriptor ioProx de 16 bytes:
 `version, facility, card_number:u16be, raw[8], reserved[4]`.
 
-## 4000-4044: emulación HF (Ultra y Lite)
+## 4000-4045: emulación HF (Ultra y Lite)
 
 Los setters modifican RAM salvo que se indique otra cosa. Para persistir el slot
 activo use 1009, cambie de slot o apague de forma controlada. Los comandos host
@@ -387,12 +387,13 @@ requiere owner de emulación.
 | 4042 | `MF1_SET_RANDOM_UID_MODE` | `enabled:u8` | Genera UID nuevo en cada activación; desactiva block0 mode |
 | 4043 | `MF1_GET_RANDOM_UID_MODE` | ignorado | `enabled:u8` |
 | 4044 | `MF1_SET_READER_KEYS_ANIM` | `enabled:u8` | Animación rainbow RAM-only de captura Reader Keys |
+| 4045 | `MF1_READER_KEYS_RESELECT` | `mute_ms:u16be` (50..500) | Silencia y vuelve a presentar la emulación para reintentos automáticos |
 
 Registro 4006, exactamente 18 bytes:
 
 ```text
 block:u8
-flags:u8                 # bit0 Key B, bit1 nested
+flags:u8                 # bit0 Key B, bit1 nested, bit2 auth successful
 cuid:u32be
 nt:u32be
 nr_encrypted:u32be

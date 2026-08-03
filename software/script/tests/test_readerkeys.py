@@ -34,6 +34,7 @@ class TestReaderKeysCommands(unittest.TestCase):
         self.assertEqual(Command.MF1_SET_RANDOM_UID_MODE, 4042)
         self.assertEqual(Command.MF1_GET_RANDOM_UID_MODE, 4043)
         self.assertEqual(Command.MF1_SET_READER_KEYS_ANIM, 4044)
+        self.assertEqual(Command.MF1_READER_KEYS_RESELECT, 4045)
 
     def test_cli_tree(self):
         node = _child(_child(_child(u.root, "hf"), "mf"), "readerkeys")

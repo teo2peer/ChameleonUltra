@@ -143,6 +143,7 @@ void nfc_tag_mf1_data_save_failcb(tag_specific_type_t type, tag_data_buffer_t *b
 bool nfc_tag_mf1_data_factory(uint8_t slot, tag_specific_type_t tag_type);
 void nfc_tag_mf1_set_detection_enable(bool enable);
 bool nfc_tag_mf1_is_detection_enable(void);
+bool nfc_tag_mf1_reader_keys_reselect(uint16_t mute_ms);
 void nfc_tag_mf1_set_random_uid_mode(bool enable);
 bool nfc_tag_mf1_is_random_uid_mode(void);
 void nfc_tag_mf1_detection_log_clear(void);

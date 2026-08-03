@@ -7,6 +7,7 @@
 #include "fds_util.h"
 #include "tag_persistence.h"
 #include "app_util_platform.h"
+#include "nrf_delay.h"
 
 #ifdef NFC_MF1_FAST_SIM
 #include "mf1_crypto1.h"
@@ -470,7 +471,6 @@ void append_mf1_auth_log_step2(uint8_t *nr, uint8_t *ar) {
  * @param is_auth_success: Whether to verify success
  */
 void append_mf1_auth_log_step3(bool is_auth_success) {
-    (void)is_auth_success;
     ensure_auth_log_valid();
     // Determine to the upper limit and skip this operation directly to avoid covering the previous records
     if (m_auth_log.count >= MF1_AUTH_LOG_MAX_SIZE) {
@@ -479,6 +479,9 @@ void append_mf1_auth_log_step3(bool is_auth_success) {
     if (!mf1_auth_log_latch_finish(&m_auth_log_latch, m_detection_enabled,
                                    m_detection_generation)) return;
 
+    if (is_auth_success) {
+        m_pending_auth_log.flags |= MF1_AUTH_LOG_FLAG_SUCCESS;
+    }
     memcpy(&m_auth_log.logs[m_auth_log.count], &m_pending_auth_log,
            sizeof(m_pending_auth_log));
     m_auth_log.count += 1;
@@ -1421,6 +1424,14 @@ void nfc_tag_mf1_set_detection_enable(bool enable) {
 // Whether it can be detected at present
 bool nfc_tag_mf1_is_detection_enable(void) {
     return m_detection_enabled;
+}
+
+bool nfc_tag_mf1_reader_keys_reselect(uint16_t mute_ms) {
+    if (!m_detection_enabled || mute_ms < 50u || mute_ms > 500u) return false;
+    nfc_tag_14a_sense_switch(false);
+    nrf_delay_ms(mute_ms);
+    nfc_tag_14a_sense_switch(true);
+    return true;
 }
 
 // Enable/disable random-UID-per-activation mode

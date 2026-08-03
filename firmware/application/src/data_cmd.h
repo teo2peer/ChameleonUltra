@@ -183,6 +183,7 @@
 #define DATA_CMD_MF1_SET_RANDOM_UID_MODE        (4042)  // emulate a new random UID on each reader activation
 #define DATA_CMD_MF1_GET_RANDOM_UID_MODE        (4043)
 #define DATA_CMD_MF1_SET_READER_KEYS_ANIM       (4044)  // center-out rainbow LED animation for reader-key capture
+#define DATA_CMD_MF1_READER_KEYS_RESELECT        (4045)  // bounded RF mute/reselect for automatic reader-key retries
 //
 // ******************************************************************
 

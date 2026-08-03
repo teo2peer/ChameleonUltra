@@ -231,6 +231,7 @@ class TestCommandMirror(unittest.TestCase):
             "MF1_SET_PRNG_TYPE",
             "MF1_SET_RANDOM_UID_MODE",
             "MF1_GET_RANDOM_UID_MODE",
+            "MF1_READER_KEYS_RESELECT",
             "MF1_GET_GEN1A_MODE",
             "MF1_SET_GEN1A_MODE",
             "MF1_GET_GEN2_MODE",

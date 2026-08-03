@@ -2199,6 +2199,15 @@ static data_frame_tx_t *cmd_processor_mf1_set_reader_keys_anim(uint16_t cmd, uin
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
+static data_frame_tx_t *cmd_processor_mf1_reader_keys_reselect(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 2) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t mute_ms = cmd_read_u16be(data);
+    status = nfc_tag_mf1_reader_keys_reselect(mute_ms) ? STATUS_SUCCESS : STATUS_PAR_ERR;
+    return data_frame_make(cmd, status, 0, NULL);
+}
+
 static data_frame_tx_t *cmd_processor_mf1_get_gen1a_mode(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t mode = nfc_tag_mf1_is_gen1a_magic_mode();
     return data_frame_make(cmd, STATUS_SUCCESS, 1, &mode);
@@ -4206,6 +4215,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_MF1_SET_RANDOM_UID_MODE,      before_mf1_emulator_loaded,  cmd_processor_mf1_set_random_uid_mode,       NULL                   },
     {    DATA_CMD_MF1_GET_RANDOM_UID_MODE,      before_mf1_emulator_loaded,  cmd_processor_mf1_get_random_uid_mode,       NULL                   },
     {    DATA_CMD_MF1_SET_READER_KEYS_ANIM,     NULL,                        cmd_processor_mf1_set_reader_keys_anim,      NULL                   },
+    {    DATA_CMD_MF1_READER_KEYS_RESELECT,      before_mf1_emulator_loaded,  cmd_processor_mf1_reader_keys_reselect,       NULL                   },
     {    DATA_CMD_MF1_GET_GEN1A_MODE,           before_mf1_emulator_loaded,  cmd_processor_mf1_get_gen1a_mode,            NULL                   },
     {    DATA_CMD_MF1_SET_GEN1A_MODE,           before_mf1_emulator_loaded,  cmd_processor_mf1_set_gen1a_mode,            NULL                   },
     {    DATA_CMD_MF1_GET_GEN2_MODE,            before_mf1_emulator_loaded,  cmd_processor_mf1_get_gen2_mode,             NULL                   },

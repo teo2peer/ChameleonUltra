@@ -6,6 +6,7 @@
 
 #define MF1_AUTH_LOG_FLAG_KEY_B  0x01u
 #define MF1_AUTH_LOG_FLAG_NESTED 0x02u
+#define MF1_AUTH_LOG_FLAG_SUCCESS 0x04u
 #define MF1_AUTH_LOG_RECORD_SIZE 18u
 
 typedef struct {

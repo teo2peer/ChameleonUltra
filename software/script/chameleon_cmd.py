@@ -2597,6 +2597,16 @@ class ChameleonCMD:
         return self.device.send_cmd_sync(Command.MF1_SET_READER_KEYS_ANIM, data)
 
     @expect_response(Status.SUCCESS)
+    def mf1_reader_keys_reselect(self, mute_ms: int = 150):
+        """Briefly mute and re-present the emulated card to the reader."""
+        if not 50 <= mute_ms <= 500:
+            raise ValueError("mute_ms must be between 50 and 500")
+        return self.device.send_cmd_sync(
+            Command.MF1_READER_KEYS_RESELECT,
+            struct.pack('!H', mute_ms),
+        )
+
+    @expect_response(Status.SUCCESS)
     def mf1_get_detection_count(self):
         """
         Get the statistics of the current detection records.
@@ -2634,6 +2644,7 @@ class ChameleonCMD:
                     'block': block,
                     'type': ['A', 'B'][bitfield & 0x01],
                     'is_nested': bool(bitfield & 0x02),
+                    'is_successful': bool(bitfield & 0x04),
                     'uid': uid.hex(),
                     'nt': nt.hex(),
                     'nr': nr.hex(),

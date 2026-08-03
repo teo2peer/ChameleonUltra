@@ -106,6 +106,8 @@ static void test_mf1_auth_log_latch(void) {
     assert(mf1_auth_log_flags(false, false) == 0u);
     assert(mf1_auth_log_flags(true, true) ==
            (MF1_AUTH_LOG_FLAG_KEY_B | MF1_AUTH_LOG_FLAG_NESTED));
+    assert((MF1_AUTH_LOG_FLAG_KEY_B | MF1_AUTH_LOG_FLAG_NESTED |
+            MF1_AUTH_LOG_FLAG_SUCCESS) == 0x07u);
 
     mf1_auth_log_latch_t latch = {0};
     assert(mf1_auth_log_latch_begin(&latch, true, 7u));
